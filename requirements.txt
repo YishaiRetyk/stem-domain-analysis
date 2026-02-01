@@ -1,0 +1,5 @@
+numpy>=1.20
+scipy>=1.7
+scikit-image>=0.19
+matplotlib>=3.5
+ncempy>=1.8
