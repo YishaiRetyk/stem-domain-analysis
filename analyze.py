@@ -48,7 +48,7 @@ def prompt_yes_no(message: str, default: bool = True) -> bool:
     return response in ('y', 'yes')
 
 
-def get_boundary_conditions(metadata: dict, args) -> dict:
+def get_boundary_conditions(metadata: dict, args, no_interactive: bool = False) -> dict:
     """
     Get boundary conditions from metadata, args, or prompt user.
     
@@ -113,11 +113,15 @@ def get_boundary_conditions(metadata: dict, args) -> dict:
     print()
     if args.tile_size:
         params['tile_size'] = args.tile_size
+    elif no_interactive:
+        params['tile_size'] = 256  # default
     else:
         params['tile_size'] = int(prompt_float("FFT tile size (pixels)", default=256))
     
     if args.stride:
         params['stride'] = args.stride
+    elif no_interactive:
+        params['stride'] = params['tile_size'] // 2  # default
     else:
         default_stride = params['tile_size'] // 2
         params['stride'] = int(prompt_float("Tile stride (pixels)", default=default_stride))
@@ -183,8 +187,8 @@ Examples:
     print(f"Output: {args.output}/")
     
     # Import modules (delayed to show help faster)
-    from src.io_dm4 import load_dm4_image
-    from src.preprocess import preprocess_image
+    from src.io_dm4 import load_dm4
+    from src.preprocess import preprocess
     from src.radial_analysis import run_radial_analysis
     
     # Load input file
@@ -194,10 +198,14 @@ Examples:
     metadata = {}
     
     if suffix == '.dm4' or suffix == '.dm3':
-        image, metadata = load_dm4_image(str(input_path))
+        record = load_dm4(str(input_path))
+        image = record.image
+        metadata = record.metadata
+        metadata['pixel_size_nm'] = record.px_nm  # Add pixel size to metadata dict
         print(f"  Loaded DM4: {image.shape}")
+        print(f"  Pixel size from file: {record.px_nm} nm/pixel")
         if metadata:
-            print(f"  Metadata: {list(metadata.keys())}")
+            print(f"  Metadata keys: {len(metadata)} entries")
     elif suffix == '.npy':
         image = np.load(input_path)
         print(f"  Loaded NPY: {image.shape}")
@@ -233,13 +241,21 @@ Examples:
             print("  Use interactive mode or provide all parameters.")
             sys.exit(1)
     
-    params = get_boundary_conditions(metadata, args)
+    params = get_boundary_conditions(metadata, args, no_interactive=args.no_interactive)
     
     # Preprocess
     print("\n[2/4] Preprocessing...")
-    processed = preprocess_image(image, verbose=args.verbose)
+    preprocess_params = {
+        'outlier_percentile': 0.1,
+        'normalize': True,
+        'smooth_sigma': 0.5,
+    }
+    preprocess_result = preprocess(image, preprocess_params)
+    processed = preprocess_result.image_pp
     print(f"  Output shape: {processed.shape}")
-    print(f"  Range: [{processed.min():.1f}, {processed.max():.1f}]")
+    print(f"  Range: [{processed.min():.3f}, {processed.max():.3f}]")
+    if args.verbose:
+        print(f"  Diagnostics: {preprocess_result.diagnostics}")
     
     # Save preprocessed if requested
     output_path = Path(args.output)
