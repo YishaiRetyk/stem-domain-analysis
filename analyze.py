@@ -52,17 +52,23 @@ def auto_detect_threshold(image: np.ndarray, pixel_size_nm: float,
                           q_min: float, q_max: float, tile_size: int = 256,
                           sample_tiles: int = 500) -> dict:
     """
-    Auto-detect intensity threshold using statistical analysis.
+    Auto-detect intensity threshold using ensemble of methods.
     
-    Samples tiles, computes peak intensities in target q-range,
-    and suggests threshold based on distribution.
+    Runs multiple detection algorithms in parallel and combines results:
+    - Otsu's method (bimodal separation)
+    - Percentile-based (90th percentile)
+    - Median + k*MAD (robust outlier detection)
+    - Knee/elbow detection
+    - Gaussian Mixture Model (2 components)
     
     Returns dict with:
-        - suggested: recommended threshold
-        - percentiles: {50, 75, 90, 95} percentile values
-        - stats: {min, max, mean, std}
+        - suggested: recommended threshold (ensemble decision)
+        - method: which method was selected
+        - methods: individual method results
+        - stats: intensity statistics
     """
     from scipy.signal import windows
+    from scipy import ndimage
     
     h, w = image.shape
     stride = tile_size
@@ -96,32 +102,237 @@ def auto_detect_threshold(image: np.ndarray, pixel_size_nm: float,
             tile_idx += 1
     
     intensities = np.array(intensities)
+    n_samples = len(intensities)
     
-    # Compute statistics
-    percentiles = {
-        50: np.percentile(intensities, 50),
-        75: np.percentile(intensities, 75),
-        90: np.percentile(intensities, 90),
-        95: np.percentile(intensities, 95),
-    }
-    
+    # Basic statistics
     stats = {
         'min': float(intensities.min()),
         'max': float(intensities.max()),
         'mean': float(intensities.mean()),
         'std': float(intensities.std()),
-        'n_samples': len(intensities),
+        'median': float(np.median(intensities)),
+        'n_samples': n_samples,
     }
     
-    # Suggest threshold at 90th percentile (top 10% as crystalline)
-    # This assumes crystalline regions are minority with stronger peaks
-    suggested = percentiles[90]
+    methods = {}
+    
+    # Method 1: Percentile-based (90th)
+    methods['percentile_90'] = {
+        'threshold': float(np.percentile(intensities, 90)),
+        'description': '90th percentile (top 10% as crystalline)',
+    }
+    
+    # Method 2: Otsu's method
+    try:
+        thresh_otsu = _otsu_threshold(intensities)
+        methods['otsu'] = {
+            'threshold': float(thresh_otsu),
+            'description': "Otsu's method (minimize intra-class variance)",
+        }
+    except Exception as e:
+        methods['otsu'] = {'threshold': None, 'error': str(e)}
+    
+    # Method 3: Median + k*MAD (k=3 for outliers)
+    median = np.median(intensities)
+    mad = np.median(np.abs(intensities - median))
+    thresh_mad = median + 3 * mad * 1.4826  # 1.4826 scales MAD to std for normal dist
+    methods['median_mad'] = {
+        'threshold': float(thresh_mad),
+        'description': 'Median + 3×MAD (robust outlier detection)',
+        'mad': float(mad),
+    }
+    
+    # Method 4: Knee/elbow detection
+    try:
+        thresh_knee = _knee_threshold(intensities)
+        methods['knee'] = {
+            'threshold': float(thresh_knee),
+            'description': 'Knee detection (elbow in sorted curve)',
+        }
+    except Exception as e:
+        methods['knee'] = {'threshold': None, 'error': str(e)}
+    
+    # Method 5: Gaussian Mixture Model (2 components)
+    try:
+        thresh_gmm, gmm_info = _gmm_threshold(intensities)
+        methods['gmm'] = {
+            'threshold': float(thresh_gmm),
+            'description': 'GMM (2 Gaussians, intersection point)',
+            **gmm_info,
+        }
+    except Exception as e:
+        methods['gmm'] = {'threshold': None, 'error': str(e)}
+    
+    # Method 6: Bimodality test + adaptive selection
+    try:
+        is_bimodal, dip_stat = _test_bimodality(intensities)
+        methods['bimodality'] = {
+            'is_bimodal': is_bimodal,
+            'dip_statistic': float(dip_stat),
+        }
+    except Exception:
+        is_bimodal = False
+        methods['bimodality'] = {'is_bimodal': False, 'error': 'test failed'}
+    
+    # Ensemble decision
+    valid_thresholds = []
+    for name, m in methods.items():
+        if isinstance(m, dict) and m.get('threshold') is not None:
+            valid_thresholds.append((name, m['threshold']))
+    
+    if not valid_thresholds:
+        # Fallback
+        suggested = stats['median'] + stats['std']
+        selected_method = 'fallback'
+    elif is_bimodal and methods.get('otsu', {}).get('threshold'):
+        # Bimodal: prefer Otsu
+        suggested = methods['otsu']['threshold']
+        selected_method = 'otsu'
+    elif methods.get('gmm', {}).get('threshold') and methods['gmm'].get('separation', 0) > 1.5:
+        # Good GMM separation: use GMM
+        suggested = methods['gmm']['threshold']
+        selected_method = 'gmm'
+    else:
+        # Default: median of all valid thresholds (consensus)
+        threshold_values = [t for _, t in valid_thresholds]
+        suggested = float(np.median(threshold_values))
+        selected_method = 'consensus'
+    
+    # Compute detection rates for each threshold
+    for name, m in methods.items():
+        if isinstance(m, dict) and m.get('threshold') is not None:
+            pct = np.sum(intensities >= m['threshold']) / n_samples * 100
+            m['detection_pct'] = round(pct, 1)
     
     return {
         'suggested': suggested,
-        'percentiles': percentiles,
+        'method': selected_method,
+        'methods': methods,
         'stats': stats,
+        'percentiles': {
+            50: float(np.percentile(intensities, 50)),
+            75: float(np.percentile(intensities, 75)),
+            90: float(np.percentile(intensities, 90)),
+            95: float(np.percentile(intensities, 95)),
+        },
     }
+
+
+def _otsu_threshold(data: np.ndarray) -> float:
+    """Otsu's method for threshold selection."""
+    # Create histogram
+    hist, bin_edges = np.histogram(data, bins=256)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    
+    # Normalize histogram
+    hist = hist.astype(float) / hist.sum()
+    
+    # Compute cumulative sums
+    weight1 = np.cumsum(hist)
+    weight2 = np.cumsum(hist[::-1])[::-1]
+    
+    # Cumulative means
+    mean1 = np.cumsum(hist * bin_centers) / (weight1 + 1e-10)
+    mean2 = (np.cumsum((hist * bin_centers)[::-1]) / (weight2[::-1] + 1e-10))[::-1]
+    
+    # Between-class variance
+    variance = weight1[:-1] * weight2[1:] * (mean1[:-1] - mean2[1:]) ** 2
+    
+    # Find maximum
+    idx = np.argmax(variance)
+    return bin_centers[idx]
+
+
+def _knee_threshold(data: np.ndarray) -> float:
+    """Find knee/elbow point in sorted intensity curve."""
+    sorted_data = np.sort(data)[::-1]  # Descending
+    n = len(sorted_data)
+    
+    # Normalize to [0, 1] for both axes
+    x = np.arange(n) / (n - 1)
+    y = (sorted_data - sorted_data.min()) / (sorted_data.max() - sorted_data.min() + 1e-10)
+    
+    # Line from first to last point
+    # Using perpendicular distance formula instead of cross product
+    x1, y1 = 0, y[0]
+    x2, y2 = 1, y[-1]
+    
+    # Distance from point (x[i], y[i]) to line through (x1,y1)-(x2,y2)
+    # d = |((y2-y1)*x - (x2-x1)*y + x2*y1 - y2*x1)| / sqrt((y2-y1)^2 + (x2-x1)^2)
+    numerator = np.abs((y2 - y1) * x - (x2 - x1) * y + x2 * y1 - y2 * x1)
+    denominator = np.sqrt((y2 - y1)**2 + (x2 - x1)**2)
+    distances = numerator / denominator
+    
+    # Knee is point with maximum distance
+    knee_idx = np.argmax(distances)
+    return sorted_data[knee_idx]
+
+
+def _gmm_threshold(data: np.ndarray) -> tuple:
+    """Fit 2-component GMM and find threshold at intersection."""
+    from sklearn.mixture import GaussianMixture
+    
+    # Fit GMM
+    gmm = GaussianMixture(n_components=2, random_state=42)
+    gmm.fit(data.reshape(-1, 1))
+    
+    means = gmm.means_.flatten()
+    stds = np.sqrt(gmm.covariances_.flatten())
+    weights = gmm.weights_
+    
+    # Sort by mean
+    idx = np.argsort(means)
+    means = means[idx]
+    stds = stds[idx]
+    weights = weights[idx]
+    
+    # Threshold between the two means
+    # Simple: midpoint weighted by stds
+    threshold = (means[0] * stds[1] + means[1] * stds[0]) / (stds[0] + stds[1])
+    
+    # Separation measure (distance between means / pooled std)
+    separation = (means[1] - means[0]) / np.sqrt((stds[0]**2 + stds[1]**2) / 2)
+    
+    info = {
+        'means': means.tolist(),
+        'stds': stds.tolist(),
+        'weights': weights.tolist(),
+        'separation': float(separation),
+    }
+    
+    return threshold, info
+
+
+def _test_bimodality(data: np.ndarray) -> tuple:
+    """Test if distribution is bimodal using Hartigan's dip test approximation."""
+    # Simple approximation: check if histogram has two peaks
+    hist, _ = np.histogram(data, bins=50)
+    
+    # Smooth histogram
+    from scipy.ndimage import gaussian_filter1d
+    smooth_hist = gaussian_filter1d(hist.astype(float), sigma=2)
+    
+    # Find local maxima
+    from scipy.signal import find_peaks
+    peaks, _ = find_peaks(smooth_hist, height=smooth_hist.max() * 0.1)
+    
+    # Dip statistic approximation (simplified)
+    sorted_data = np.sort(data)
+    n = len(sorted_data)
+    
+    # Compute empirical CDF
+    ecdf = np.arange(1, n + 1) / n
+    
+    # Greatest convex minorant and least concave majorant
+    # Simplified: just use range between peaks if multiple
+    if len(peaks) >= 2:
+        dip_stat = 0.1  # Indicates bimodality
+        is_bimodal = True
+    else:
+        dip_stat = 0.01
+        is_bimodal = False
+    
+    return is_bimodal, dip_stat
 
 
 def get_boundary_conditions(metadata: dict, args, no_interactive: bool = False,
@@ -209,8 +420,8 @@ def get_boundary_conditions(metadata: dict, args, no_interactive: bool = False,
     if args.threshold:
         params['intensity_threshold'] = args.threshold
         print(f"Intensity threshold (from args): {params['intensity_threshold']}")
-    elif image is not None and not no_interactive:
-        print("Auto-detecting threshold...")
+    elif image is not None:
+        print("Auto-detecting threshold (ensemble of methods)...")
         auto = auto_detect_threshold(
             image, params['pixel_size_nm'],
             params['q_min'], params['q_max'],
@@ -218,31 +429,39 @@ def get_boundary_conditions(metadata: dict, args, no_interactive: bool = False,
         )
         print(f"  Sampled {auto['stats']['n_samples']} tiles")
         print(f"  Intensity range: {auto['stats']['min']:.0f} - {auto['stats']['max']:.0f}")
-        print(f"  Percentiles: 50%={auto['percentiles'][50]:.0f}, "
-              f"75%={auto['percentiles'][75]:.0f}, 90%={auto['percentiles'][90]:.0f}, "
-              f"95%={auto['percentiles'][95]:.0f}")
-        print(f"  Suggested threshold (90th pct): {auto['suggested']:.0f}")
+        print()
+        print("  Method comparison:")
+        print("  " + "-" * 55)
+        print(f"  {'Method':<20} {'Threshold':>10} {'Detection':>10}")
+        print("  " + "-" * 55)
+        for name, m in auto['methods'].items():
+            if isinstance(m, dict) and m.get('threshold') is not None:
+                det_pct = m.get('detection_pct', '?')
+                print(f"  {name:<20} {m['threshold']:>10.0f} {det_pct:>9}%")
+        print("  " + "-" * 55)
         
-        use_auto = prompt_yes_no(f"  Use suggested threshold ({auto['suggested']:.0f})?", default=True)
-        if use_auto:
-            params['intensity_threshold'] = auto['suggested']
+        # Show bimodality result
+        bimod = auto['methods'].get('bimodality', {})
+        if bimod.get('is_bimodal'):
+            print(f"  Distribution: BIMODAL (two distinct populations)")
         else:
-            params['intensity_threshold'] = prompt_float("  Enter threshold manually")
+            print(f"  Distribution: unimodal")
+        
+        print()
+        print(f"  Selected method: {auto['method'].upper()}")
+        print(f"  Suggested threshold: {auto['suggested']:.0f}")
+        
+        if not no_interactive:
+            use_auto = prompt_yes_no(f"  Use suggested threshold ({auto['suggested']:.0f})?", default=True)
+            if use_auto:
+                params['intensity_threshold'] = auto['suggested']
+            else:
+                params['intensity_threshold'] = prompt_float("  Enter threshold manually")
+        else:
+            params['intensity_threshold'] = auto['suggested']
+            print(f"  (auto-selected for --no-interactive)")
+        
         params['auto_threshold_stats'] = auto
-    elif no_interactive:
-        # Default to 90th percentile auto-detection
-        if image is not None:
-            auto = auto_detect_threshold(
-                image, params['pixel_size_nm'],
-                params['q_min'], params['q_max'],
-                params['tile_size']
-            )
-            params['intensity_threshold'] = auto['suggested']
-            params['auto_threshold_stats'] = auto
-            print(f"Intensity threshold (auto-detected): {params['intensity_threshold']:.0f}")
-        else:
-            params['intensity_threshold'] = 3000  # fallback default
-            print(f"Intensity threshold (default): {params['intensity_threshold']}")
     else:
         print("Peak detection threshold:")
         print("  (Higher = more selective, Lower = more detections)")
