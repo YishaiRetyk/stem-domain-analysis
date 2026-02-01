@@ -31,7 +31,7 @@ This toolkit processes large-scale STEM images to:
 
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/stem-domain-analysis.git
+git clone https://github.com/YishaiRetyk/stem-domain-analysis.git
 cd stem-domain-analysis
 
 # Create virtual environment
@@ -45,11 +45,42 @@ pip install numpy scipy scikit-image matplotlib ncempy
 
 ## Quick Start
 
-### 1. Load and Preprocess a DM4 Image
+### Automated Script (Recommended)
+
+The easiest way to run the analysis:
+
+```bash
+# Interactive mode - prompts for any missing parameters
+python analyze.py sample.dm4
+
+# Specify all parameters via command line
+python analyze.py sample.dm4 \
+    --pixel-size 0.1297 \
+    --d-min 0.5 \
+    --d-max 1.5 \
+    --threshold 3000 \
+    -o results/
+
+# Non-interactive mode (fails if parameters missing)
+python analyze.py sample.dm4 --pixel-size 0.1297 --d-min 0.5 --d-max 1.5 --no-interactive
+```
+
+The script will:
+1. Load the DM4/TIFF/NPY file
+2. Extract metadata (pixel size) if available
+3. **Prompt for missing parameters** (d-spacing range, threshold, etc.)
+4. Preprocess the image
+5. Run radial FFT analysis
+6. Generate all output visualizations
+
+### Python API
+
+For programmatic use:
 
 ```python
 from src.io_dm4 import load_dm4_image
 from src.preprocess import preprocess_image
+from src.radial_analysis import run_radial_analysis
 
 # Load DM4 file
 image, metadata = load_dm4_image('sample.dm4')
@@ -57,12 +88,6 @@ pixel_size = metadata.get('pixel_size_nm', 0.1297)  # nm/pixel
 
 # Preprocess (normalize, denoise)
 processed = preprocess_image(image)
-```
-
-### 2. Run Radial Analysis
-
-```python
-from src.radial_analysis import run_radial_analysis
 
 # Target d-spacing: 0.5-1.5 nm → q-range: 0.67-2.0 nm⁻¹
 params = {
@@ -83,7 +108,7 @@ results = run_radial_analysis(
 print(f"Detected {results['peak_results']['n_peaks']} crystalline tiles")
 ```
 
-### 3. Output Files
+### Output Files
 
 The analysis generates:
 
@@ -167,9 +192,9 @@ If you use this tool in your research, please cite:
 ```bibtex
 @software{stem_domain_analysis,
   title={STEM Domain Analysis},
-  author={Your Name},
+  author={Yishai Retyk},
   year={2025},
-  url={https://github.com/YOUR_USERNAME/stem-domain-analysis}
+  url={https://github.com/YishaiRetyk/stem-domain-analysis}
 }
 ```
 
