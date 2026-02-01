@@ -438,6 +438,71 @@ def save_detection_heatmap(intensity_map: np.ndarray, output_path: str,
     plt.close()
 
 
+def save_fft_power_spectrum(image: np.ndarray, pixel_size_nm: float,
+                            output_path: str, q_range: Tuple[float, float] = None,
+                            tile_size: int = 256):
+    """
+    Save 2D FFT power spectrum visualization from center tile.
+    
+    Shows log-scale power spectrum with optional q-range annulus overlay.
+    """
+    h, w = image.shape
+    cy, cx = h // 2, w // 2
+    half = tile_size // 2
+    
+    # Extract center tile
+    center_tile = image[cy - half:cy + half, cx - half:cx + half]
+    
+    # Apply Hann window
+    hann_1d = windows.hann(tile_size)
+    window = np.outer(hann_1d, hann_1d)
+    windowed = center_tile.astype(np.float64) * window
+    
+    # Compute FFT
+    fft = np.fft.fft2(windowed)
+    fft_shifted = np.fft.fftshift(fft)
+    power = np.abs(fft_shifted)**2
+    
+    # Log scale for visualization
+    log_power = np.log10(power + 1)
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=(10, 10))
+    
+    im = ax.imshow(log_power, cmap='inferno', origin='lower')
+    plt.colorbar(im, ax=ax, label='Log₁₀(Power + 1)')
+    
+    # Add q-range annulus if specified
+    if q_range is not None:
+        q_min, q_max = q_range
+        q_scale = 1.0 / (tile_size * pixel_size_nm)
+        r_min = q_min / q_scale
+        r_max = q_max / q_scale
+        
+        center = tile_size // 2
+        theta = np.linspace(0, 2 * np.pi, 100)
+        
+        # Inner circle
+        x_inner = center + r_min * np.cos(theta)
+        y_inner = center + r_min * np.sin(theta)
+        ax.plot(x_inner, y_inner, 'c--', linewidth=1.5, label=f'q={q_min:.2f} nm⁻¹')
+        
+        # Outer circle
+        x_outer = center + r_max * np.cos(theta)
+        y_outer = center + r_max * np.sin(theta)
+        ax.plot(x_outer, y_outer, 'c-', linewidth=1.5, label=f'q={q_max:.2f} nm⁻¹')
+        
+        ax.legend(loc='upper right')
+    
+    ax.set_title(f'FFT Power Spectrum (Center {tile_size}×{tile_size} tile)\nPixel: {pixel_size_nm:.4f} nm')
+    ax.set_xlabel('Frequency X')
+    ax.set_ylabel('Frequency Y')
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+
+
 def run_radial_analysis(image: np.ndarray, pixel_size_nm: float,
                         output_dir: str = 'outputs',
                         params: dict = None,
@@ -476,9 +541,18 @@ def run_radial_analysis(image: np.ndarray, pixel_size_nm: float,
         title=f"Enhanced Radial Profile (q={p['q_range'][0]}-{p['q_range'][1]})"
     )
     
+    # Also save 2D FFT power spectrum
+    save_fft_power_spectrum(
+        image, pixel_size_nm,
+        str(output_path / '2_FFT_Power_Spectrum.png'),
+        q_range=p['q_range'],
+        tile_size=p['tile_size']
+    )
+    
     if verbose:
         print(f"  Q range: {profile.q_min:.3f} - {profile.q_max:.3f} nm^-1")
         print(f"  Saved: 1_Radial_Profile.png")
+        print(f"  Saved: 2_FFT_Power_Spectrum.png")
     
     # 2. Process tiles for peak detection
     if verbose:
