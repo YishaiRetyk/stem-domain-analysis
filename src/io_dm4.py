@@ -79,15 +79,13 @@ def load_dm4(path: str) -> ImageRecord:
             logger.warning(f"Unknown unit: {units0}, assuming nm")
             metadata_px_nm = scale0
     
-    # Use pipeline constant, log discrepancy if any
-    px_nm = PIPELINE_PX_NM
+    # Use metadata pixel size if available, otherwise set to None (will require user input)
     if metadata_px_nm is not None:
-        discrepancy = abs(metadata_px_nm - PIPELINE_PX_NM) / PIPELINE_PX_NM * 100
-        if discrepancy > 1:  # More than 1% difference
-            logger.warning(f"Pixel size discrepancy: metadata={metadata_px_nm:.6f} nm/px, "
-                          f"pipeline={PIPELINE_PX_NM:.6f} nm/px ({discrepancy:.1f}% diff)")
-        else:
-            logger.info(f"Pixel size from metadata: {metadata_px_nm:.6f} nm/px (matches pipeline)")
+        px_nm = metadata_px_nm
+        logger.info(f"Using pixel size from metadata: {px_nm:.6f} nm/px")
+    else:
+        px_nm = None
+        logger.warning("Pixel size not found in metadata - user input required")
     
     # Build metadata dict
     metadata = {
