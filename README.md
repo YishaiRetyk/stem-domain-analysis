@@ -6,26 +6,90 @@ Automated crystal domain segmentation and orientation mapping for STEM-HAADF (Sc
 
 This toolkit processes large-scale STEM images to:
 - **Detect crystalline domains** via FFT-based radial profile analysis
+- **Automatically discover diffraction peaks** without prior material knowledge
 - **Map crystal orientations** using diffraction peak localization
-- **Segment domain regions** with clustering algorithms
+- **Validate results** with spatial coherence analysis
 - **Generate quantitative metrics** for domain size, shape, and orientation distributions
+
+## Pipeline Architecture
+
+```mermaid
+flowchart TD
+    subgraph Input["📥 Input"]
+        A[DM4/TIFF/NPY Image]
+    end
+
+    subgraph Loading["1️⃣ Load & Preprocess"]
+        B[Load Image<br/>Extract Metadata]
+        C[Preprocess<br/>Normalize, Denoise]
+    end
+
+    subgraph Discovery["2️⃣ Peak Discovery <i>--auto-discover</i>"]
+        D[Sample Tiles<br/>Compute Radial Profile]
+        E[Fit Polynomial Background]
+        F[Background Subtraction]
+        G[Find Diffraction Peaks<br/>Prominence Filter]
+        H[Estimate Threshold<br/>per Peak]
+    end
+
+    subgraph Analysis["3️⃣ Radial Analysis"]
+        I[Tile-based FFT]
+        J[Peak Detection<br/>in q-range]
+        K[Orientation Extraction]
+    end
+
+    subgraph Validation["4️⃣ Validation <i>--validate</i>"]
+        L[Spatial Coherence<br/>Score]
+        M[Orientation Entropy]
+        N[Domain Clustering<br/>Analysis]
+    end
+
+    subgraph Output["📊 Output"]
+        O[Peak Discovery Plot]
+        P[Radial Profile]
+        Q[Peak Location Map]
+        R[Orientation Map]
+        S[Heatmap]
+        T[parameters.json]
+    end
+
+    A --> B --> C
+    C --> D --> E --> F --> G --> H
+    H --> I
+    C -.->|"Manual params"| I
+    I --> J --> K
+    K --> L --> M --> N
+    
+    G --> O
+    I --> P
+    J --> Q
+    K --> R
+    J --> S
+    H --> T
+    N --> T
+
+    style Discovery fill:#e1f5fe
+    style Validation fill:#fff3e0
+```
 
 ## Features
 
-- 📊 **Radial Profile Analysis** — Extract and visualize FFT intensity profiles in q-space (nm⁻¹)
-- 🎯 **Peak Detection** — Identify crystalline diffraction peaks within specified d-spacing ranges
-- 🗺️ **Orientation Mapping** — Color-coded visualization of crystal orientations across the sample
-- 📐 **Domain Metrics** — Compute area, perimeter, circularity, and orientation statistics
-- 🔬 **DM4 Support** — Native reading of Gatan Digital Micrograph files with metadata extraction
+- 🔍 **Automatic Peak Discovery** — Finds crystalline diffraction peaks without requiring d-spacing input
+- 📊 **Background-Subtracted Radial Profile** — Reveals true peaks above noise floor
+- 🎯 **Adaptive Threshold Calibration** — Sets threshold based on actual peak intensity
+- ✅ **Spatial Coherence Validation** — Detects when results are noise vs. real domains
+- 🗺️ **Orientation Mapping** — Color-coded visualization of crystal orientations
+- 📐 **Domain Metrics** — Area, perimeter, circularity, orientation statistics
+- 🔬 **DM4 Support** — Native reading of Gatan Digital Micrograph files
 
 ## Installation
 
 ### Requirements
 
 - Python 3.10+
-- NumPy, SciPy, scikit-image
+- NumPy, SciPy, scikit-image, scikit-learn
 - Matplotlib
-- ncempy (for DM4 file reading)
+- HyperSpy, ncempy (for DM4 file reading)
 
 ### Setup
 
@@ -40,97 +104,147 @@ source .venv/bin/activate  # Linux/Mac
 # or: .venv\Scripts\activate  # Windows
 
 # Install dependencies
-pip install numpy scipy scikit-image matplotlib ncempy
+pip install -r requirements.txt
 ```
 
 ## Quick Start
 
-### Automated Script (Recommended)
+### 🚀 Automatic Mode (Recommended)
 
-The easiest way to run the analysis:
+**Don't know the d-spacing? Use `--auto-discover`:**
 
 ```bash
-# Interactive mode - prompts for any missing parameters
-python analyze.py sample.dm4
+# Auto-discover peaks and validate results
+python analyze.py sample.dm4 --auto-discover --validate
 
-# Specify all parameters via command line
+# Non-interactive (for scripts/automation)
+python analyze.py sample.dm4 --auto-discover --validate --no-interactive -o results/
+```
+
+The auto-discovery will:
+1. Compute background-subtracted radial profile
+2. Find diffraction peaks using prominence detection
+3. Recommend optimal d-spacing range and threshold
+4. Validate results for spatial coherence
+
+### Manual Mode
+
+If you know the material's d-spacing:
+
+```bash
+# Specify parameters directly
 python analyze.py sample.dm4 \
-    --pixel-size 0.1297 \
-    --d-min 0.5 \
-    --d-max 1.5 \
-    --threshold 3000 \
+    --d-min 0.39 \
+    --d-max 0.43 \
+    --threshold 45000 \
     -o results/
 
-# Non-interactive mode (fails if parameters missing)
-python analyze.py sample.dm4 --pixel-size 0.1297 --d-min 0.5 --d-max 1.5 --no-interactive
+# Interactive mode - prompts for missing parameters
+python analyze.py sample.dm4
 ```
 
-The script will:
-1. Load the DM4/TIFF/NPY file
-2. Extract metadata (pixel size) if available
-3. **Prompt for missing parameters** (d-spacing range, threshold, etc.)
-4. Preprocess the image
-5. Run radial FFT analysis
-6. Generate all output visualizations
+### Full CLI Reference
 
-### Python API
+```bash
+python analyze.py <input> [options]
 
-For programmatic use:
+Positional:
+  input                   Input file (DM4, DM3, TIFF, or NPY)
 
-```python
-from src.io_dm4 import load_dm4_image
-from src.preprocess import preprocess_image
-from src.radial_analysis import run_radial_analysis
-
-# Load DM4 file
-image, metadata = load_dm4_image('sample.dm4')
-pixel_size = metadata.get('pixel_size_nm', 0.1297)  # nm/pixel
-
-# Preprocess (normalize, denoise)
-processed = preprocess_image(image)
-
-# Target d-spacing: 0.5-1.5 nm → q-range: 0.67-2.0 nm⁻¹
-params = {
-    'q_range': (0.67, 2.0),       # 1/nm
-    'intensity_threshold': 3000,  # Peak detection threshold
-    'tile_size': 256,             # FFT tile size in pixels
-    'stride': 128,                # Tile overlap
-}
-
-results = run_radial_analysis(
-    processed, 
-    pixel_size_nm=pixel_size,
-    output_dir='outputs',
-    params=params,
-    verbose=True
-)
-
-print(f"Detected {results['peak_results']['n_peaks']} crystalline tiles")
+Options:
+  -o, --output DIR        Output directory (default: outputs)
+  --pixel-size FLOAT      Pixel size in nm/pixel (auto-detected from DM4)
+  --d-min FLOAT           Minimum d-spacing in nm
+  --d-max FLOAT           Maximum d-spacing in nm
+  --threshold FLOAT       Peak detection intensity threshold
+  --tile-size INT         FFT tile size in pixels (default: 256)
+  --stride INT            Tile stride in pixels (default: tile_size/2)
+  --auto-discover         Automatically discover diffraction peaks
+  --validate              Validate results with coherence analysis
+  --no-interactive        Fail instead of prompting for missing params
+  --save-preprocessed     Save preprocessed image as NPY
+  -v, --verbose           Verbose output
 ```
 
-### Output Files
-
-The analysis generates:
+## Output Files
 
 | File | Description |
 |------|-------------|
-| `1_Radial_Profile.png` | FFT radial intensity profile (log scale) with highlighted q-range |
+| `0_Peak_Discovery.png` | Background-subtracted radial profile with detected peaks *(auto-discover only)* |
+| `1_Radial_Profile.png` | FFT radial intensity profile with highlighted q-range |
+| `2_FFT_Power_Spectrum.png` | 2D FFT power spectrum visualization |
 | `3_Peak_Location_Map.png` | Spatial map of detected crystalline peaks (green overlay) |
-| `4_Orientation_Map.png` | Color-coded crystal orientation map |
+| `4_Orientation_Map.png` | Color-coded crystal orientation map (-180° to +180°) |
 | `Heatmap.png` | Peak intensity heatmap across tile grid |
+| `parameters.json` | All analysis parameters and validation results |
 
-## Parameters
+## How Auto-Discovery Works
+
+The `--auto-discover` flag enables automatic parameter selection:
+
+```mermaid
+flowchart LR
+    subgraph Profile["Radial Profile"]
+        A[Sample 200 tiles] --> B[Average FFT]
+        B --> C[Fit polynomial<br/>background]
+        C --> D[Subtract background]
+    end
+
+    subgraph Peaks["Peak Finding"]
+        D --> E[scipy.find_peaks<br/>with prominence]
+        E --> F[Rank by SNR]
+        F --> G[Select best peak]
+    end
+
+    subgraph Threshold["Calibration"]
+        G --> H[Sample tiles at<br/>peak q-range]
+        H --> I[Set threshold for<br/>~15% detection]
+    end
+
+    I --> J[Run Analysis]
+```
+
+### Why Background Subtraction?
+
+Raw FFT profiles show a strong power-law decay that masks diffraction peaks:
+
+| Without Background Subtraction | With Background Subtraction |
+|-------------------------------|----------------------------|
+| Monotonic decay | Clear peaks visible |
+| Peaks hidden in noise | SNR quantifiable |
+| Manual d-spacing required | Automatic peak finding |
+
+## Validation Metrics
+
+When using `--validate`, the tool computes:
+
+| Metric | Good Value | Meaning |
+|--------|------------|---------|
+| **Coherence Score** | > 0.5 | Combined spatial + orientation coherence |
+| **Local Coherence** | > 0.5 | Neighboring tiles have similar orientations |
+| **Orientation Entropy** | < 0.5 | Orientations cluster (not random) |
+| **Detection Rate** | 5-30% | Reasonable crystalline fraction |
+
+### Interpreting Results
+
+| Interpretation | What It Means | Action |
+|----------------|---------------|--------|
+| `good_domains` | Real crystalline domains detected | ✅ Results valid |
+| `weak_domains` | Some structure, possibly noisy | Consider adjusting threshold |
+| `likely_noise_high_detection` | Too many detections, random orientations | Wrong q-range or threshold too low |
+| `sparse_or_noise` | Very few detections | Threshold too high or no crystallinity |
+
+## Parameters Reference
 
 ### Radial Analysis
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `q_range` | `(2.3, 2.6)` | Target q-range in nm⁻¹ for peak detection |
-| `intensity_threshold` | `45000` | Minimum peak intensity for detection |
+| `q_range` | Auto or `(2.3, 2.6)` | Target q-range in nm⁻¹ |
+| `intensity_threshold` | Auto or `45000` | Minimum peak intensity |
 | `tile_size` | `256` | FFT window size in pixels |
-| `stride` | `128` | Step between tiles (overlap = tile_size - stride) |
-| `window` | `'hann'` | Windowing function for FFT |
-| `dc_mask_radius` | `3` | Radius to mask central DC component |
+| `stride` | `128` | Step between tiles |
+| `window` | `hann` | Windowing function for FFT |
 
 ### Converting d-spacing to q
 
@@ -138,56 +252,97 @@ The analysis generates:
 q (nm⁻¹) = 1 / d (nm)
 ```
 
-| d-spacing (nm) | q (nm⁻¹) |
-|----------------|----------|
-| 0.5 | 2.0 |
-| 1.0 | 1.0 |
-| 1.5 | 0.67 |
-| 2.0 | 0.5 |
+| Material Type | d-spacing (nm) | q (nm⁻¹) |
+|--------------|----------------|----------|
+| Metals | 0.2 - 0.4 | 2.5 - 5.0 |
+| Oxides | 0.3 - 0.6 | 1.7 - 3.3 |
+| Organics | 0.5 - 1.5 | 0.7 - 2.0 |
+| Proteins | 1.0 - 5.0 | 0.2 - 1.0 |
+
+## Python API
+
+```python
+from src.io_dm4 import load_dm4
+from src.preprocess import preprocess
+from src.peak_discovery import discover_peaks, get_recommended_params
+from src.radial_analysis import run_radial_analysis
+
+# Load and preprocess
+record = load_dm4('sample.dm4')
+processed = preprocess(record.image)
+
+# Auto-discover peaks
+discovery = discover_peaks(
+    processed, 
+    record.pixel_size_nm,
+    tile_size=256,
+    verbose=True
+)
+
+# Get recommended parameters
+params = get_recommended_params(discovery)
+if params:
+    print(f"Recommended d-spacing: {params['d_min']:.3f} - {params['d_max']:.3f} nm")
+    print(f"Recommended threshold: {params['intensity_threshold']:.0f}")
+
+# Run analysis with discovered parameters
+results = run_radial_analysis(
+    processed,
+    pixel_size_nm=record.pixel_size_nm,
+    output_dir='outputs',
+    params={
+        'q_range': (params['q_min'], params['q_max']),
+        'intensity_threshold': params['intensity_threshold'],
+    },
+    verbose=True
+)
+```
 
 ## Module Reference
 
-### `src/io_dm4.py`
-DM4 file reader with metadata extraction (pixel size, acquisition parameters).
+| Module | Purpose |
+|--------|---------|
+| `src/io_dm4.py` | DM4/DM3 file loading with metadata extraction |
+| `src/preprocess.py` | Image normalization, denoising, background subtraction |
+| `src/peak_discovery.py` | **NEW:** Automatic peak finding and threshold calibration |
+| `src/radial_analysis.py` | FFT analysis, peak detection, orientation mapping |
+| `src/fft_features.py` | Feature extraction for ML pipelines |
+| `src/cluster_domains.py` | HDBSCAN clustering and spatial regularization |
+| `src/domain_metrics.py` | Per-domain statistics and quality gates |
+| `src/viz.py` | Visualization utilities |
+| `src/ilastik_roi.py` | ROI export for Ilastik workflows |
 
-### `src/preprocess.py`
-Image preprocessing: normalization, background subtraction, denoising.
+## Example Workflow
 
-### `src/radial_analysis.py`
-Core FFT analysis: radial profiles, peak detection, orientation mapping.
+```bash
+# 1. First run: auto-discover to find parameters
+python analyze.py myimage.dm4 --auto-discover --validate -o test_run/
 
-### `src/fft_features.py`
-Feature extraction from FFT power spectra for machine learning.
+# 2. Review 0_Peak_Discovery.png to see detected peaks
+# 3. Check parameters.json for suggested values
+# 4. If satisfied, use same params for batch processing:
 
-### `src/cluster_domains.py`
-Domain clustering and segmentation algorithms.
+python analyze.py *.dm4 --d-min 0.40 --d-max 0.44 --threshold 5000 --no-interactive
+```
 
-### `src/domain_metrics.py`
-Quantitative metrics: area, perimeter, orientation statistics.
+## Troubleshooting
 
-### `src/viz.py`
-Visualization utilities for results and diagnostics.
+### "No significant peaks found"
+- Image may be amorphous (no crystalline regions)
+- Try preprocessing with different parameters
+- Check if pixel size is correct
 
-### `src/ilastik_roi.py`
-ROI export compatible with Ilastik segmentation workflow.
+### High detection rate with random orientations
+- Threshold too low → increase `--threshold`
+- Wrong q-range → check material's expected d-spacing
+- Use `--auto-discover` to find correct parameters
 
-## Example Results
-
-### Radial Profile (Log Scale)
-Shows FFT intensity vs. spatial frequency with target q-range highlighted:
-- Central beam dominates at q≈0
-- Crystalline peaks visible in selected range
-- Log scale reveals weak diffraction features
-
-### Orientation Map
-Color-coded by crystal orientation angle (-180° to +180°):
-- Similar colors indicate same crystallographic orientation
-- Domain boundaries visible where colors change
-- Useful for grain boundary analysis
+### Low detection rate
+- Threshold too high → decrease `--threshold`
+- Peaks may be at different q-range
+- Sample may have weak crystallinity
 
 ## Citation
-
-If you use this tool in your research, please cite:
 
 ```bibtex
 @software{stem_domain_analysis,

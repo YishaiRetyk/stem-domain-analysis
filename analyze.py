@@ -371,18 +371,93 @@ def get_boundary_conditions(metadata: dict, args, no_interactive: bool = False,
         print("⚠ Pixel size not found in metadata.")
         params['pixel_size_nm'] = prompt_float("  Enter pixel size (nm/pixel)")
     
-    # D-spacing range - ALWAYS ask (material-specific)
+    # Auto-discover peaks if requested and no d-spacing provided
+    if args.auto_discover and image is not None and args.d_min is None and args.d_max is None:
+        from src.peak_discovery import discover_peaks, get_recommended_params, save_discovery_plot
+        
+        print("\n" + "=" * 60)
+        print("AUTOMATIC PEAK DISCOVERY")
+        print("=" * 60)
+        print("Searching for crystalline diffraction peaks...")
+        
+        discovery_result = discover_peaks(
+            image, params['pixel_size_nm'],
+            tile_size=args.tile_size or 256,
+            verbose=True
+        )
+        
+        # Save discovery plot
+        output_path = Path(args.output)
+        output_path.mkdir(parents=True, exist_ok=True)
+        save_discovery_plot(discovery_result, str(output_path / '0_Peak_Discovery.png'))
+        print(f"\n  Saved: 0_Peak_Discovery.png")
+        
+        # Store discovery results
+        params['discovery_result'] = {
+            'n_peaks': len(discovery_result.peaks),
+            'best_peak_idx': discovery_result.best_peak_idx,
+            'noise_floor': discovery_result.noise_floor,
+            'message': discovery_result.message,
+            'peaks': [
+                {
+                    'q_center': p.q_center,
+                    'd_spacing': p.d_spacing,
+                    'snr': p.snr,
+                    'confidence': p.confidence,
+                    'suggested_threshold': p.suggested_threshold,
+                }
+                for p in discovery_result.peaks
+            ]
+        }
+        
+        recommended = get_recommended_params(discovery_result)
+        
+        if recommended:
+            print(f"\n  RECOMMENDED PARAMETERS:")
+            print(f"    D-spacing: {recommended['d_min']:.3f} - {recommended['d_max']:.3f} nm")
+            print(f"    Q-range:   {recommended['q_min']:.3f} - {recommended['q_max']:.3f} nm⁻¹")
+            print(f"    Threshold: {recommended['intensity_threshold']:.0f}")
+            print(f"    Confidence: {recommended['confidence']} (SNR={recommended['snr']:.1f})")
+            
+            if not no_interactive:
+                use_recommended = prompt_yes_no("\n  Use recommended parameters?", default=True)
+                if use_recommended:
+                    params['d_min'] = recommended['d_min']
+                    params['d_max'] = recommended['d_max']
+                    params['intensity_threshold'] = recommended['intensity_threshold']
+                    params['auto_discovered'] = True
+                    print("  ✓ Using auto-discovered parameters")
+                else:
+                    print("\n  Manual parameter entry:")
+            else:
+                # Non-interactive: use recommended
+                params['d_min'] = recommended['d_min']
+                params['d_max'] = recommended['d_max']
+                params['intensity_threshold'] = recommended['intensity_threshold']
+                params['auto_discovered'] = True
+                print("  ✓ Using auto-discovered parameters (--no-interactive)")
+        else:
+            print("\n  ⚠ No strong peaks found. Manual parameter entry required.")
+            if no_interactive:
+                print("ERROR: Auto-discovery found no peaks and --no-interactive set")
+                sys.exit(1)
+    
+    # D-spacing range - use discovered, args, or prompt
     print()
-    if args.d_min is not None and args.d_max is not None:
+    if 'd_min' in params and 'd_max' in params:
+        # Already set from auto-discovery
+        print(f"D-spacing range (auto-discovered): {params['d_min']:.3f} - {params['d_max']:.3f} nm")
+    elif args.d_min is not None and args.d_max is not None:
         params['d_min'] = args.d_min
         params['d_max'] = args.d_max
         print(f"D-spacing range (from args): {params['d_min']} - {params['d_max']} nm")
     elif no_interactive:
-        print("ERROR: D-spacing range required (--d-min and --d-max)")
+        print("ERROR: D-spacing range required (--d-min and --d-max, or use --auto-discover)")
         sys.exit(1)
     else:
         print("Target lattice d-spacing range (material-specific):")
         print("  Common ranges: 0.2-0.4 nm (metals), 0.3-0.6 nm (oxides), 0.5-1.5 nm (organics)")
+        print("  TIP: Use --auto-discover to automatically find peaks!")
         params['d_min'] = prompt_float("  Minimum d-spacing (nm)")
         params['d_max'] = prompt_float("  Maximum d-spacing (nm)")
     
@@ -417,7 +492,10 @@ def get_boundary_conditions(metadata: dict, args, no_interactive: bool = False,
     
     # Intensity threshold - auto-detect if image provided and not specified
     print()
-    if args.threshold:
+    if 'intensity_threshold' in params:
+        # Already set from auto-discovery
+        print(f"Intensity threshold (auto-discovered): {params['intensity_threshold']:.0f}")
+    elif args.threshold:
         params['intensity_threshold'] = args.threshold
         print(f"Intensity threshold (from args): {params['intensity_threshold']}")
     elif image is not None:
@@ -506,6 +584,10 @@ Examples:
                         help='Tile stride in pixels (default: tile_size/2)')
     parser.add_argument('--no-interactive', action='store_true',
                         help='Fail instead of prompting for missing parameters')
+    parser.add_argument('--auto-discover', action='store_true',
+                        help='Automatically discover diffraction peaks (recommended if d-spacing unknown)')
+    parser.add_argument('--validate', action='store_true',
+                        help='Validate results by checking spatial coherence')
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='Verbose output')
     parser.add_argument('--save-preprocessed', action='store_true',
@@ -586,13 +668,15 @@ Examples:
     # Get boundary conditions (with auto-threshold using preprocessed image)
     print("\n[3/5] Setting analysis parameters...")
     if args.no_interactive:
-        # Check required params
+        # Check required params (--auto-discover can substitute for --d-min/--d-max)
         missing = []
         if not args.pixel_size and metadata.get('pixel_size_nm') is None:
             missing.append('--pixel-size')
-        if args.d_min is None:
+        if args.d_min is None and args.d_max is None and not args.auto_discover:
+            missing.append('--d-min and --d-max (or use --auto-discover)')
+        elif args.d_min is None and args.d_max is not None:
             missing.append('--d-min')
-        if args.d_max is None:
+        elif args.d_max is None and args.d_min is not None:
             missing.append('--d-max')
         if missing:
             print(f"Error: Missing required parameters: {', '.join(missing)}")
@@ -657,6 +741,47 @@ Examples:
     print(f"  D-spacing range: {params['d_min']:.2f} - {params['d_max']:.2f} nm")
     print(f"  Q-range: {params['q_min']:.3f} - {params['q_max']:.3f} nm⁻¹")
     print(f"  Threshold: {params['intensity_threshold']}")
+    
+    # Validate results if requested
+    if args.validate:
+        from src.peak_discovery import validate_spatial_coherence
+        
+        print("\n" + "-" * 60)
+        print("VALIDATION")
+        print("-" * 60)
+        
+        validation = validate_spatial_coherence(
+            results['peak_results']['peak_mask'],
+            results['peak_results']['orientation_map']
+        )
+        
+        print(f"  Detection rate: {validation['detection_rate']*100:.1f}%")
+        print(f"  Coherence score: {validation['coherence_score']:.2f}")
+        print(f"  Local coherence: {validation['local_coherence']:.2f}")
+        print(f"  Orientation entropy: {validation['orientation_entropy']:.2f}")
+        print(f"  Significant domains: {validation['n_domains']}")
+        print(f"  Largest domain: {validation['largest_domain']} tiles")
+        print(f"  Interpretation: {validation['interpretation']}")
+        
+        if not validation['is_valid']:
+            print()
+            print("  ⚠ WARNING: Results may not be meaningful!")
+            if validation['interpretation'] == 'likely_noise_high_detection':
+                print("    High detection rate with low coherence suggests wrong parameters.")
+                print("    Try: --auto-discover to find correct d-spacing range")
+            elif validation['orientation_entropy'] > 0.8:
+                print("    Orientations appear random (high entropy).")
+                print("    This could indicate noise rather than real domains.")
+        else:
+            print()
+            print("  ✓ Results appear valid")
+        
+        params['validation'] = validation
+        
+        # Update parameters file with validation
+        with open(params_path, 'w') as f:
+            json.dump(params_serializable, f, indent=2)
+    
     print()
     print("Output files:")
     for f in sorted(output_path.glob('*.png')):
