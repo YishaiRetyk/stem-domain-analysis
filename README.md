@@ -72,6 +72,33 @@ flowchart TD
     style Validation fill:#fff3e0
 ```
 
+## What's New (v2.0)
+
+### 🎨 E1: Enhanced Output & Presentation
+- **Original image preserved** — `0_Original.png` saved before any processing
+- **Scale bars** on all output images (using matplotlib-scalebar)
+- **Smart folder naming** — Output folder named after input file (`outputs/<filename>/`)
+
+### 🎚️ E2: Interactive Threshold Tuning
+- **`--interactive-threshold`** — Iteratively adjust threshold until satisfied
+- Visual feedback with detection rate guidance (too low/high/reasonable)
+- Iteration count tracked in `parameters.json`
+
+### 📊 E3: Robust Peak Detection
+- **`--peak-method percentile95`** (new default) — Uses mean of top 5% intensities
+- More robust for polycrystalline samples with diffuse ring patterns
+- Weighted centroid for accurate peak localization
+- Legacy mode: `--peak-method max` for single-pixel maximum
+
+### 🌈 E4: Multi-Plane Discrimination
+- **`--multi-plane`** — Analyze multiple lattice planes simultaneously
+- **`--interactive`** — Select which discovered peaks to analyze
+- **`--max-planes N`** — Limit number of planes (default: 5)
+- Color-coded composite maps showing dominant plane per region
+- Per-plane orientation maps (`5a_Orientation_Plane0.png`, `5b_...`, etc.)
+
+---
+
 ## Features
 
 - 🔍 **Automatic Peak Discovery** — Finds crystalline diffraction peaks without requiring d-spacing input
@@ -81,6 +108,8 @@ flowchart TD
 - 🗺️ **Orientation Mapping** — Color-coded visualization of crystal orientations
 - 📐 **Domain Metrics** — Area, perimeter, circularity, orientation statistics
 - 🔬 **DM4 Support** — Native reading of Gatan Digital Micrograph files
+- 🎨 **Scale Bars** — Calibrated scale bars on all output images
+- 🌈 **Multi-Plane Analysis** — Simultaneous analysis of multiple lattice planes
 
 ## Installation
 
@@ -88,7 +117,7 @@ flowchart TD
 
 - Python 3.10+
 - NumPy, SciPy, scikit-image, scikit-learn
-- Matplotlib
+- Matplotlib, matplotlib-scalebar
 - HyperSpy, ncempy (for DM4 file reading)
 
 ### Setup
@@ -151,8 +180,8 @@ python analyze.py <input> [options]
 Positional:
   input                   Input file (DM4, DM3, TIFF, or NPY)
 
-Options:
-  -o, --output DIR        Output directory (default: outputs)
+Core Options:
+  -o, --output DIR        Output directory (default: outputs/<input_filename>/)
   --pixel-size FLOAT      Pixel size in nm/pixel (auto-detected from DM4)
   --d-min FLOAT           Minimum d-spacing in nm
   --d-max FLOAT           Maximum d-spacing in nm
@@ -164,19 +193,65 @@ Options:
   --no-interactive        Fail instead of prompting for missing params
   --save-preprocessed     Save preprocessed image as NPY
   -v, --verbose           Verbose output
+
+Peak Detection (E3):
+  --peak-method {max,percentile95}
+                          Peak intensity method (default: percentile95)
+                          - max: Single brightest pixel
+                          - percentile95: Mean of top 5% (more robust)
+
+Interactive Threshold (E2):
+  --interactive-threshold
+                          Enable iterative threshold adjustment
+                          Shows results, allows tweaking until satisfied
+
+Multi-Plane Analysis (E4):
+  --multi-plane           Analyze all discovered peaks simultaneously
+                          (requires --auto-discover)
+  --interactive           Interactive mode: select which peaks to analyze
+  --max-planes N          Maximum planes to analyze (default: 5)
+```
+
+### Usage Examples
+
+```bash
+# Basic auto-discovery (recommended)
+python analyze.py sample.dm4 --auto-discover
+
+# With interactive threshold tuning
+python analyze.py sample.dm4 --auto-discover --interactive-threshold
+
+# Multi-plane analysis (all discovered peaks)
+python analyze.py sample.dm4 --auto-discover --multi-plane
+
+# Interactive plane selection
+python analyze.py sample.dm4 --auto-discover --multi-plane --interactive
+
+# Combine features
+python analyze.py sample.dm4 --auto-discover --multi-plane --interactive-threshold
+
+# Non-interactive batch mode
+python analyze.py *.dm4 --auto-discover --no-interactive
 ```
 
 ## Output Files
 
+Output is saved to `outputs/<input_filename>/` by default.
+
 | File | Description |
 |------|-------------|
-| `0_Peak_Discovery.png` | Background-subtracted radial profile with detected peaks *(auto-discover only)* |
-| `1_Radial_Profile.png` | FFT radial intensity profile with highlighted q-range |
-| `2_FFT_Power_Spectrum.png` | 2D FFT power spectrum visualization |
-| `3_Peak_Location_Map.png` | Spatial map of detected crystalline peaks (green overlay) |
-| `4_Orientation_Map.png` | Color-coded crystal orientation map (-180° to +180°) |
+| `0_Original.png` | **NEW:** Original image before processing (with scale bar) |
+| `original.npy` | **NEW:** Original image data (NumPy format) |
+| `1_Peak_Discovery.png` | Background-subtracted radial profile with detected peaks *(auto-discover only)* |
+| `2_Radial_Profile.png` | FFT radial intensity profile with highlighted q-range |
+| `3_FFT_Power_Spectrum.png` | 2D FFT power spectrum visualization |
+| `4_Peak_Location_Map.png` | Spatial map of detected crystalline peaks (green overlay, with scale bar) |
+| `5_Orientation_Map.png` | Color-coded crystal orientation map (-180° to +180°, with scale bar) |
+| `5a_Orientation_Plane0.png` | **NEW:** Per-plane orientation map *(multi-plane mode only)* |
+| `5b_Orientation_Plane1.png` | **NEW:** Per-plane orientation map *(multi-plane mode only)* |
+| `6_Multi_Plane_Composite.png` | **NEW:** Color-coded composite showing dominant plane per region *(multi-plane mode only)* |
 | `Heatmap.png` | Peak intensity heatmap across tile grid |
-| `parameters.json` | All analysis parameters and validation results |
+| `parameters.json` | All analysis parameters, validation results, and plane metadata |
 
 ## How Auto-Discovery Works
 
