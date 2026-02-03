@@ -16,6 +16,80 @@ plt.rcParams['savefig.bbox'] = 'tight'
 plt.rcParams['font.size'] = 10
 
 
+def add_scalebar(ax, pixel_size_nm: float, image_shape: tuple,
+                 location: str = 'lower right', color: str = 'white') -> None:
+    """
+    Add calibrated scale bar to matplotlib axis.
+
+    Args:
+        ax: Matplotlib axis
+        pixel_size_nm: Pixel size in nm/pixel
+        image_shape: (height, width) of image in pixels
+        location: Scale bar location ('lower right', 'lower left', etc.)
+        color: Scale bar color
+    """
+    try:
+        from matplotlib_scalebar.scalebar import ScaleBar
+
+        # Create scale bar (matplotlib-scalebar handles auto-sizing)
+        scalebar = ScaleBar(
+            pixel_size_nm,
+            'nm',
+            length_fraction=0.25,  # 25% of image width
+            location=location,
+            color=color,
+            box_color='black',
+            box_alpha=0.5,
+            scale_loc='top',
+            font_properties={'size': 10}
+        )
+        ax.add_artist(scalebar)
+    except ImportError:
+        logger.warning("matplotlib-scalebar not installed, skipping scale bar")
+
+
+def save_image_with_scalebar(image: np.ndarray, path: str,
+                              pixel_size_nm: float,
+                              cmap: str = 'gray',
+                              vmin: Optional[float] = None,
+                              vmax: Optional[float] = None,
+                              title: Optional[str] = None,
+                              colorbar: bool = True) -> None:
+    """
+    Save image as PNG with scale bar.
+
+    Args:
+        image: 2D numpy array
+        path: Output path for PNG
+        pixel_size_nm: Pixel size in nm/pixel
+        cmap: Matplotlib colormap name
+        vmin: Minimum value for colormap scaling
+        vmax: Maximum value for colormap scaling
+        title: Optional figure title
+        colorbar: Whether to include colorbar
+    """
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(10, 10))
+    im = ax.imshow(image, cmap=cmap, vmin=vmin, vmax=vmax, origin='upper')
+
+    # Add scale bar
+    add_scalebar(ax, pixel_size_nm, image.shape, location='lower right', color='white')
+
+    if colorbar:
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    if title:
+        ax.set_title(title)
+
+    ax.set_xlabel('X (pixels)')
+    ax.set_ylabel('Y (pixels)')
+
+    plt.savefig(path, bbox_inches='tight')
+    plt.close(fig)
+    logger.info(f"Saved: {path}")
+
+
 def save_image_png(image: np.ndarray, path: str, cmap: str = 'gray', 
                    vmin: Optional[float] = None, vmax: Optional[float] = None,
                    title: Optional[str] = None, colorbar: bool = True) -> None:
@@ -431,9 +505,135 @@ def create_pipeline_figure(image: np.ndarray, preprocessed: np.ndarray,
         ax.set_xlabel('X (pixels)')
         ax.set_ylabel('Y (pixels)')
     
-    plt.suptitle('STEM-HAADF Crystal Domain Segmentation Pipeline', 
+    plt.suptitle('STEM-HAADF Crystal Domain Segmentation Pipeline',
                  fontsize=14, fontweight='bold', y=1.02)
     plt.tight_layout()
     plt.savefig(path, bbox_inches='tight')
     plt.close(fig)
     logger.info(f"Saved: {path}")
+
+
+def save_multi_plane_composite(
+    image: np.ndarray,
+    multi_result,
+    stride: int,
+    tile_size: int,
+    output_path: str,
+    pixel_size_nm: Optional[float] = None
+):
+    """
+    Save multi-plane composite map with color-coded planes.
+
+    Args:
+        image: Original image
+        multi_result: MultiPlaneResult object
+        stride: Tile stride
+        tile_size: Tile size
+        output_path: Output path for PNG
+        pixel_size_nm: Pixel size for scale bar
+    """
+    fig, ax = plt.subplots(figsize=(14, 12))
+
+    # Show grayscale image
+    ax.imshow(image, cmap='gray', alpha=1.0)
+
+    # Create colored overlay
+    h, w = image.shape
+    overlay = np.zeros((h, w, 4))  # RGBA
+
+    # Define colors for each plane
+    colors = [
+        (1.0, 0.0, 0.0),  # Red - Plane 0
+        (0.0, 0.0, 1.0),  # Blue - Plane 1
+        (0.0, 1.0, 0.0),  # Green - Plane 2
+        (1.0, 1.0, 0.0),  # Yellow - Plane 3
+        (1.0, 0.0, 1.0),  # Magenta - Plane 4
+        (0.0, 1.0, 1.0),  # Cyan - Plane 5
+    ]
+
+    n_rows, n_cols = multi_result.dominant_plane_map.shape
+
+    for row in range(n_rows):
+        for col in range(n_cols):
+            plane_id = multi_result.dominant_plane_map[row, col]
+            if plane_id >= 0:  # Valid detection
+                y = row * stride
+                x = col * stride
+
+                color = colors[plane_id % len(colors)]
+                overlay[y:y+tile_size, x:x+tile_size, 0] = color[0]
+                overlay[y:y+tile_size, x:x+tile_size, 1] = color[1]
+                overlay[y:y+tile_size, x:x+tile_size, 2] = color[2]
+                overlay[y:y+tile_size, x:x+tile_size, 3] = 0.6  # Alpha
+
+    ax.imshow(overlay)
+
+    # Add scale bar
+    if pixel_size_nm:
+        add_scalebar(ax, pixel_size_nm, image.shape, location='lower right', color='white')
+
+    # Legend
+    from matplotlib.patches import Patch
+    legend_elements = []
+    for plane in multi_result.planes:
+        color = colors[plane.plane_id % len(colors)]
+        legend_elements.append(
+            Patch(facecolor=color,
+                  label=f'Plane {plane.plane_id}: d={plane.d_spacing:.3f} nm')
+        )
+    ax.legend(handles=legend_elements, loc='upper right', framealpha=0.9)
+
+    ax.set_title(f'Multi-Plane Composite Map ({len(multi_result.planes)} planes)')
+    ax.set_xlabel('X (pixels)')
+    ax.set_ylabel('Y (pixels)')
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+    logger.info(f"Saved: {output_path}")
+
+
+def save_per_plane_maps(
+    image: np.ndarray,
+    multi_result,
+    stride: int,
+    tile_size: int,
+    output_dir: Path,
+    pixel_size_nm: Optional[float] = None
+):
+    """
+    Save individual orientation maps for each plane.
+
+    Creates: 5a_Orientation_Plane0.png, 5b_Orientation_Plane1.png, etc.
+
+    Args:
+        image: Original image
+        multi_result: MultiPlaneResult object
+        stride: Tile stride
+        tile_size: Tile size
+        output_dir: Output directory
+        pixel_size_nm: Pixel size for scale bar
+    """
+    from src.radial_analysis import save_orientation_map
+
+    for plane in multi_result.planes:
+        # Use alphabetic suffix: a, b, c, etc.
+        suffix = chr(97 + plane.plane_id)  # 97 = 'a'
+        output_path = output_dir / f'5{suffix}_Orientation_Plane{plane.plane_id}.png'
+
+        # Use existing save_orientation_map but with per-plane data
+        save_orientation_map(
+            image,
+            plane.peak_mask,
+            plane.orientation_map,
+            stride,
+            tile_size,
+            str(output_path),
+            params={
+                'q_range': plane.q_range,
+                'd_spacing': plane.d_spacing,
+            },
+            pixel_size_nm=pixel_size_nm
+        )
+
+        logger.info(f"Saved: {output_path.name}")

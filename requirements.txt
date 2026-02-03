@@ -3,5 +3,6 @@ scipy>=1.7
 scikit-image>=0.19
 scikit-learn>=1.0
 matplotlib>=3.5
+matplotlib-scalebar>=0.8.0
 ncempy>=1.8
 hyperspy>=1.7

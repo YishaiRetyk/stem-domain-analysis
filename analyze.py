@@ -97,7 +97,14 @@ def auto_detect_threshold(image: np.ndarray, pixel_size_nm: float,
                 tile = image[y:y+tile_size, x:x+tile_size].astype(np.float64) * hann
                 fft = np.fft.fftshift(np.fft.fft2(tile))
                 power = np.abs(fft)**2
-                peak_intensity = np.max(power * q_mask)
+                # Use percentile95 method for robust threshold estimation
+                intensities_in_annulus = power[q_mask]
+                if len(intensities_in_annulus) > 0:
+                    p95_threshold = np.percentile(intensities_in_annulus, 95)
+                    high_intensities = intensities_in_annulus[intensities_in_annulus > p95_threshold]
+                    peak_intensity = np.mean(high_intensities) if len(high_intensities) > 0 else np.max(intensities_in_annulus)
+                else:
+                    peak_intensity = 0
                 intensities.append(peak_intensity)
             tile_idx += 1
     
@@ -389,8 +396,8 @@ def get_boundary_conditions(metadata: dict, args, no_interactive: bool = False,
         # Save discovery plot
         output_path = Path(args.output)
         output_path.mkdir(parents=True, exist_ok=True)
-        save_discovery_plot(discovery_result, str(output_path / '0_Peak_Discovery.png'))
-        print(f"\n  Saved: 0_Peak_Discovery.png")
+        save_discovery_plot(discovery_result, str(output_path / '1_Peak_Discovery.png'))
+        print(f"\n  Saved: 1_Peak_Discovery.png")
         
         # Store discovery results
         params['discovery_result'] = {
@@ -436,6 +443,41 @@ def get_boundary_conditions(metadata: dict, args, no_interactive: bool = False,
                 params['intensity_threshold'] = recommended['intensity_threshold']
                 params['auto_discovered'] = True
                 print("  ✓ Using auto-discovered parameters (--no-interactive)")
+
+            # Handle multi-plane mode
+            if args.multi_plane and recommended:
+                params['multi_plane_mode'] = True
+                params['discovered_peaks'] = discovery_result.peaks[:args.max_planes]
+
+                if args.interactive and not no_interactive:
+                    # Interactive plane selection
+                    print("\n  Select planes to analyze:")
+                    print(f"  {'#':<3} {'q (nm⁻¹)':<10} {'d (nm)':<10} {'SNR':<8} {'Threshold':<12}")
+                    print(f"  {'-'*50}")
+
+                    selected_peaks = []
+                    for i, p in enumerate(params['discovered_peaks']):
+                        prompt_text = f"  {i+1:<3} {p.q_center:<10.3f} {p.d_spacing:<10.3f} {p.snr:<8.1f} {p.suggested_threshold:<12.0f}"
+                        include = prompt_yes_no(prompt_text, default=True)
+                        if include:
+                            selected_peaks.append(p)
+
+                    params['discovered_peaks'] = selected_peaks
+                    print(f"\n  Selected {len(selected_peaks)} planes for analysis")
+                else:
+                    print(f"\n  ✓ Will analyze top {len(params['discovered_peaks'])} planes")
+
+                # Don't set d_min/d_max (will use per-plane ranges)
+                # Remove them if they were set
+                if 'd_min' in params:
+                    del params['d_min']
+                if 'd_max' in params:
+                    del params['d_max']
+                if 'intensity_threshold' in params:
+                    del params['intensity_threshold']
+
+                return params
+
         else:
             print("\n  ⚠ No strong peaks found. Manual parameter entry required.")
             if no_interactive:
@@ -550,6 +592,117 @@ def get_boundary_conditions(metadata: dict, args, no_interactive: bool = False,
     return params
 
 
+def run_interactive_threshold_loop(
+    processed: np.ndarray,
+    pixel_size_nm: float,
+    params: dict,
+    output_path: Path,
+    verbose: bool = True
+) -> dict:
+    """
+    Interactive threshold tuning loop.
+
+    Runs analysis, shows results, prompts for threshold adjustment.
+    Continues until user accepts results.
+
+    Args:
+        processed: Preprocessed image
+        pixel_size_nm: Pixel size in nm
+        params: Initial analysis parameters (must include all except threshold)
+        output_path: Output directory
+        verbose: Verbose output
+
+    Returns:
+        Final analysis results dict
+    """
+    from src.radial_analysis import run_radial_analysis
+
+    current_threshold = params['intensity_threshold']
+    iteration = 0
+
+    while True:
+        iteration += 1
+        print("\n" + "=" * 60)
+        print(f"THRESHOLD ITERATION {iteration}")
+        print("=" * 60)
+        print(f"Current threshold: {current_threshold:.0f}")
+        print()
+
+        # Update params with current threshold
+        analysis_params = {
+            'q_range': (params['q_min'], params['q_max']),
+            'intensity_threshold': current_threshold,
+            'tile_size': params['tile_size'],
+            'stride': params['stride'],
+            'peak_method': params.get('peak_method', 'percentile95'),
+        }
+
+        # Run analysis
+        print("[Running analysis with current threshold...]")
+        results = run_radial_analysis(
+            processed,
+            pixel_size_nm=pixel_size_nm,
+            output_dir=str(output_path),
+            params=analysis_params,
+            verbose=verbose
+        )
+
+        # Display results summary
+        print("\n" + "-" * 60)
+        print("RESULTS SUMMARY")
+        print("-" * 60)
+        n_peaks = results['peak_results']['n_peaks']
+        total_tiles = np.prod(results['peak_results']['grid_shape'])
+        pct = n_peaks / total_tiles * 100 if total_tiles > 0 else 0
+
+        print(f"  Crystalline tiles: {n_peaks}/{total_tiles} ({pct:.1f}%)")
+        print(f"  D-spacing range: {params['d_min']:.2f} - {params['d_max']:.2f} nm")
+        print(f"  Q-range: {params['q_min']:.3f} - {params['q_max']:.3f} nm⁻¹")
+        print(f"  Threshold: {current_threshold:.0f}")
+        print()
+
+        # Guidance
+        if pct < 5:
+            print("  💡 Low detection rate - consider lowering threshold")
+        elif pct > 30:
+            print("  💡 High detection rate - consider raising threshold")
+        else:
+            print("  ✓ Detection rate looks reasonable")
+
+        print()
+        print(f"  Review output files in: {output_path}/")
+        print(f"    - 4_Peak_Location_Map.png (spatial distribution)")
+        print(f"    - 5_Orientation_Map.png (crystal orientations)")
+        print()
+
+        # Prompt for adjustment
+        accept = prompt_yes_no("  Accept these results?", default=True)
+
+        if accept:
+            print("\n  ✓ Results accepted!")
+            # Update final params
+            params['intensity_threshold'] = current_threshold
+            params['interactive_iterations'] = iteration
+            return results
+        else:
+            # Get new threshold
+            print()
+            print(f"  Current threshold: {current_threshold:.0f}")
+            print("  Enter new threshold (or press Ctrl+C to abort):")
+
+            while True:
+                try:
+                    new_threshold = prompt_float("    New threshold", default=current_threshold)
+                    if new_threshold <= 0:
+                        print("    Threshold must be positive. Try again.")
+                        continue
+                    current_threshold = new_threshold
+                    break
+                except KeyboardInterrupt:
+                    print("\n\n  Aborted by user.")
+                    sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="STEM Domain Analysis - Automated Pipeline",
@@ -569,7 +722,7 @@ Examples:
     
     parser.add_argument('input', type=str, help='Input file (DM4, TIFF, or NPY)')
     parser.add_argument('-o', '--output', type=str, default='outputs',
-                        help='Output directory (default: outputs)')
+                        help='Output directory (default: outputs/<input_filename>)')
     parser.add_argument('--pixel-size', type=float, dest='pixel_size',
                         help='Pixel size in nm/pixel')
     parser.add_argument('--d-min', type=float, dest='d_min',
@@ -592,7 +745,19 @@ Examples:
                         help='Verbose output')
     parser.add_argument('--save-preprocessed', action='store_true',
                         help='Save preprocessed image as NPY file')
-    
+    parser.add_argument('--peak-method', type=str,
+                        choices=['max', 'percentile95'],
+                        default='percentile95',
+                        help='Peak intensity detection method: max (single pixel) or percentile95 (mean of top 5%%)')
+    parser.add_argument('--interactive-threshold', action='store_true',
+                        help='Enable interactive threshold tuning (prompt to adjust after seeing results)')
+    parser.add_argument('--multi-plane', action='store_true',
+                        help='Analyze all discovered peaks (requires --auto-discover)')
+    parser.add_argument('--interactive', action='store_true',
+                        help='Interactive mode: select peaks and/or tune threshold')
+    parser.add_argument('--max-planes', type=int, default=5,
+                        help='Maximum number of planes to analyze (default: 5)')
+
     args = parser.parse_args()
     
     # Check input file
@@ -600,7 +765,19 @@ Examples:
     if not input_path.exists():
         print(f"Error: Input file not found: {input_path}")
         sys.exit(1)
-    
+
+    # Generate output directory name from input file if using default
+    if args.output == 'outputs':
+        # Extract base name without extension
+        input_stem = input_path.stem
+        # Create output folder: outputs/<input_basename>/
+        output_dir = Path('outputs') / input_stem
+    else:
+        output_dir = Path(args.output)
+
+    # Update args.output
+    args.output = str(output_dir)
+
     print("\n" + "=" * 60)
     print("STEM DOMAIN ANALYSIS")
     print("=" * 60)
@@ -650,7 +827,28 @@ Examples:
         print(f"Error: Unsupported file format: {suffix}")
         print("  Supported: .dm4, .dm3, .npy, .tif, .tiff")
         sys.exit(1)
-    
+
+    # Save original image to output directory (before preprocessing)
+    output_path = Path(args.output)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # Save original as NPY
+    original_npy_path = output_path / 'original.npy'
+    np.save(original_npy_path, image)
+    print(f"  Saved: {original_npy_path.name}")
+
+    # Save original as PNG with scale bar (if pixel size known)
+    if metadata.get('pixel_size_nm'):
+        from src.viz import save_image_with_scalebar
+        save_image_with_scalebar(
+            image,
+            str(output_path / '0_Original.png'),
+            pixel_size_nm=metadata['pixel_size_nm'],
+            title='Original STEM-HAADF Image',
+            cmap='gray'
+        )
+        print(f"  Saved: 0_Original.png")
+
     # Preprocess first (needed for auto-threshold detection)
     print("\n[2/5] Preprocessing...")
     preprocess_params = {
@@ -684,7 +882,10 @@ Examples:
             sys.exit(1)
     
     params = get_boundary_conditions(metadata, args, no_interactive=args.no_interactive, image=processed)
-    
+
+    # Add peak detection method to params
+    params['peak_method'] = args.peak_method
+
     # Save preprocessed if requested
     output_path = Path(args.output)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -694,6 +895,10 @@ Examples:
         np.save(npy_path, processed)
         print(f"  Saved: {npy_path}")
     
+    # Add interactive mode flag if enabled
+    if args.interactive_threshold and not args.no_interactive:
+        params['interactive_threshold_mode'] = True
+
     # Save parameters (convert numpy types for JSON)
     params_path = output_path / 'parameters.json'
     params_serializable = {}
@@ -714,22 +919,118 @@ Examples:
     
     # Run radial analysis
     print("\n[4/5] Running radial analysis...")
-    
-    analysis_params = {
-        'q_range': (params['q_min'], params['q_max']),
-        'intensity_threshold': params['intensity_threshold'],
-        'tile_size': params['tile_size'],
-        'stride': params['stride'],
-    }
-    
-    results = run_radial_analysis(
-        processed,
-        pixel_size_nm=params['pixel_size_nm'],
-        output_dir=str(output_path),
-        params=analysis_params,
-        verbose=True
-    )
-    
+
+    # Check if multi-plane mode
+    if params.get('multi_plane_mode', False):
+        # MULTI-PLANE MODE
+        from src.multi_plane_analysis import analyze_multiple_planes
+
+        print(f"  Analyzing {len(params['discovered_peaks'])} planes...")
+
+        multi_results = analyze_multiple_planes(
+            processed,
+            pixel_size_nm=params['pixel_size_nm'],
+            peaks=params['discovered_peaks'],
+            tile_size=params['tile_size'],
+            stride=params['stride'],
+            peak_method=args.peak_method,
+            verbose=True
+        )
+
+        # Save multi-plane visualizations
+        from src.viz import save_multi_plane_composite, save_per_plane_maps
+
+        print("\n[4.1] Saving multi-plane composite...")
+        save_multi_plane_composite(
+            processed,
+            multi_results,
+            params['stride'],
+            params['tile_size'],
+            str(output_path / '6_Multi_Plane_Composite.png'),
+            pixel_size_nm=params['pixel_size_nm']
+        )
+
+        print("[4.2] Saving per-plane orientation maps...")
+        save_per_plane_maps(
+            processed,
+            multi_results,
+            params['stride'],
+            params['tile_size'],
+            output_path,
+            pixel_size_nm=params['pixel_size_nm']
+        )
+
+        # For backwards compatibility, store first plane as 'results'
+        results = {
+            'profile': multi_results.radial_profile,
+            'peak_results': {
+                'peak_mask': multi_results.planes[0].peak_mask,
+                'orientation_map': multi_results.planes[0].orientation_map,
+                'intensity_map': multi_results.planes[0].intensity_map,
+                'grid_shape': multi_results.planes[0].peak_mask.shape,
+                'n_peaks': multi_results.planes[0].n_detections,
+            },
+            'multi_plane_results': multi_results,  # Store full multi-plane data
+        }
+
+        # Add multi-plane metadata to params for JSON
+        params['planes'] = [
+            {
+                'plane_id': plane.plane_id,
+                'd_spacing': plane.d_spacing,
+                'q_center': plane.q_center,
+                'q_range': plane.q_range,
+                'n_detections': plane.n_detections,
+                'detection_rate': plane.detection_rate,
+                'coherence_score': plane.coherence_score,
+                'is_valid': plane.is_valid,
+            }
+            for plane in multi_results.planes
+        ]
+
+    elif args.interactive_threshold and not args.no_interactive:
+        # INTERACTIVE THRESHOLD TUNING MODE
+        results = run_interactive_threshold_loop(
+            processed,
+            pixel_size_nm=params['pixel_size_nm'],
+            params=params,
+            output_path=output_path,
+            verbose=True
+        )
+    else:
+        # STANDARD SINGLE-PLANE MODE
+        analysis_params = {
+            'q_range': (params['q_min'], params['q_max']),
+            'intensity_threshold': params['intensity_threshold'],
+            'tile_size': params['tile_size'],
+            'stride': params['stride'],
+            'peak_method': args.peak_method,
+        }
+
+        results = run_radial_analysis(
+            processed,
+            pixel_size_nm=params['pixel_size_nm'],
+            output_dir=str(output_path),
+            params=analysis_params,
+            verbose=True
+        )
+
+    # Re-save parameters if interactive mode was used (threshold may have changed)
+    if args.interactive_threshold and not args.no_interactive:
+        params_serializable = {}
+        for k, v in params.items():
+            if isinstance(v, (np.floating, np.integer)):
+                params_serializable[k] = float(v) if isinstance(v, np.floating) else int(v)
+            elif isinstance(v, dict):
+                params_serializable[k] = {
+                    kk: (float(vv) if isinstance(vv, (np.floating, np.integer, float, int)) else vv)
+                    for kk, vv in v.items()
+                }
+            else:
+                params_serializable[k] = v
+        with open(params_path, 'w') as f:
+            json.dump(params_serializable, f, indent=2)
+
     # Summary
     print("\n[5/5] Summary")
     print("=" * 60)

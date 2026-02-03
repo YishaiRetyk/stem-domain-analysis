@@ -143,8 +143,28 @@ def analyze_tile_peaks(tile: np.ndarray, pixel_size_nm: float,
     
     # Find intensity in target q-range
     target_power = power_masked * q_mask
-    peak_intensity = np.max(target_power)
-    
+    intensities_in_annulus = target_power[q_mask]
+
+    # Select peak detection method
+    peak_method = p.get('peak_method', 'percentile95')
+
+    if peak_method == 'percentile95':
+        # Robust method: mean of top 5% intensities
+        if len(intensities_in_annulus) > 0:
+            p95_threshold = np.percentile(intensities_in_annulus, 95)
+            high_intensities = intensities_in_annulus[intensities_in_annulus > p95_threshold]
+            if len(high_intensities) > 0:
+                peak_intensity = np.mean(high_intensities)
+            else:
+                peak_intensity = np.max(intensities_in_annulus)
+        else:
+            peak_intensity = 0
+    elif peak_method == 'max':
+        # Original method: single pixel maximum
+        peak_intensity = np.max(target_power)
+    else:
+        raise ValueError(f"Unknown peak_method: {peak_method}")
+
     if peak_intensity < threshold:
         return TilePeakResult(
             has_peak=False,
@@ -153,10 +173,27 @@ def analyze_tile_peaks(tile: np.ndarray, pixel_size_nm: float,
             orientation_deg=0,
             confidence=0
         )
-    
+
     # Find peak location
-    peak_idx = np.unravel_index(np.argmax(target_power), target_power.shape)
-    peak_y, peak_x = peak_idx
+    if peak_method == 'max':
+        # Find single brightest pixel
+        peak_idx = np.unravel_index(np.argmax(target_power), target_power.shape)
+        peak_y, peak_x = peak_idx
+    else:  # percentile95
+        # Find centroid of top 5% intensities
+        p95_threshold = np.percentile(intensities_in_annulus, 95)
+        high_intensity_mask = (target_power > p95_threshold) & q_mask
+
+        if np.any(high_intensity_mask):
+            # Weighted centroid
+            weights = target_power[high_intensity_mask]
+            coords = np.argwhere(high_intensity_mask)
+            peak_y = np.average(coords[:, 0], weights=weights)
+            peak_x = np.average(coords[:, 1], weights=weights)
+        else:
+            # Fallback to max
+            peak_idx = np.unravel_index(np.argmax(target_power), target_power.shape)
+            peak_y, peak_x = peak_idx
     
     # Compute q at peak
     peak_r = np.sqrt((peak_x - center)**2 + (peak_y - center)**2)
@@ -322,7 +359,8 @@ def save_radial_profile_plot(profile: RadialProfile, q_range: Tuple[float, float
 
 def save_peak_location_map(image: np.ndarray, peak_mask: np.ndarray,
                            stride: int, tile_size: int,
-                           output_path: str, params: dict = None):
+                           output_path: str, params: dict = None,
+                           pixel_size_nm: float = None):
     """
     Save peak location map overlaid on original image.
     Green = peak detected, gray = no peak
@@ -330,34 +368,39 @@ def save_peak_location_map(image: np.ndarray, peak_mask: np.ndarray,
     p = params or {}
     q_range = p.get('q_range', (2.3, 2.6))
     threshold = p.get('intensity_threshold', 45000)
-    
+
     fig, ax = plt.subplots(figsize=(12, 10))
-    
+
     # Show original image
     ax.imshow(image, cmap='gray', alpha=1.0)
-    
+
     # Create overlay
     h, w = image.shape
     overlay = np.zeros((h, w, 4))  # RGBA
-    
+
     n_rows, n_cols = peak_mask.shape
-    
+
     for row in range(n_rows):
         for col in range(n_cols):
             y = row * stride
             x = col * stride
-            
+
             if peak_mask[row, col]:
                 # Green with alpha
                 overlay[y:y+tile_size, x:x+tile_size, 1] = 0.6  # G
                 overlay[y:y+tile_size, x:x+tile_size, 3] = 0.7  # A
-    
+
     ax.imshow(overlay)
-    
+
+    # Add scale bar
+    if pixel_size_nm:
+        from src.viz import add_scalebar
+        add_scalebar(ax, pixel_size_nm, image.shape, location='lower right', color='white')
+
     ax.set_title(f'Peak Locations (Green)\nq={q_range[0]}-{q_range[1]} | Thresh={threshold}')
     ax.set_xlabel('X (pixels)')
     ax.set_ylabel('Y (pixels)')
-    
+
     plt.tight_layout()
     plt.savefig(output_path, dpi=150)
     plt.close()
@@ -366,56 +409,62 @@ def save_peak_location_map(image: np.ndarray, peak_mask: np.ndarray,
 def save_orientation_map(image: np.ndarray, peak_mask: np.ndarray,
                          orientation_map: np.ndarray,
                          stride: int, tile_size: int,
-                         output_path: str, params: dict = None):
+                         output_path: str, params: dict = None,
+                         pixel_size_nm: float = None):
     """
     Save orientation map with color-coded angles.
     Uses cyclic colormap for angle visualization.
     """
     p = params or {}
     q_range = p.get('q_range', (2.3, 2.6))
-    
+
     fig, ax = plt.subplots(figsize=(12, 10))
-    
+
     # Show original image
     ax.imshow(image, cmap='gray', alpha=1.0)
-    
+
     # Create colored overlay based on orientation
     h, w = image.shape
     overlay = np.zeros((h, w, 4))  # RGBA
-    
+
     n_rows, n_cols = peak_mask.shape
-    
+
     for row in range(n_rows):
         for col in range(n_cols):
             if not peak_mask[row, col]:
                 continue
-                
+
             y = row * stride
             x = col * stride
             angle = orientation_map[row, col]
-            
+
             # Map angle (-180 to 180) to hue (0 to 1)
             hue = (angle + 180) / 360
-            
+
             # HSV to RGB
             rgb = hsv_to_rgb([hue, 0.8, 0.9])
-            
+
             overlay[y:y+tile_size, x:x+tile_size, 0] = rgb[0]
             overlay[y:y+tile_size, x:x+tile_size, 1] = rgb[1]
             overlay[y:y+tile_size, x:x+tile_size, 2] = rgb[2]
             overlay[y:y+tile_size, x:x+tile_size, 3] = 0.7
-    
+
     ax.imshow(overlay)
-    
+
+    # Add scale bar
+    if pixel_size_nm:
+        from src.viz import add_scalebar
+        add_scalebar(ax, pixel_size_nm, image.shape, location='lower right', color='white')
+
     # Add colorbar for angle
     sm = plt.cm.ScalarMappable(cmap='hsv', norm=plt.Normalize(-180, 180))
     sm.set_array([])
     cbar = plt.colorbar(sm, ax=ax, label='Angle (Degrees)')
-    
+
     ax.set_title(f'Orientation Map\nq={q_range[0]}-{q_range[1]}')
     ax.set_xlabel('X (pixels)')
     ax.set_ylabel('Y (pixels)')
-    
+
     plt.tight_layout()
     plt.savefig(output_path, dpi=150)
     plt.close()
@@ -537,22 +586,22 @@ def run_radial_analysis(image: np.ndarray, pixel_size_nm: float,
     
     save_radial_profile_plot(
         profile, p['q_range'],
-        str(output_path / '1_Radial_Profile.png'),
+        str(output_path / '2_Radial_Profile.png'),
         title=f"Enhanced Radial Profile (q={p['q_range'][0]}-{p['q_range'][1]})"
     )
-    
+
     # Also save 2D FFT power spectrum
     save_fft_power_spectrum(
         image, pixel_size_nm,
-        str(output_path / '2_FFT_Power_Spectrum.png'),
+        str(output_path / '3_FFT_Power_Spectrum.png'),
         q_range=p['q_range'],
         tile_size=p['tile_size']
     )
-    
+
     if verbose:
         print(f"  Q range: {profile.q_min:.3f} - {profile.q_max:.3f} nm^-1")
-        print(f"  Saved: 1_Radial_Profile.png")
-        print(f"  Saved: 2_FFT_Power_Spectrum.png")
+        print(f"  Saved: 2_Radial_Profile.png")
+        print(f"  Saved: 3_FFT_Power_Spectrum.png")
     
     # 2. Process tiles for peak detection
     if verbose:
@@ -569,27 +618,29 @@ def run_radial_analysis(image: np.ndarray, pixel_size_nm: float,
     save_peak_location_map(
         image, peak_results['peak_mask'],
         p['stride'], p['tile_size'],
-        str(output_path / '3_Peak_Location_Map.png'),
-        params=p
+        str(output_path / '4_Peak_Location_Map.png'),
+        params=p,
+        pixel_size_nm=pixel_size_nm
     )
-    
+
     if verbose:
-        print(f"  Saved: 3_Peak_Location_Map.png")
-    
+        print(f"  Saved: 4_Peak_Location_Map.png")
+
     # 4. Save orientation map
     if verbose:
         print("\n[4] Generating orientation map...")
-    
+
     save_orientation_map(
         image, peak_results['peak_mask'],
         peak_results['orientation_map'],
         p['stride'], p['tile_size'],
-        str(output_path / '4_Orientation_Map.png'),
-        params=p
+        str(output_path / '5_Orientation_Map.png'),
+        params=p,
+        pixel_size_nm=pixel_size_nm
     )
-    
+
     if verbose:
-        print(f"  Saved: 4_Orientation_Map.png")
+        print(f"  Saved: 5_Orientation_Map.png")
     
     # 5. Save detection heatmap
     if verbose:

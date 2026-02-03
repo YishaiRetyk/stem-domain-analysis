@@ -287,7 +287,14 @@ def estimate_threshold_for_peak(
         tile = image[y:y+tile_size, x:x+tile_size].astype(np.float64) * hann
         fft = np.fft.fftshift(np.fft.fft2(tile))
         power = np.abs(fft)**2
-        peak_intensity = np.max(power * q_mask)
+        # Use percentile95 method for robust threshold estimation
+        intensities_in_annulus = power[q_mask]
+        if len(intensities_in_annulus) > 0:
+            p95_threshold = np.percentile(intensities_in_annulus, 95)
+            high_intensities = intensities_in_annulus[intensities_in_annulus > p95_threshold]
+            peak_intensity = np.mean(high_intensities) if len(high_intensities) > 0 else np.max(intensities_in_annulus)
+        else:
+            peak_intensity = 0
         intensities.append(peak_intensity)
     
     intensities = np.array(intensities)
