@@ -212,6 +212,13 @@ Multi-Plane Analysis (E4):
   --max-planes N          Maximum planes to analyze (default: 5)
 ```
 
+### Getting Help
+
+```bash
+# Show all available options
+python analyze.py --help
+```
+
 ### Usage Examples
 
 ```bash
