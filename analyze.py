@@ -900,6 +900,8 @@ Examples:
         params['interactive_threshold_mode'] = True
 
     # Save parameters (convert numpy types for JSON)
+    from dataclasses import is_dataclass, asdict
+
     params_path = output_path / 'parameters.json'
     params_serializable = {}
     for k, v in params.items():
@@ -911,6 +913,15 @@ Examples:
                 kk: (float(vv) if isinstance(vv, (np.floating, np.integer, float, int)) else vv)
                 for kk, vv in v.items()
             }
+        elif isinstance(v, list):
+            # Handle lists (e.g., discovered_peaks with DiscoveredPeak objects)
+            params_serializable[k] = [
+                asdict(item) if is_dataclass(item) else item
+                for item in v
+            ]
+        elif is_dataclass(v):
+            # Handle individual dataclass objects
+            params_serializable[k] = asdict(v)
         else:
             params_serializable[k] = v
     with open(params_path, 'w') as f:
@@ -1026,6 +1037,15 @@ Examples:
                     kk: (float(vv) if isinstance(vv, (np.floating, np.integer, float, int)) else vv)
                     for kk, vv in v.items()
                 }
+            elif isinstance(v, list):
+                # Handle lists (e.g., discovered_peaks with DiscoveredPeak objects)
+                params_serializable[k] = [
+                    asdict(item) if is_dataclass(item) else item
+                    for item in v
+                ]
+            elif is_dataclass(v):
+                # Handle individual dataclass objects
+                params_serializable[k] = asdict(v)
             else:
                 params_serializable[k] = v
         with open(params_path, 'w') as f:
