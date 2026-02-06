@@ -703,6 +703,336 @@ def run_interactive_threshold_loop(
                     sys.exit(1)
 
 
+def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
+                        metadata: dict) -> int:
+    """Run the new hybrid FFT + GPA + Peak-Finding pipeline.
+
+    Pipeline order:
+    1. LOAD (already done) + G1 input validation + FFTGrid
+    2. BRANCH A: preprocess_fft_safe
+    3. BRANCH B: preprocess_segmentation
+    4. EARLY ROI (uses Branch B)
+    5. GLOBAL FFT (uses Branch A)
+    6. TILE FFT + Two-Tier SNR (uses Branch A + ROI)
+    7. GPA (optional)
+    8. PEAK FINDING (optional)
+    9. VALIDATION + REPORTING
+    """
+    import logging
+    from src.fft_coords import FFTGrid
+    from src.pipeline_config import PipelineConfig, GPAConfig, TierConfig
+    from src.preprocess_fft_safe import preprocess_fft_safe
+    from src.preprocess_segmentation import preprocess_segmentation
+    from src.roi_masking import compute_roi_mask, downsample_to_tile_grid
+    from src.global_fft import compute_global_fft
+    from src.tile_fft import process_all_tiles, check_tiling_adequacy
+    from src.fft_snr_metrics import build_gated_tile_grid
+    from src.gates import evaluate_gate
+    from src.validation import validate_pipeline
+    from src.reporting import save_pipeline_artifacts, save_json
+
+    # Configure logging
+    log_level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(level=log_level,
+                        format='%(name)s %(levelname)s: %(message)s')
+
+    # --- Load config ---
+    config = PipelineConfig()
+    if args.config:
+        try:
+            import yaml
+            with open(args.config) as f:
+                cfg_dict = yaml.safe_load(f)
+            config = PipelineConfig.from_dict(cfg_dict)
+            print(f"  Loaded config from {args.config}")
+        except ImportError:
+            print("  WARNING: pyyaml not installed, using defaults")
+        except Exception as e:
+            print(f"  WARNING: Failed to load config: {e}, using defaults")
+
+    # Apply CLI overrides
+    pixel_size = args.pixel_size or metadata.get('pixel_size_nm') or config.pixel_size_nm
+    config.pixel_size_nm = pixel_size
+    if args.tile_size:
+        config.tile_size = args.tile_size
+    if args.stride:
+        config.stride = args.stride
+    else:
+        config.stride = config.tile_size // 2
+    config.tier.tier_a_snr = args.snr_tier_a
+    config.tier.tier_b_snr = args.snr_tier_b
+    config.gpa.mode = args.gpa_mode
+    config.gpa.on_fail = args.gpa_on_fail
+    if args.no_gpa:
+        config.gpa.enabled = False
+    if args.no_peak_finding:
+        config.peak_finding.enabled = False
+
+    H, W = image.shape
+    print(f"\n  Image: {H}x{W}, pixel_size={pixel_size:.6f} nm")
+    print(f"  Tile: {config.tile_size}, stride: {config.stride}")
+    print(f"  Tier A SNR: {config.tier.tier_a_snr}, Tier B: {config.tier.tier_b_snr}")
+
+    # --- Step 1: Input validation (G1) ---
+    print("\n[1/9] Input validation...")
+    g1_checks = {
+        "is_2d": image.ndim == 2,
+        "no_nan": not np.any(np.isnan(image)),
+        "no_inf": not np.any(np.isinf(image)),
+        "min_dim": min(H, W) >= 512,
+        "has_pixel_size": pixel_size > 0,
+    }
+    g1 = evaluate_gate("G1", g1_checks)
+    gate_results = {"G1": g1}
+    if not g1.passed:
+        print(f"  FATAL: Input validation failed: {g1.reason}")
+        return 1
+    print("  G1 PASS")
+
+    # Instantiate FFTGrid (canonical coordinate system)
+    fft_grid = FFTGrid(H, W, pixel_size)
+
+    # --- Step 2: Branch A preprocessing (FFT-safe) ---
+    print("\n[2/9] Branch A: FFT-safe preprocessing...")
+    preproc_record = preprocess_fft_safe(image, config.preprocessing)
+    gate_results["G2"] = evaluate_gate("G2", {
+        "clipped_fraction": preproc_record.diagnostics.get("clipped_fraction", 0),
+        "intensity_range_ratio": preproc_record.diagnostics.get("intensity_range_ratio", 100),
+    })
+    print(f"  Confidence: {preproc_record.confidence}")
+    print(f"  G2 {'PASS' if gate_results['G2'].passed else 'FAIL (DEGRADE)'}")
+
+    # --- Step 3: Branch B preprocessing (segmentation) ---
+    print("\n[3/9] Branch B: Segmentation preprocessing...")
+    seg_record = preprocess_segmentation(image, config.segmentation)
+    print(f"  Output range: [{seg_record.image_seg.min():.3f}, {seg_record.image_seg.max():.3f}]")
+
+    # --- Step 4: Early ROI ---
+    print("\n[4/9] Early ROI masking...")
+    roi_result = compute_roi_mask(seg_record.image_seg, config.roi)
+    roi_grid = downsample_to_tile_grid(
+        roi_result.mask_full, config.tile_size, config.stride,
+        min_coverage=config.roi.min_tile_coverage
+    )
+    gate_results["G3"] = evaluate_gate("G3", {
+        "coverage_pct": roi_result.coverage_pct,
+        "n_components": roi_result.n_components,
+    })
+    print(f"  Coverage: {roi_result.coverage_pct:.1f}%, components: {roi_result.n_components}")
+    print(f"  G3 {'PASS' if gate_results['G3'].passed else 'FAIL (FALLBACK)'}")
+    if not gate_results["G3"].passed:
+        roi_grid = np.ones(roi_grid.shape, dtype=bool)
+        print("  Using full-image ROI (fallback)")
+
+    # --- Step 5: Global FFT ---
+    print("\n[5/9] Global FFT analysis...")
+    global_fft_result = compute_global_fft(preproc_record.image_fft, fft_grid, config.global_fft)
+    d_dom = global_fft_result.d_dom
+
+    best_global_snr = max((p.snr for p in global_fft_result.peaks), default=0)
+    gate_results["G4"] = evaluate_gate("G4", best_global_snr)
+    print(f"  d_dom: {d_dom:.3f} nm" if d_dom else "  d_dom: not found")
+    print(f"  Peaks found: {len(global_fft_result.peaks)}, g-vectors: {len(global_fft_result.g_vectors)}")
+    print(f"  G4 {'PASS' if gate_results['G4'].passed else 'FAIL (FALLBACK)'}")
+
+    # Determine q_ranges for tile FFT from global peaks
+    q_ranges = []
+    if global_fft_result.peaks:
+        for p in global_fft_result.peaks:
+            q_width = max(p.q_fwhm * 2, p.q_center * 0.03) if p.q_fwhm > 0 else p.q_center * 0.1
+            q_ranges.append((p.q_center - q_width, p.q_center + q_width))
+    elif args.d_min is not None and args.d_max is not None:
+        q_ranges.append((1.0 / args.d_max, 1.0 / args.d_min))
+
+    # --- Step 6: Tile FFT + Two-tier classification ---
+    print("\n[6/9] Tile FFT + Two-tier classification...")
+
+    # G5: tiling adequacy
+    d_for_g5 = d_dom if d_dom else (args.d_max if args.d_max else 1.0)
+    d_px = d_for_g5 / pixel_size
+    periods = config.tile_size / d_px if d_px > 0 else 0
+    gate_results["G5"] = evaluate_gate("G5", periods)
+    if not gate_results["G5"].passed:
+        print(f"  FATAL: Only {periods:.1f} periods per tile (need >=20)")
+        # Save what we have and exit
+        report = validate_pipeline(
+            preproc_record=preproc_record, roi_result=roi_result,
+            global_fft_result=global_fft_result,
+            gate_results=gate_results, tile_size=config.tile_size,
+            pixel_size_nm=pixel_size, d_dom_nm=d_dom,
+        )
+        save_pipeline_artifacts(
+            output_path, config=config, fft_grid=fft_grid,
+            preproc_record=preproc_record, seg_record=seg_record,
+            roi_result=roi_result, global_fft_result=global_fft_result,
+            validation_report=report,
+        )
+        return 1
+    print(f"  Periods/tile: {periods:.1f} (G5 PASS)")
+
+    peak_sets, skipped_mask = process_all_tiles(
+        preproc_record.image_fft, roi_grid, fft_grid,
+        tile_size=config.tile_size, stride=config.stride,
+        q_ranges=q_ranges if q_ranges else None,
+    )
+
+    tile_fft_grid = FFTGrid(config.tile_size, config.tile_size, pixel_size)
+    gated_grid = build_gated_tile_grid(
+        peak_sets, skipped_mask, tile_fft_grid, config.tile_size,
+        tier_config=config.tier, peak_gate_config=config.peak_gates,
+    )
+
+    ts = gated_grid.tier_summary
+    print(f"  Tier A: {ts.n_tier_a}, Tier B: {ts.n_tier_b}, "
+          f"Rejected: {ts.n_rejected}, Skipped: {ts.n_skipped}")
+    print(f"  Tier A fraction: {ts.tier_a_fraction:.3f}")
+
+    gate_results["G6"] = evaluate_gate("G6", ts.tier_a_fraction)
+    gate_results["G7"] = evaluate_gate("G7", ts.median_snr_tier_a)
+    tier_a_sym = gated_grid.symmetry_map[gated_grid.tier_map == "A"]
+    mean_sym = float(np.mean(tier_a_sym)) if len(tier_a_sym) > 0 else 0.0
+    gate_results["G8"] = evaluate_gate("G8", mean_sym)
+    for gid in ("G6", "G7", "G8"):
+        print(f"  {gid} {'PASS' if gate_results[gid].passed else 'FAIL'}")
+
+    # --- Step 7: GPA ---
+    gpa_result = None
+    if config.gpa.enabled and global_fft_result.g_vectors:
+        print(f"\n[7/9] GPA (mode={config.gpa.mode})...")
+        from src.gpa import run_gpa
+
+        gpa_result = run_gpa(
+            preproc_record.image_fft,
+            global_fft_result.g_vectors,
+            gated_grid, global_fft_result, fft_grid,
+            config=config.gpa,
+            tile_size=config.tile_size,
+            stride=config.stride,
+        )
+        if gpa_result is not None:
+            print(f"  Mode used: {gpa_result.mode}")
+            print(f"  Phases computed: {len(gpa_result.phases)}")
+            print(f"  Displacement: {'yes' if gpa_result.displacement else 'no'}")
+            print(f"  Strain: {'yes' if gpa_result.strain else 'no'}")
+            # Collect GPA gate results if present
+            if gpa_result.qc.get("g10_passed") is not None:
+                g10_val = {
+                    "phase_noise": {k: v.phase_noise_sigma
+                                    for k, v in gpa_result.phases.items()
+                                    if v.phase_noise_sigma is not None},
+                    "unwrap_success": {k: v.unwrap_success_fraction
+                                       for k, v in gpa_result.phases.items()},
+                }
+                gate_results["G10"] = evaluate_gate("G10", g10_val)
+                print(f"  G10 {'PASS' if gate_results['G10'].passed else 'FAIL'}")
+            if gpa_result.qc.get("g11_passed") is not None:
+                g11_val = {
+                    "ref_strain_max": gpa_result.qc.get("ref_strain_mean_exx", 0),
+                    "outlier_fraction": gpa_result.qc.get("strain_outlier_fraction", 0),
+                }
+                gate_results["G11"] = evaluate_gate("G11", g11_val)
+                print(f"  G11 {'PASS' if gate_results['G11'].passed else 'FAIL'}")
+        else:
+            print("  GPA skipped")
+    else:
+        print("\n[7/9] GPA skipped")
+        if not config.gpa.enabled:
+            print("  (disabled by config)")
+        elif not global_fft_result.g_vectors:
+            print("  (no g-vectors available)")
+
+    # --- Step 8: Peak finding ---
+    lattice_validation = None
+    peaks = None
+    if config.peak_finding.enabled and d_dom is not None:
+        print("\n[8/9] Peak finding...")
+        from src.peak_finding import (
+            build_bandpass_image, find_subpixel_peaks, validate_peak_lattice,
+        )
+
+        g_dom_mag = 1.0 / d_dom if d_dom > 0 else None
+        peak_image = build_bandpass_image(
+            preproc_record.image_fft, g_dom_mag, fft_grid,
+            bandwidth_fraction=config.peak_finding.bandpass_bandwidth,
+        )
+
+        peaks = find_subpixel_peaks(
+            peak_image, d_dom, pixel_size,
+            min_prominence=config.peak_finding.min_prominence,
+            tile_size=config.tile_size,
+        )
+        print(f"  Peaks found: {len(peaks)}")
+
+        if len(peaks) >= 2:
+            lattice_validation = validate_peak_lattice(
+                peaks, d_dom, pixel_size,
+                tolerance=config.peak_finding.lattice_tolerance,
+            )
+            gate_results["G12"] = evaluate_gate("G12", lattice_validation.fraction_valid)
+            print(f"  Lattice valid: {lattice_validation.fraction_valid:.1%}")
+            print(f"  G12 {'PASS' if gate_results['G12'].passed else 'FAIL'}")
+    else:
+        print("\n[8/9] Peak finding skipped")
+
+    # --- Step 9: Validation + Reporting ---
+    print("\n[9/9] Validation and reporting...")
+    report = validate_pipeline(
+        preproc_record=preproc_record,
+        roi_result=roi_result,
+        global_fft_result=global_fft_result,
+        gated_grid=gated_grid,
+        gpa_result=gpa_result,
+        lattice_validation=lattice_validation,
+        gate_results=gate_results,
+        tile_size=config.tile_size,
+        pixel_size_nm=pixel_size,
+        d_dom_nm=d_dom,
+    )
+
+    saved = save_pipeline_artifacts(
+        output_path,
+        config=config,
+        fft_grid=fft_grid,
+        preproc_record=preproc_record,
+        seg_record=seg_record,
+        roi_result=roi_result,
+        global_fft_result=global_fft_result,
+        gated_grid=gated_grid,
+        gpa_result=gpa_result,
+        lattice_validation=lattice_validation,
+        peaks=peaks,
+        validation_report=report,
+    )
+
+    # --- Summary ---
+    print("\n" + "=" * 60)
+    print("HYBRID PIPELINE SUMMARY")
+    print("=" * 60)
+    print(f"  {report.summary}")
+    print()
+    if gated_grid:
+        print(f"  Tier A: {ts.n_tier_a} tiles ({ts.tier_a_fraction:.1%})")
+        print(f"  Tier B: {ts.n_tier_b} tiles")
+        print(f"  Rejected: {ts.n_rejected} tiles")
+    if gpa_result:
+        print(f"  GPA mode: {gpa_result.mode}")
+    if lattice_validation:
+        print(f"  Peak lattice valid: {lattice_validation.fraction_valid:.1%}")
+    print()
+    print("Output files:")
+    for name, path in sorted(saved.items()):
+        print(f"  - {name}")
+    print()
+    print("=" * 60)
+    if report.overall_pass:
+        print("PIPELINE COMPLETE")
+    else:
+        print("PIPELINE COMPLETE (with failures)")
+    print("=" * 60)
+
+    return 0 if report.overall_pass else 1
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="STEM Domain Analysis - Automated Pipeline",
@@ -757,6 +1087,30 @@ Examples:
                         help='Interactive mode: select peaks and/or tune threshold')
     parser.add_argument('--max-planes', type=int, default=5,
                         help='Maximum number of planes to analyze (default: 5)')
+
+    # --- New hybrid pipeline flags (WS8) ---
+    parser.add_argument('--hybrid', action='store_true',
+                        help='Run the new hybrid FFT+GPA+Peak-Finding pipeline')
+    parser.add_argument('--config', type=str, default=None,
+                        help='YAML config file for hybrid pipeline')
+    parser.add_argument('--gpa-mode', type=str, choices=['auto', 'full', 'region'],
+                        default='auto', dest='gpa_mode',
+                        help='GPA execution mode (default: auto)')
+    parser.add_argument('--gpa-on-fail', type=str,
+                        choices=['fallback_to_region', 'skip', 'error'],
+                        default='fallback_to_region', dest='gpa_on_fail',
+                        help='GPA failure behavior (default: fallback_to_region)')
+    parser.add_argument('--snr-tier-a', type=float, default=5.0, dest='snr_tier_a',
+                        help='Tier A SNR threshold (default: 5.0)')
+    parser.add_argument('--snr-tier-b', type=float, default=3.0, dest='snr_tier_b',
+                        help='Tier B SNR threshold (default: 3.0)')
+    parser.add_argument('--no-gpa', action='store_true', dest='no_gpa',
+                        help='Skip GPA stage entirely')
+    parser.add_argument('--no-peak-finding', action='store_true', dest='no_peak_finding',
+                        help='Skip peak-finding stage')
+    parser.add_argument('--report-format', type=str, choices=['json', 'html', 'both'],
+                        default='json', dest='report_format',
+                        help='Report output format (default: json)')
 
     args = parser.parse_args()
     
@@ -848,6 +1202,11 @@ Examples:
             cmap='gray'
         )
         print(f"  Saved: 0_Original.png")
+
+    # --- Dispatch to hybrid pipeline if requested ---
+    if args.hybrid:
+        print("\n  Running HYBRID pipeline (FFT + GPA + Peak-Finding)")
+        return run_hybrid_pipeline(image, args, output_path, metadata)
 
     # Preprocess first (needed for auto-threshold detection)
     print("\n[2/5] Preprocessing...")
