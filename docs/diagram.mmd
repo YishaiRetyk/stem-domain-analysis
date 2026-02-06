@@ -1,0 +1,301 @@
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#e1f5fe', 'primaryTextColor': '#01579b', 'primaryBorderColor': '#0288d1', 'lineColor': '#0288d1', 'secondaryColor': '#fff3e0', 'tertiaryColor': '#f3e5f5'}}}%%
+
+flowchart TB
+    %% ============================================================
+    %% STEM DOMAIN ANALYSIS - COMPLETE WORKFLOW DIAGRAM
+    %% ============================================================
+    %% This diagram shows all processing stages, noise filtering
+    %% operations, and artifacts produced by the pipeline.
+    %% ============================================================
+
+    subgraph INPUT["📥 INPUT STAGE"]
+        direction TB
+        IN_FILE["Input File<br/>.dm4 / .dm3 / .tiff / .npy"]
+        IN_META["Metadata Extraction<br/>(pixel_size_nm)"]
+        IN_FILE --> IN_META
+    end
+
+    subgraph PREPROCESS["🔧 PREPROCESSING STAGE"]
+        direction TB
+
+        subgraph PREPROCESS_FILTERS["Noise Filtering"]
+            PP_CLIP["<b>Outlier Clipping</b><br/>Percentile p0.1 - p99.9<br/><i>Removes hot/dead pixels</i>"]
+            PP_NORM["<b>Min-Max Normalization</b><br/>Scale to [0, 1]<br/><i>Standardizes intensity range</i>"]
+            PP_GAUSS["<b>Gaussian Smoothing</b><br/>σ = 0.5<br/><i>Reduces high-freq noise</i>"]
+        end
+
+        PP_CLIP --> PP_NORM --> PP_GAUSS
+
+        PP_QC["Spectral Entropy QC<br/>(Gate G2 validation)"]
+        PP_GAUSS --> PP_QC
+    end
+
+    subgraph PREPROCESS_ARTIFACTS["📄 Preprocessing Artifacts"]
+        direction LR
+        ART_ORIG_NPY[("original.npy")]
+        ART_ORIG_PNG[("0_Original.png")]
+        ART_PP_NPY[("preprocessed.npy<br/><i>--save-preprocessed</i>")]
+        ART_G2[("g2_result.json")]
+    end
+
+    subgraph DISCOVERY["🔍 PEAK DISCOVERY STAGE<br/><i>(--auto-discover)</i>"]
+        direction TB
+
+        subgraph DISCOVERY_FFT["FFT Preparation"]
+            DISC_SAMPLE["Multi-tile Sampling<br/>(100+ tiles)"]
+            DISC_HANN["<b>Hann Window</b><br/>2D outer product<br/><i>Reduces spectral leakage</i>"]
+            DISC_FFT["2D FFT"]
+            DISC_DC["<b>DC Masking</b><br/>2-3 pixel radius<br/><i>Removes DC bias</i>"]
+        end
+
+        DISC_SAMPLE --> DISC_HANN --> DISC_FFT --> DISC_DC
+
+        subgraph DISCOVERY_RADIAL["Radial Profile Analysis"]
+            DISC_RADIAL["<b>Radial Binning</b><br/>Azimuthal averaging<br/><i>Reduces noise via averaging</i>"]
+            DISC_POLY["<b>Polynomial Background Fit</b><br/>Degree 5-6, log-space<br/>3 iterations, MAD weighting<br/><i>Removes smooth decay</i>"]
+            DISC_SAVGOL["<b>Savitzky-Golay Filter</b><br/>window=11, polyorder=2<br/><i>Smooths for peak finding</i>"]
+        end
+
+        DISC_DC --> DISC_RADIAL --> DISC_POLY --> DISC_SAVGOL
+
+        DISC_PEAKS["Peak Detection<br/>(prominence + SNR)"]
+        DISC_SAVGOL --> DISC_PEAKS
+    end
+
+    subgraph DISCOVERY_ARTIFACTS["📄 Discovery Artifacts"]
+        direction LR
+        ART_DISC_PNG[("1_Peak_Discovery.png")]
+    end
+
+    subgraph THRESHOLD["⚖️ THRESHOLD DETECTION"]
+        direction TB
+
+        subgraph THRESHOLD_METHODS["Ensemble Methods"]
+            TH_OTSU["Otsu's Method<br/><i>Bimodal separation</i>"]
+            TH_PERC["Percentile-90<br/><i>Top 10% as crystalline</i>"]
+            TH_MAD["<b>Median + 3×MAD</b><br/><i>Robust outlier detection</i>"]
+            TH_KNEE["Knee Detection<br/><i>Elbow in sorted curve</i>"]
+            TH_GMM["GMM (2-component)<br/><i>Gaussian mixture</i>"]
+            TH_BIMOD["<b>Bimodality Test</b><br/>Gaussian-smoothed histogram<br/><i>Detects two populations</i>"]
+        end
+
+        TH_ENSEMBLE["Ensemble Decision<br/>(consensus voting)"]
+        TH_OTSU & TH_PERC & TH_MAD & TH_KNEE & TH_GMM & TH_BIMOD --> TH_ENSEMBLE
+    end
+
+    subgraph ANALYSIS["📊 RADIAL ANALYSIS STAGE"]
+        direction TB
+
+        subgraph ANALYSIS_TILE["Per-Tile FFT Processing"]
+            AN_TILE["Tile Extraction<br/>(256×256, stride 128)"]
+            AN_HANN2["<b>Hann Window</b><br/><i>Spectral leakage reduction</i>"]
+            AN_FFT2["2D FFT + Shift"]
+            AN_DC2["<b>DC Masking</b><br/><i>Remove DC component</i>"]
+            AN_QMASK["Q-range Masking<br/>(annulus selection)"]
+        end
+
+        AN_TILE --> AN_HANN2 --> AN_FFT2 --> AN_DC2 --> AN_QMASK
+
+        subgraph ANALYSIS_PEAK["Peak Detection"]
+            AN_THRESH["<b>Intensity Thresholding</b><br/>percentile95 or max<br/><i>Classify crystalline/amorphous</i>"]
+            AN_CENTROID["<b>Weighted Centroid</b><br/>Top 5% pixels<br/><i>Robust peak location</i>"]
+            AN_ORIENT["Orientation Calculation<br/>(-180° to +180°)"]
+        end
+
+        AN_QMASK --> AN_THRESH --> AN_CENTROID --> AN_ORIENT
+
+        AN_RADIAL2["<b>Radial Profile</b><br/>Azimuthal average<br/><i>Global spectrum</i>"]
+        AN_DC2 --> AN_RADIAL2
+    end
+
+    subgraph ANALYSIS_ARTIFACTS["📄 Analysis Artifacts"]
+        direction LR
+        ART_RADIAL[("2_Radial_Profile.png")]
+        ART_FFT[("3_FFT_Power_Spectrum.png")]
+        ART_PEAK[("4_Peak_Location_Map.png")]
+        ART_ORIENT[("5_Orientation_Map.png")]
+        ART_HEAT[("Heatmap.png")]
+    end
+
+    subgraph MULTIPLANE["🔀 MULTI-PLANE ANALYSIS<br/><i>(--multi-plane --auto-discover)</i>"]
+        direction TB
+        MP_LOOP["Per-Plane Loop<br/>(up to 5 planes)"]
+        MP_QRANGE["Plane-specific Q-range"]
+        MP_ANALYSIS["Independent Analysis<br/>(per-plane orientation)"]
+        MP_COMPOSITE["Composite Map<br/>(dominant plane per tile)"]
+
+        MP_LOOP --> MP_QRANGE --> MP_ANALYSIS --> MP_COMPOSITE
+    end
+
+    subgraph MULTIPLANE_ARTIFACTS["📄 Multi-Plane Artifacts"]
+        direction LR
+        ART_MP_A[("5a_Orientation_Plane0.png")]
+        ART_MP_B[("5b_Orientation_Plane1.png")]
+        ART_MP_ETC[("5c/5d/5e...")]
+        ART_MP_COMP[("6_Multi_Plane_Composite.png")]
+    end
+
+    subgraph ROI["🎯 ROI MASKING<br/><i>(ilastik_roi module)</i>"]
+        direction TB
+
+        subgraph ROI_FEATURES["Feature Computation"]
+            ROI_INT["<b>Intensity Threshold</b><br/>Percentile 10<br/><i>Exclude dark background</i>"]
+            ROI_VAR["<b>Local Variance</b><br/>32×32 convolution<br/><i>Texture-based filtering</i>"]
+            ROI_CRYST["Crystallinity Score<br/>(FFT-based)"]
+        end
+
+        ROI_INT & ROI_VAR & ROI_CRYST --> ROI_COMBINE
+
+        ROI_COMBINE["Weighted Combination<br/>(0.3×int + 0.2×var + 0.5×cryst)"]
+
+        subgraph ROI_MORPH["Morphological Cleanup"]
+            ROI_THRESH2["<b>Binary Threshold</b><br/>p > 0.3<br/><i>Probability to mask</i>"]
+            ROI_FILL["<b>Binary Fill Holes</b><br/><i>Fill enclosed gaps</i>"]
+            ROI_OPEN["<b>Binary Opening</b><br/>5×5 kernel<br/><i>Remove small noise</i>"]
+            ROI_SMOOTH["<b>Gaussian Smooth Edges</b><br/>σ = 2.0<br/><i>Smooth mask boundaries</i>"]
+        end
+
+        ROI_COMBINE --> ROI_THRESH2 --> ROI_FILL --> ROI_OPEN --> ROI_SMOOTH
+    end
+
+    subgraph ROI_ARTIFACTS["📄 ROI Artifacts"]
+        direction LR
+        ART_ROI_MASK[("ilastik_mask.npy")]
+        ART_ROI_PROB[("ilastik_prob.npy")]
+        ART_ROI_PNG[("ilastik_mask_overlay.png")]
+    end
+
+    subgraph FEATURES["📐 FEATURE EXTRACTION<br/><i>(fft_features module)</i>"]
+        direction TB
+        FE_TILES["Tile Grid Processing"]
+        FE_MAX["<b>Maximum Filter</b><br/>5×5 footprint<br/><i>Local peak detection</i>"]
+        FE_EXTRACT["Feature Vector Extraction<br/>(orientation, d-spacing, intensity)"]
+
+        FE_TILES --> FE_MAX --> FE_EXTRACT
+    end
+
+    subgraph FEATURES_ARTIFACTS["📄 Feature Artifacts"]
+        direction LR
+        ART_FE_NPZ[("tile_features.npz")]
+        ART_FE_GRID[("tile_grid_overlay.png")]
+        ART_FE_COUNT[("peak_count_map.png")]
+        ART_FE_CONF[("confidence_map.png")]
+    end
+
+    subgraph CLUSTER["🧩 CLUSTERING<br/><i>(cluster_domains module)</i>"]
+        direction TB
+
+        CL_SCALE["<b>StandardScaler</b><br/>Z-score normalization<br/><i>Equal feature weighting</i>"]
+        CL_HDBSCAN["HDBSCAN Clustering"]
+
+        subgraph CL_SPATIAL["Spatial Regularization"]
+            CL_MODE["<b>Mode Filter</b><br/>3×3 neighborhood<br/>2 iterations<br/><i>Smooth label boundaries</i>"]
+            CL_DILATE["<b>Binary Dilation</b><br/><i>Find neighbors for tiny regions</i>"]
+            CL_LABEL["<b>Connected Components</b><br/><i>Region identification</i>"]
+        end
+
+        CL_SCALE --> CL_HDBSCAN --> CL_MODE --> CL_DILATE --> CL_LABEL
+    end
+
+    subgraph CLUSTER_ARTIFACTS["📄 Clustering Artifacts"]
+        direction LR
+        ART_CL_JSON[("clustering_results.json")]
+        ART_CL_LABELS[("tile_labels.npy")]
+        ART_CL_IMAGE[("label_image.npy")]
+    end
+
+    subgraph METRICS["📈 DOMAIN METRICS<br/><i>(domain_metrics module)</i>"]
+        direction TB
+        DM_COMPUTE["Per-Domain Statistics<br/>(area, orientation, crystallinity)"]
+        DM_GATE["Gate G7 Validation"]
+
+        DM_COMPUTE --> DM_GATE
+    end
+
+    subgraph METRICS_ARTIFACTS["📄 Metrics Artifacts"]
+        direction LR
+        ART_DM_CSV[("domain_summary.csv")]
+        ART_DM_G7[("gate_g7_report.json")]
+        ART_DM_PEAKS[("domain_peaks/*.png")]
+    end
+
+    subgraph VALIDATION["✅ VALIDATION<br/><i>(--validate)</i>"]
+        direction TB
+        VAL_DETECT["Detection Rate"]
+        VAL_COHERE["Coherence Score"]
+        VAL_ENTROPY["Orientation Entropy"]
+        VAL_DOMAINS["Domain Count & Size"]
+        VAL_INTERP["Interpretation<br/>(good_domains / weak_domains /<br/>likely_noise / sparse_or_noise)"]
+
+        VAL_DETECT & VAL_COHERE & VAL_ENTROPY & VAL_DOMAINS --> VAL_INTERP
+    end
+
+    subgraph OUTPUT["📤 OUTPUT STAGE"]
+        direction TB
+        OUT_PARAMS[("parameters.json<br/><i>All params + results</i>")]
+    end
+
+    %% ============================================================
+    %% MAIN FLOW CONNECTIONS
+    %% ============================================================
+
+    INPUT --> PREPROCESS
+    PREPROCESS --> PREPROCESS_ARTIFACTS
+
+    PREPROCESS --> DISCOVERY
+    DISCOVERY --> DISCOVERY_ARTIFACTS
+    DISCOVERY --> THRESHOLD
+
+    PREPROCESS --> THRESHOLD
+    THRESHOLD --> ANALYSIS
+
+    ANALYSIS --> ANALYSIS_ARTIFACTS
+
+    ANALYSIS --> MULTIPLANE
+    MULTIPLANE --> MULTIPLANE_ARTIFACTS
+
+    ANALYSIS --> ROI
+    ROI --> ROI_ARTIFACTS
+
+    ANALYSIS --> FEATURES
+    FEATURES --> FEATURES_ARTIFACTS
+
+    FEATURES --> CLUSTER
+    CLUSTER --> CLUSTER_ARTIFACTS
+
+    CLUSTER --> METRICS
+    METRICS --> METRICS_ARTIFACTS
+
+    ANALYSIS --> VALIDATION
+    VALIDATION --> OUTPUT
+
+    %% ============================================================
+    %% STYLING
+    %% ============================================================
+
+    %% Noise filter styling (orange background)
+    classDef filterNode fill:#fff3e0,stroke:#e65100,stroke-width:2px,color:#e65100
+    class PP_CLIP,PP_NORM,PP_GAUSS,DISC_HANN,DISC_DC,DISC_RADIAL,DISC_POLY,DISC_SAVGOL filterNode
+    class TH_MAD,TH_BIMOD,AN_HANN2,AN_DC2,AN_THRESH,AN_CENTROID,AN_RADIAL2 filterNode
+    class ROI_INT,ROI_VAR,ROI_THRESH2,ROI_FILL,ROI_OPEN,ROI_SMOOTH filterNode
+    class FE_MAX,CL_SCALE,CL_MODE,CL_DILATE,CL_LABEL filterNode
+
+    %% Artifact styling (green with database icon)
+    classDef artifactNode fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#1b5e20
+    class ART_ORIG_NPY,ART_ORIG_PNG,ART_PP_NPY,ART_G2 artifactNode
+    class ART_DISC_PNG artifactNode
+    class ART_RADIAL,ART_FFT,ART_PEAK,ART_ORIENT,ART_HEAT artifactNode
+    class ART_MP_A,ART_MP_B,ART_MP_ETC,ART_MP_COMP artifactNode
+    class ART_ROI_MASK,ART_ROI_PROB,ART_ROI_PNG artifactNode
+    class ART_FE_NPZ,ART_FE_GRID,ART_FE_COUNT,ART_FE_CONF artifactNode
+    class ART_CL_JSON,ART_CL_LABELS,ART_CL_IMAGE artifactNode
+    class ART_DM_CSV,ART_DM_G7,ART_DM_PEAKS artifactNode
+    class OUT_PARAMS artifactNode
+
+    %% Stage subgraph styling
+    classDef stageSubgraph fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
+    class INPUT,PREPROCESS,DISCOVERY,THRESHOLD,ANALYSIS,MULTIPLANE,ROI,FEATURES,CLUSTER,METRICS,VALIDATION,OUTPUT stageSubgraph
+
+    %% Artifact subgraph styling
+    classDef artifactSubgraph fill:#f1f8e9,stroke:#558b2f,stroke-width:1px,stroke-dasharray: 5 5
+    class PREPROCESS_ARTIFACTS,DISCOVERY_ARTIFACTS,ANALYSIS_ARTIFACTS,MULTIPLANE_ARTIFACTS,ROI_ARTIFACTS,FEATURES_ARTIFACTS,CLUSTER_ARTIFACTS,METRICS_ARTIFACTS artifactSubgraph
