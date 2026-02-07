@@ -940,6 +940,7 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
             config=config.gpa,
             tile_size=config.tile_size,
             stride=config.stride,
+            ctx=ctx,
         )
         if gpa_result is not None:
             print(f"  Mode used: {gpa_result.mode}")

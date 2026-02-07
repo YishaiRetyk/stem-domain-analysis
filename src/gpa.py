@@ -145,47 +145,85 @@ def compute_gpa_phase(image_fft: np.ndarray,
                       g_vector: GVector,
                       mask_sigma_q: float,
                       fft_grid: FFTGrid,
-                      amplitude_threshold: float = 0.1) -> GPAPhaseResult:
+                      amplitude_threshold: float = 0.1,
+                      ctx=None,
+                      _cached_ft_shifted=None) -> GPAPhaseResult:
     """GPA phase extraction following Hytch et al. (1998).
 
     Uses subpixel-correct real-space phase ramp (F2).
     Phase unwrapping on full array without zero-forcing (F3).
+
+    Parameters
+    ----------
+    ctx : DeviceContext, optional
+        GPU/CPU context. ``None`` uses pure NumPy (backward-compatible).
+    _cached_ft_shifted : array, optional
+        Pre-computed ``fftshift(fft2(image_fft))``. When provided, steps 1-2
+        are skipped and this array is reused (not deleted by this function).
     """
     H, W = image_fft.shape
     px = fft_grid.pixel_size_nm
 
-    # FFT
-    FT = np.fft.fft2(image_fft)
-    FT_shifted = np.fft.fftshift(FT)
+    use_gpu = ctx is not None and ctx.using_gpu
+
+    if use_gpu:
+        try:
+            return _compute_gpa_phase_gpu(
+                image_fft, g_vector, mask_sigma_q, fft_grid,
+                amplitude_threshold, ctx, _cached_ft_shifted,
+            )
+        except Exception as e:
+            # OOM fallback: clear GPU memory and retry on CPU
+            if "out of memory" in str(e).lower() or "MemoryError" in type(e).__name__:
+                logger.warning("GPU OOM in compute_gpa_phase, falling back to CPU: %s", e)
+                ctx.clear_memory_pool()
+            else:
+                raise
+
+    # --- CPU path (original logic) ---
+    xp = np  # always numpy here
+
+    if _cached_ft_shifted is not None:
+        FT_shifted = _cached_ft_shifted
+        owns_ft = False
+    else:
+        FT = xp.fft.fft2(image_fft)
+        FT_shifted = xp.fft.fftshift(FT)
+        del FT
+        owns_ft = True
 
     # Gaussian mask centred on g in frequency space
     g_px_x, g_px_y = fft_grid.q_to_px(g_vector.gx, g_vector.gy)
     sigma_px_x = mask_sigma_q / fft_grid.qx_scale
     sigma_px_y = mask_sigma_q / fft_grid.qy_scale
 
-    y_freq, x_freq = np.mgrid[:H, :W]
-    mask = np.exp(-0.5 * ((x_freq - g_px_x) ** 2 / (sigma_px_x ** 2 + 1e-10) +
+    # Memory-efficient broadcasting (avoid mgrid)
+    y_freq = xp.arange(H, dtype=np.float64).reshape(-1, 1)
+    x_freq = xp.arange(W, dtype=np.float64).reshape(1, -1)
+    mask = xp.exp(-0.5 * ((x_freq - g_px_x) ** 2 / (sigma_px_x ** 2 + 1e-10) +
                            (y_freq - g_px_y) ** 2 / (sigma_px_y ** 2 + 1e-10)))
 
     # Extract g-component
     filtered = FT_shifted * mask
-    del FT, FT_shifted, mask
-    H_g_prime = np.fft.ifft2(np.fft.ifftshift(filtered))
+    if owns_ft:
+        del FT_shifted
+    del mask
+    H_g_prime = xp.fft.ifft2(xp.fft.ifftshift(filtered))
     del filtered
 
     # Subpixel-correct demodulation via real-space phase ramp (F2)
-    row_nm = np.arange(H).reshape(-1, 1) * px
-    col_nm = np.arange(W).reshape(1, -1) * px
-    phase_ramp = np.exp(-2j * np.pi * (g_vector.gx * col_nm + g_vector.gy * row_nm))
+    row_nm = xp.arange(H, dtype=np.float64).reshape(-1, 1) * px
+    col_nm = xp.arange(W, dtype=np.float64).reshape(1, -1) * px
+    phase_ramp = xp.exp(-2j * np.pi * (g_vector.gx * col_nm + g_vector.gy * row_nm))
 
     H_g = H_g_prime * phase_ramp
     del H_g_prime, phase_ramp
-    phase_raw = np.angle(H_g)
-    amplitude = np.abs(H_g)
+    phase_raw = xp.angle(H_g)
+    amplitude = xp.abs(H_g)
     del H_g
 
     # Amplitude mask (B5)
-    amp_threshold = amplitude_threshold * np.max(amplitude)
+    amp_threshold = amplitude_threshold * xp.max(amplitude)
     amplitude_mask = amplitude > amp_threshold
 
     # Phase unwrapping -- full array, NO zero-forcing (F3)
@@ -212,6 +250,94 @@ def compute_gpa_phase(image_fft: np.ndarray,
         amplitude_mask=amplitude_mask_eroded,
         g_vector=g_vector,
         phase_noise_sigma=None,  # computed later
+        unwrap_success_fraction=float(unwrap_success),
+    )
+
+
+def _compute_gpa_phase_gpu(image_fft, g_vector, mask_sigma_q, fft_grid,
+                            amplitude_threshold, ctx, _cached_ft_shifted):
+    """GPU-accelerated GPA phase extraction (steps 1-8 on GPU, 9+ on CPU)."""
+    xp = ctx.xp
+    H, W = image_fft.shape
+    px = fft_grid.pixel_size_nm
+
+    # Steps 1-2: FFT + fftshift (or reuse cache)
+    if _cached_ft_shifted is not None:
+        FT_shifted = ctx.to_device(_cached_ft_shifted)
+        owns_ft = False
+    else:
+        img_d = ctx.to_device(image_fft.astype(np.float64))
+        FT_shifted = ctx.fftshift(ctx.fft2(img_d))
+        del img_d
+        owns_ft = True
+
+    # Step 3: Gaussian mask via broadcasting (avoids mgrid, saves ~1.4 GB)
+    g_px_x, g_px_y = fft_grid.q_to_px(g_vector.gx, g_vector.gy)
+    sigma_px_x = mask_sigma_q / fft_grid.qx_scale
+    sigma_px_y = mask_sigma_q / fft_grid.qy_scale
+
+    y_freq = xp.arange(H, dtype=xp.float64).reshape(-1, 1)
+    x_freq = xp.arange(W, dtype=xp.float64).reshape(1, -1)
+    mask = xp.exp(-0.5 * ((x_freq - g_px_x) ** 2 / (sigma_px_x ** 2 + 1e-10) +
+                           (y_freq - g_px_y) ** 2 / (sigma_px_y ** 2 + 1e-10)))
+    del x_freq, y_freq
+
+    # Step 4: Filter
+    filtered = FT_shifted * mask
+    if owns_ft:
+        del FT_shifted
+    del mask
+
+    # Step 5: IFFT
+    H_g_prime = ctx.ifft2(ctx.ifftshift(filtered))
+    del filtered
+
+    # Step 6: Phase ramp via broadcasting
+    row_nm = xp.arange(H, dtype=xp.float64).reshape(-1, 1) * px
+    col_nm = xp.arange(W, dtype=xp.float64).reshape(1, -1) * px
+    phase_ramp = xp.exp(-2j * np.pi * (g_vector.gx * col_nm + g_vector.gy * row_nm))
+    del row_nm, col_nm
+
+    # Step 7: Demodulate
+    H_g = H_g_prime * phase_ramp
+    del H_g_prime, phase_ramp
+
+    # Step 8: Angle, abs, amplitude mask — on GPU
+    phase_raw = xp.angle(H_g)
+    amplitude = xp.abs(H_g)
+    del H_g
+    amp_threshold = amplitude_threshold * xp.max(amplitude)
+    amplitude_mask = amplitude > amp_threshold
+
+    # Transfer to CPU
+    phase_raw = ctx.to_host(phase_raw)
+    amplitude = ctx.to_host(amplitude)
+    amplitude_mask = ctx.to_host(amplitude_mask)
+
+    # Step 9: Phase unwrapping (CPU only — no CuPy equivalent)
+    try:
+        from skimage.restoration import unwrap_phase
+        phase_unwrapped = unwrap_phase(phase_raw)
+    except ImportError:
+        logger.warning("skimage.restoration.unwrap_phase not available, using raw phase")
+        phase_unwrapped = phase_raw.copy()
+
+    # Step 10: Post-mask with eroded amplitude mask
+    amplitude_mask_eroded = ndimage.binary_erosion(amplitude_mask, iterations=2)
+    phase_unwrapped[~amplitude_mask_eroded] = np.nan
+
+    # Unwrap quality
+    n_valid = int(np.sum(amplitude_mask_eroded & ~np.isnan(phase_unwrapped)))
+    n_amp_masked = int(np.sum(amplitude_mask))
+    unwrap_success = n_valid / max(n_amp_masked, 1)
+
+    return GPAPhaseResult(
+        phase_raw=phase_raw.astype(np.float32),
+        phase_unwrapped=phase_unwrapped.astype(np.float32),
+        amplitude=amplitude.astype(np.float32),
+        amplitude_mask=amplitude_mask_eroded,
+        g_vector=g_vector,
+        phase_noise_sigma=None,
         unwrap_success_fraction=float(unwrap_success),
     )
 
@@ -276,24 +402,42 @@ def compute_displacement_field(phase_g1: GPAPhaseResult,
 
 
 def smooth_displacement(displacement: DisplacementField,
-                        sigma: float = 2.0) -> DisplacementField:
+                        sigma: float = 2.0,
+                        ctx=None) -> DisplacementField:
     """Gaussian smooth displacement fields before strain computation (B5)."""
-    ux_smooth = ndimage.gaussian_filter(np.nan_to_num(displacement.ux), sigma=sigma)
-    uy_smooth = ndimage.gaussian_filter(np.nan_to_num(displacement.uy), sigma=sigma)
+    if ctx is not None and ctx.using_gpu:
+        ux_d = ctx.to_device(np.nan_to_num(displacement.ux).astype(np.float64))
+        uy_d = ctx.to_device(np.nan_to_num(displacement.uy).astype(np.float64))
+        ux_smooth = ctx.to_host(ctx.gaussian_filter(ux_d, sigma=sigma))
+        uy_smooth = ctx.to_host(ctx.gaussian_filter(uy_d, sigma=sigma))
+        del ux_d, uy_d
+    else:
+        ux_smooth = ndimage.gaussian_filter(np.nan_to_num(displacement.ux), sigma=sigma)
+        uy_smooth = ndimage.gaussian_filter(np.nan_to_num(displacement.uy), sigma=sigma)
     return DisplacementField(ux=ux_smooth, uy=uy_smooth)
 
 
 def compute_strain_field(displacement: DisplacementField,
-                         pixel_size_nm: float) -> StrainField:
+                         pixel_size_nm: float,
+                         ctx=None) -> StrainField:
     """Compute strain via central differences on smoothed displacement (B5).
 
     Displacement u is in nm, pixel_size_nm is real-space pixel pitch.
     Strain is dimensionless.
     """
-    du_x_dx = np.gradient(displacement.ux, axis=1) / pixel_size_nm
-    du_x_dy = np.gradient(displacement.ux, axis=0) / pixel_size_nm
-    du_y_dx = np.gradient(displacement.uy, axis=1) / pixel_size_nm
-    du_y_dy = np.gradient(displacement.uy, axis=0) / pixel_size_nm
+    if ctx is not None and ctx.using_gpu:
+        ux_d = ctx.to_device(displacement.ux.astype(np.float64))
+        uy_d = ctx.to_device(displacement.uy.astype(np.float64))
+        du_x_dx = ctx.to_host(ctx.gradient(ux_d, axis=1)) / pixel_size_nm
+        du_x_dy = ctx.to_host(ctx.gradient(ux_d, axis=0)) / pixel_size_nm
+        du_y_dx = ctx.to_host(ctx.gradient(uy_d, axis=1)) / pixel_size_nm
+        du_y_dy = ctx.to_host(ctx.gradient(uy_d, axis=0)) / pixel_size_nm
+        del ux_d, uy_d
+    else:
+        du_x_dx = np.gradient(displacement.ux, axis=1) / pixel_size_nm
+        du_x_dy = np.gradient(displacement.ux, axis=0) / pixel_size_nm
+        du_y_dx = np.gradient(displacement.uy, axis=1) / pixel_size_nm
+        du_y_dy = np.gradient(displacement.uy, axis=0) / pixel_size_nm
 
     return StrainField(
         exx=du_x_dx,
@@ -324,7 +468,8 @@ def run_gpa_full(image_fft: np.ndarray,
                  fft_grid: FFTGrid,
                  config: GPAConfig = None,
                  tile_size: int = 256,
-                 stride: int = 128) -> GPAResult:
+                 stride: int = 128,
+                 ctx=None) -> GPAResult:
     """Full-image GPA mode."""
     if config is None:
         config = GPAConfig()
@@ -338,6 +483,7 @@ def run_gpa_full(image_fft: np.ndarray,
         phase_result = compute_gpa_phase(
             image_fft, gv, mask_sigma, fft_grid,
             amplitude_threshold=config.amplitude_threshold,
+            ctx=ctx,
         )
         # Phase noise in reference region
         sigma_phi = check_phase_noise(phase_result, ref_region.tiles,
@@ -369,8 +515,8 @@ def run_gpa_full(image_fft: np.ndarray,
     if len(phases) == 2:
         displacement = compute_displacement_field(phases["g0"], phases["g1"])
         if displacement is not None:
-            displacement = smooth_displacement(displacement, sigma=config.displacement_smooth_sigma)
-            strain = compute_strain_field(displacement, fft_grid.pixel_size_nm)
+            displacement = smooth_displacement(displacement, sigma=config.displacement_smooth_sigma, ctx=ctx)
+            strain = compute_strain_field(displacement, fft_grid.pixel_size_nm, ctx=ctx)
             qc["displacement_smooth_sigma"] = config.displacement_smooth_sigma
 
     # Gate G10
@@ -444,18 +590,31 @@ def run_gpa_region(image_fft: np.ndarray,
                    fft_grid: FFTGrid,
                    config: GPAConfig = None,
                    tile_size: int = 256,
-                   stride: int = 128) -> GPAResult:
+                   stride: int = 128,
+                   ctx=None) -> GPAResult:
     """Region-wise GPA mode.
 
     Segments Tier A tiles into connected domains.
     For each domain: select local reference, run GPA.
     Stitches results into a unified GPAResult.
+
+    FFT caching: computes ``fftshift(fft2(image_fft))`` once and passes it to
+    all ``compute_gpa_phase()`` calls, eliminating ``2*N + 2`` redundant FFTs.
     """
     if config is None:
         config = GPAConfig()
 
     H, W = image_fft.shape
     mask_sigma = _determine_mask_sigma(g_vectors, config)
+
+    # Pre-compute FFT once and cache for all compute_gpa_phase calls
+    if ctx is not None and ctx.using_gpu:
+        img_d = ctx.to_device(image_fft.astype(np.float64))
+        cached_ft_shifted = ctx.to_host(ctx.fftshift(ctx.fft2(img_d)))
+        del img_d
+        ctx.clear_memory_pool()
+    else:
+        cached_ft_shifted = np.fft.fftshift(np.fft.fft2(image_fft))
 
     # Find connected domains of Tier A tiles
     tier_a_mask = (gated_grid.tier_map == "A")
@@ -511,6 +670,8 @@ def run_gpa_region(image_fft: np.ndarray,
             phase_result = compute_gpa_phase(
                 image_fft, gv, mask_sigma, fft_grid,
                 amplitude_threshold=config.amplitude_threshold,
+                ctx=ctx,
+                _cached_ft_shifted=cached_ft_shifted,
             )
 
             # Extract domain region and insert into combined
@@ -525,7 +686,9 @@ def run_gpa_region(image_fft: np.ndarray,
     for gi, gv in enumerate(g_vectors[:2]):
         key = f"g{gi}"
         phase = compute_gpa_phase(image_fft, gv, mask_sigma, fft_grid,
-                                  amplitude_threshold=config.amplitude_threshold)
+                                  amplitude_threshold=config.amplitude_threshold,
+                                  ctx=ctx,
+                                  _cached_ft_shifted=cached_ft_shifted)
         phase.phase_unwrapped = combined_phase_unwrapped[key].astype(np.float32)
         phase.amplitude_mask = combined_amplitude_mask[key]
 
@@ -537,12 +700,14 @@ def run_gpa_region(image_fft: np.ndarray,
         qc[f"unwrap_success_{key}"] = phase.unwrap_success_fraction
         all_phases[key] = phase
 
+    del cached_ft_shifted
+
     # Displacement / strain
     if len(all_phases) == 2:
         combined_displacement = compute_displacement_field(all_phases["g0"], all_phases["g1"])
         if combined_displacement is not None:
-            combined_displacement = smooth_displacement(combined_displacement, sigma=config.displacement_smooth_sigma)
-            combined_strain = compute_strain_field(combined_displacement, fft_grid.pixel_size_nm)
+            combined_displacement = smooth_displacement(combined_displacement, sigma=config.displacement_smooth_sigma, ctx=ctx)
+            combined_strain = compute_strain_field(combined_displacement, fft_grid.pixel_size_nm, ctx=ctx)
 
     mode_decision = GPAModeDecision(
         selected_mode="region",
@@ -574,7 +739,8 @@ def run_gpa(image_fft: np.ndarray,
             fft_grid: FFTGrid,
             config: GPAConfig = None,
             tile_size: int = 256,
-            stride: int = 128) -> Optional[GPAResult]:
+            stride: int = 128,
+            ctx=None) -> Optional[GPAResult]:
     """Run GPA with mode auto-selection and failure handling.
 
     Returns GPAResult or None if skipped.
@@ -596,12 +762,12 @@ def run_gpa(image_fft: np.ndarray,
         if mode_decision.selected_mode == "full":
             ref_region = select_reference_region(gated_grid)
             result = run_gpa_full(image_fft, g_vectors, ref_region, fft_grid,
-                                  config, tile_size, stride)
+                                  config, tile_size, stride, ctx=ctx)
             result.mode_decision = mode_decision
             return result
         else:
             result = run_gpa_region(image_fft, g_vectors, gated_grid, fft_grid,
-                                    config, tile_size, stride)
+                                    config, tile_size, stride, ctx=ctx)
             result.mode_decision = mode_decision
             return result
 
@@ -612,7 +778,7 @@ def run_gpa(image_fft: np.ndarray,
             logger.info("Falling back to region-wise GPA")
             try:
                 result = run_gpa_region(image_fft, g_vectors, gated_grid, fft_grid,
-                                        config, tile_size, stride)
+                                        config, tile_size, stride, ctx=ctx)
                 result.mode_decision = mode_decision
                 result.diagnostics["fallback"] = True
                 return result

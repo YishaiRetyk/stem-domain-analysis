@@ -18,10 +18,12 @@ logger = logging.getLogger(__name__)
 try:
     import cupy as cp
     import cupy.fft as cufft
+    from cupyx.scipy import ndimage as cu_ndimage
     GPU_AVAILABLE = True
 except ImportError:
     cp = None
     cufft = None
+    cu_ndimage = None
     GPU_AVAILABLE = False
 
 
@@ -172,6 +174,23 @@ class DeviceContext:
         if self._use_gpu:
             return cp.fft.ifftshift(arr, axes=axes)
         return np.fft.ifftshift(arr, axes=axes)
+
+    # ------------------------------------------------------------------
+    # ndimage helpers
+    # ------------------------------------------------------------------
+
+    def gaussian_filter(self, arr, sigma, **kwargs):
+        """Gaussian filter dispatching to cupyx.scipy.ndimage or scipy.ndimage."""
+        if self._use_gpu:
+            return cu_ndimage.gaussian_filter(arr, sigma, **kwargs)
+        from scipy import ndimage as sp_ndimage
+        return sp_ndimage.gaussian_filter(arr, sigma, **kwargs)
+
+    def gradient(self, arr, axis=None):
+        """Gradient dispatching to cupy.gradient or np.gradient."""
+        if self._use_gpu:
+            return cp.gradient(arr, axis=axis)
+        return np.gradient(arr, axis=axis)
 
     # ------------------------------------------------------------------
     # Memory management
