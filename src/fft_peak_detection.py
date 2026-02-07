@@ -23,18 +23,53 @@ logger = logging.getLogger(__name__)
 # Peak-height SNR (B3, C3)
 # ======================================================================
 
+def _build_exclusion_mask(x_grid: np.ndarray, y_grid: np.ndarray,
+                          all_peaks: List[TilePeak],
+                          fft_grid: FFTGrid,
+                          safety_margin_px: int = 2) -> np.ndarray:
+    """Pre-compute combined exclusion mask for all peaks and their antipodals.
+
+    Called once per tile to avoid O(P² × HW) recomputation.
+    """
+    H, W = x_grid.shape
+    exclusion_mask = np.zeros((H, W), dtype=bool)
+    for p in all_peaks:
+        exclusion_r = safety_margin_px + max(2, p.fwhm / fft_grid.qx_scale / 2 if p.fwhm > 0 else 2)
+        exclusion_r_sq = exclusion_r ** 2
+        for sign in [1, -1]:
+            ppx, ppy = fft_grid.q_to_px(sign * p.qx, sign * p.qy)
+            dist_sq = (x_grid - ppx) ** 2 + (y_grid - ppy) ** 2
+            exclusion_mask |= (dist_sq <= exclusion_r_sq)
+    return exclusion_mask
+
+
 def compute_peak_snr(power: np.ndarray,
                      target_peak: TilePeak,
                      all_peaks: List[TilePeak],
-                     fft_grid: FFTGrid) -> PeakSNR:
+                     fft_grid: FFTGrid,
+                     _cached: Optional[dict] = None) -> PeakSNR:
     """Compute peak-height SNR with peak-excluding annular background.
 
     Signal = max(power[disk_r3]) around peak centre.
     Background = annulus excluding ALL detected peaks ± safety margin.
     sigma via MAD × 1.4826.
+
+    Parameters
+    ----------
+    _cached : dict, optional
+        Pre-computed arrays from classify_tile to avoid per-peak reallocation.
+        Keys: 'x_grid', 'y_grid', 'exclusion_mask'.
     """
     H, W = power.shape
-    y_grid, x_grid = np.mgrid[:H, :W]
+
+    if _cached is not None:
+        x_grid = _cached['x_grid']
+        y_grid = _cached['y_grid']
+        exclusion_mask = _cached['exclusion_mask']
+    else:
+        y_grid, x_grid = np.mgrid[:H, :W]
+        exclusion_mask = _build_exclusion_mask(x_grid, y_grid, all_peaks,
+                                               fft_grid)
 
     # Peak pixel position
     peak_px_x, peak_px_y = fft_grid.q_to_px(target_peak.qx, target_peak.qy)
@@ -51,16 +86,6 @@ def compute_peak_snr(power: np.ndarray,
     peak_q = target_peak.q_mag
     annular_width = max(0.15, target_peak.fwhm * 1.5 if target_peak.fwhm > 0 else 0.15)
     annulus_mask = np.abs(q_mag_grid - peak_q) <= annular_width
-
-    # Exclude ALL detected peaks and their antipodals (C3)
-    exclusion_mask = np.zeros((H, W), dtype=bool)
-    safety_margin_px = 2
-    for p in all_peaks:
-        for sign in [1, -1]:
-            ppx, ppy = fft_grid.q_to_px(sign * p.qx, sign * p.qy)
-            d = np.sqrt((x_grid - ppx) ** 2 + (y_grid - ppy) ** 2)
-            exclusion_r = safety_margin_px + max(2, p.fwhm / fft_grid.qx_scale / 2 if p.fwhm > 0 else 2)
-            exclusion_mask |= (d <= exclusion_r)
 
     background_mask = annulus_mask & ~exclusion_mask & ~signal_disk
     n_bg = int(np.sum(background_mask))
@@ -276,6 +301,13 @@ def classify_tile(peak_set: TilePeakSet,
             n_non_collinear=0, best_snr=0, best_orientation_deg=0,
         )
 
+    # Pre-compute shared grids once (avoids O(P² × HW) recomputation)
+    H, W = power.shape
+    y_grid, x_grid = np.mgrid[:H, :W]
+    exclusion_mask = _build_exclusion_mask(x_grid, y_grid, peaks, fft_grid)
+    _cached = {'x_grid': x_grid, 'y_grid': y_grid,
+               'exclusion_mask': exclusion_mask}
+
     # Compute per-peak metrics
     peak_metrics = []
     best_snr = 0.0
@@ -283,7 +315,7 @@ def classify_tile(peak_set: TilePeakSet,
 
     for p in peaks:
         # SNR
-        snr_result = compute_peak_snr(power, p, peaks, fft_grid)
+        snr_result = compute_peak_snr(power, p, peaks, fft_grid, _cached=_cached)
 
         # FWHM
         fwhm_result = measure_peak_fwhm(power, p, fft_grid)
