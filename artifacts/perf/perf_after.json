@@ -1,0 +1,33 @@
+{
+  "n_tiles": 500,
+  "tile_size": 256,
+  "peaks_per_tile": 6,
+  "total_peaks": 6000,
+  "tiles_classified": 500,
+  "tier_counts": {
+    "A": 500,
+    "B": 0,
+    "REJECTED": 0
+  },
+  "total_time_s": 6.002,
+  "tiles_per_sec": 83.3,
+  "peaks_per_sec": 999.64,
+  "tile_time_mean_ms": 12.004,
+  "tile_time_median_ms": 11.752,
+  "fwhm_calls": 6000,
+  "fwhm_fit_calls": 1000,
+  "fwhm_proxy_calls": 5000,
+  "fwhm_total_s": 2.76,
+  "fwhm_fit_total_s": 2.617,
+  "fwhm_proxy_total_s": 0.143,
+  "fwhm_fraction_of_total": 0.4598,
+  "fwhm_mean_ms": 0.4599,
+  "fwhm_median_ms": 0.0257,
+  "fwhm_p95_ms": 2.806,
+  "fwhm_fit_mean_ms": 2.6166,
+  "fwhm_proxy_mean_ms": 0.0286,
+  "fwhm_methods": {
+    "wedge_fallback": 1173,
+    "moment_proxy": 4827
+  }
+}

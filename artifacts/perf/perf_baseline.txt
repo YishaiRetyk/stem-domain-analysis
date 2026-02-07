@@ -1,0 +1,19 @@
+============================================================
+Classification Performance Profile
+============================================================
+Tiles:           500 (256×256)
+Peaks/tile:      6 (6000 total)
+Tier counts:     {'A': 500, 'B': 0, 'REJECTED': 0}
+
+--- Overall ---
+Total time:      20.202 s
+Throughput:      24.8 tiles/s, 297 peaks/s
+Tile time (mean/median): 40.40 / 39.94 ms
+
+--- measure_peak_fwhm ---
+Calls:           6000
+Total time:      16.705 s (82.7% of total)
+Mean/median:     2.784 / 2.538 ms
+P95:             4.514 ms
+Methods:         {'gaussian_2d': 134, 'wedge_fallback': 5866, 'failed': 0}
+============================================================

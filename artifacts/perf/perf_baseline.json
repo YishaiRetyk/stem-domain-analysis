@@ -1,0 +1,28 @@
+{
+  "n_tiles": 500,
+  "tile_size": 256,
+  "peaks_per_tile": 6,
+  "total_peaks": 6000,
+  "tiles_classified": 500,
+  "tier_counts": {
+    "A": 500,
+    "B": 0,
+    "REJECTED": 0
+  },
+  "total_time_s": 20.202,
+  "tiles_per_sec": 24.75,
+  "peaks_per_sec": 297.0,
+  "tile_time_mean_ms": 40.404,
+  "tile_time_median_ms": 39.938,
+  "fwhm_calls": 6000,
+  "fwhm_total_s": 16.705,
+  "fwhm_fraction_of_total": 0.8269,
+  "fwhm_mean_ms": 2.7841,
+  "fwhm_median_ms": 2.5381,
+  "fwhm_p95_ms": 4.5139,
+  "fwhm_methods": {
+    "gaussian_2d": 134,
+    "wedge_fallback": 5866,
+    "failed": 0
+  }
+}

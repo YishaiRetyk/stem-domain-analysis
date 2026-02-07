@@ -1,0 +1,21 @@
+============================================================
+Classification Performance Profile
+============================================================
+Tiles:           500 (256×256)
+Peaks/tile:      6 (6000 total)
+Tier counts:     {'A': 500, 'B': 0, 'REJECTED': 0}
+
+--- Overall ---
+Total time:      6.002 s
+Throughput:      83.3 tiles/s, 1000 peaks/s
+Tile time (mean/median): 12.00 / 11.75 ms
+
+--- FWHM (all paths) ---
+Total calls:     6000 (fit: 1000, proxy: 5000)
+Total time:      2.760 s (46.0% of total)
+  curve_fit:     2.617 s (mean 2.6166 ms)
+  proxy:         0.143 s (mean 0.0286 ms)
+Mean/median:     0.460 / 0.026 ms
+P95:             2.806 ms
+Methods:         {'wedge_fallback': 1173, 'moment_proxy': 4827}
+============================================================

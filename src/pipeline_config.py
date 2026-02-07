@@ -348,6 +348,16 @@ class TierConfig:
 
 
 @dataclass
+class FWHMConfig:
+    """FWHM measurement configuration."""
+    enabled: bool = True
+    method: str = "auto"           # auto | proxy_only | curve_fit
+    maxfev: int = 500              # max iterations for curve_fit (was 2000)
+    max_per_tile: int = 2          # max curve_fit calls per tile
+    min_snr_for_fit: float = 5.0   # only curve_fit if peak SNR >= this
+
+
+@dataclass
 class PeakGateConfig:
     """Peak quality gate thresholds."""
     max_fwhm_ratio: float = 0.15

@@ -13,7 +13,7 @@ from typing import List, Optional, Tuple
 from src.fft_coords import FFTGrid
 from src.pipeline_config import (
     PeakSNR, PeakFWHM, TilePeak, TilePeakSet, TileClassification,
-    TierConfig, PeakGateConfig,
+    TierConfig, PeakGateConfig, FWHMConfig,
 )
 
 logger = logging.getLogger(__name__)
@@ -117,8 +117,19 @@ def compute_peak_snr(power: np.ndarray,
 
 
 # ======================================================================
-# FWHM via 2D Gaussian fit (B2)
+# FWHM measurement (B2): cached grids, proxy width, gated curve_fit
 # ======================================================================
+
+# --- Cached 11×11 patch grids (R=5) computed once at import time ---
+_PATCH_R = 5
+_PATCH_SIZE = 2 * _PATCH_R + 1
+_Y11, _X11 = np.mgrid[:_PATCH_SIZE, :_PATCH_SIZE]
+_DIST11 = np.sqrt((_X11 - _PATCH_R) ** 2 + (_Y11 - _PATCH_R) ** 2)
+_OUTER_RING11 = _DIST11 >= (_PATCH_R - 1)
+# Pre-computed radial bin masks for fallback
+_RADIAL_MASKS11 = [(_DIST11 >= dr) & (_DIST11 < dr + 1)
+                    for dr in range(_PATCH_R + 1)]
+
 
 def _gaussian_2d(coords, amplitude, cx, cy, sigma_x, sigma_y, theta):
     """2D Gaussian model for curve_fit."""
@@ -132,42 +143,118 @@ def _gaussian_2d(coords, amplitude, cx, cy, sigma_x, sigma_y, theta):
     return g.ravel()
 
 
-def measure_peak_fwhm(power: np.ndarray,
-                      peak: TilePeak,
-                      fft_grid: FFTGrid) -> PeakFWHM:
-    """Measure peak FWHM via 2D Gaussian fit with fallback to wedge average (B2).
+def _extract_patch(power, peak, fft_grid):
+    """Extract background-subtracted patch around a peak.
 
-    Returns PeakFWHM with fwhm_valid=False if both methods fail.
+    Returns (patch_bg, px, py) or (None, None, None) if out of bounds.
     """
     H, W = power.shape
     peak_px_x, peak_px_y = fft_grid.q_to_px(peak.qx, peak.qy)
     px = int(round(peak_px_x))
     py = int(round(peak_px_y))
+    R = _PATCH_R
 
-    R = 5  # default patch radius
-    # Bounds check
     if py - R < 0 or py + R + 1 > H or px - R < 0 or px + R + 1 > W:
-        return PeakFWHM(fwhm_valid=False, method="failed")
+        return None, None, None
 
     patch = power[py - R:py + R + 1, px - R:px + R + 1].copy()
     if patch.size < 9:
+        return None, None, None
+
+    bg_level = np.median(patch[_OUTER_RING11])
+    return patch - bg_level, px, py
+
+
+def measure_peak_fwhm_proxy(power: np.ndarray,
+                            peak: TilePeak,
+                            fft_grid: FFTGrid) -> PeakFWHM:
+    """Fast moment-based FWHM proxy — no optimizer, O(1) per peak.
+
+    Uses intensity-weighted second moment on the 11×11 patch to estimate
+    sigma, then converts to FWHM.  Falls back to radial half-max if the
+    moment estimate is degenerate.
+    """
+    patch_bg, px, py = _extract_patch(power, peak, fft_grid)
+    if patch_bg is None:
         return PeakFWHM(fwhm_valid=False, method="failed")
 
-    # Local background: median of outer ring
-    y_local, x_local = np.mgrid[:2 * R + 1, :2 * R + 1]
-    dist = np.sqrt((x_local - R) ** 2 + (y_local - R) ** 2)
-    outer_ring = dist >= (R - 1)
-    bg_level = np.median(patch[outer_ring])
-    patch_bg = patch - bg_level
+    R = _PATCH_R
 
-    # PRIMARY: 2D Gaussian fit
+    # --- Moment-based sigma estimate ---
+    weights = np.maximum(patch_bg, 0)
+    total_w = weights.sum()
+    if total_w > 0:
+        cx = np.sum(_X11 * weights) / total_w
+        cy = np.sum(_Y11 * weights) / total_w
+        var_x = np.sum(weights * (_X11 - cx) ** 2) / total_w
+        var_y = np.sum(weights * (_Y11 - cy) ** 2) / total_w
+        sigma_px = np.sqrt(max(var_x, 0.01) * max(var_y, 0.01))
+        if 0.3 <= sigma_px <= R:
+            sigma_q = sigma_px * fft_grid.qx_scale
+            fwhm_q = 2.355 * sigma_q
+            return PeakFWHM(
+                fwhm_q=float(fwhm_q),
+                sigma_x=float(np.sqrt(max(var_x, 0.01)) * fft_grid.qx_scale),
+                sigma_y=float(np.sqrt(max(var_y, 0.01)) * fft_grid.qy_scale),
+                theta=0.0,
+                fwhm_valid=True,
+                method="moment_proxy",
+            )
+
+    # --- Radial half-max fallback ---
+    return _radial_halfmax(patch_bg, fft_grid)
+
+
+def _radial_halfmax(patch_bg, fft_grid):
+    """Radial half-max FWHM using pre-computed bin masks."""
+    R = _PATCH_R
+    radial_profile = np.zeros(R + 1)
+    for dr in range(R + 1):
+        m = _RADIAL_MASKS11[dr]
+        if np.any(m):
+            radial_profile[dr] = np.mean(patch_bg[m])
+
+    peak_val = radial_profile[0]
+    if peak_val > 0:
+        half_max = peak_val / 2
+        fwhm_bins = int(np.sum(radial_profile >= half_max))
+        fwhm_q = float(fwhm_bins * fft_grid.qx_scale)
+        return PeakFWHM(
+            fwhm_q=fwhm_q,
+            sigma_x=fwhm_q / 2.355,
+            sigma_y=fwhm_q / 2.355,
+            theta=0.0,
+            fwhm_valid=True,
+            method="wedge_fallback",
+        )
+    return PeakFWHM(fwhm_valid=False, method="failed")
+
+
+def measure_peak_fwhm(power: np.ndarray,
+                      peak: TilePeak,
+                      fft_grid: FFTGrid,
+                      maxfev: int = 500) -> PeakFWHM:
+    """Measure peak FWHM via 2D Gaussian fit with fallback (B2).
+
+    Uses cached 11×11 grids.  ``maxfev`` controls curve_fit iteration
+    budget (default 500, was 2000).
+
+    Returns PeakFWHM with fwhm_valid=False if all methods fail.
+    """
+    patch_bg, px, py = _extract_patch(power, peak, fft_grid)
+    if patch_bg is None:
+        return PeakFWHM(fwhm_valid=False, method="failed")
+
+    R = _PATCH_R
+
+    # PRIMARY: 2D Gaussian fit (with cached grid arrays)
     try:
         p0 = [float(patch_bg[R, R]), float(R), float(R), 2.0, 2.0, 0.0]
         bounds = ([0, R - 3, R - 3, 0.3, 0.3, -np.pi],
                   [np.inf, R + 3, R + 3, R, R, np.pi])
         popt, pcov = curve_fit(
-            _gaussian_2d, (x_local, y_local), patch_bg.ravel(),
-            p0=p0, bounds=bounds, maxfev=2000,
+            _gaussian_2d, (_X11, _Y11), patch_bg.ravel(),
+            p0=p0, bounds=bounds, maxfev=maxfev,
         )
         amp, cx, cy, sigma_x, sigma_y, theta = popt
 
@@ -192,33 +279,8 @@ def measure_peak_fwhm(power: np.ndarray,
     except Exception:
         pass
 
-    # FALLBACK: simple radial half-max estimate
-    try:
-        radial_profile = np.zeros(R + 1)
-        counts = np.zeros(R + 1)
-        for dr in range(R + 1):
-            mask = (dist >= dr) & (dist < dr + 1)
-            if np.any(mask):
-                radial_profile[dr] = np.mean(patch_bg[mask])
-                counts[dr] = np.sum(mask)
-
-        peak_val = radial_profile[0]
-        if peak_val > 0:
-            half_max = peak_val / 2
-            fwhm_bins = np.sum(radial_profile >= half_max)
-            fwhm_q = float(fwhm_bins * fft_grid.qx_scale)
-            return PeakFWHM(
-                fwhm_q=fwhm_q,
-                sigma_x=fwhm_q / 2.355,
-                sigma_y=fwhm_q / 2.355,
-                theta=0.0,
-                fwhm_valid=True,
-                method="wedge_fallback",
-            )
-    except Exception:
-        pass
-
-    return PeakFWHM(fwhm_valid=False, method="failed")
+    # FALLBACK: radial half-max (using cached masks)
+    return _radial_halfmax(patch_bg, fft_grid)
 
 
 # ======================================================================
@@ -282,15 +344,23 @@ def count_non_collinear(peaks: List[TilePeak], min_angle_deg: float = 15.0) -> i
 def classify_tile(peak_set: TilePeakSet,
                   fft_grid: FFTGrid,
                   tier_config: TierConfig = None,
-                  peak_gate_config: PeakGateConfig = None) -> TileClassification:
+                  peak_gate_config: PeakGateConfig = None,
+                  fwhm_config: FWHMConfig = None) -> TileClassification:
     """Classify a tile as Tier A, Tier B, or REJECTED.
 
     Uses power_spectrum from peak_set for SNR and FWHM computation.
+
+    FWHM policy (controlled by *fwhm_config*):
+    - ``auto``: proxy width for all peaks, curve_fit only for top-K high-SNR
+    - ``proxy_only``: never run curve_fit
+    - ``curve_fit``: always run curve_fit (legacy behaviour, slow)
     """
     if tier_config is None:
         tier_config = TierConfig()
     if peak_gate_config is None:
         peak_gate_config = PeakGateConfig()
+    if fwhm_config is None:
+        fwhm_config = FWHMConfig()
 
     peaks = peak_set.peaks
     power = peak_set.power_spectrum
@@ -308,17 +378,52 @@ def classify_tile(peak_set: TilePeakSet,
     _cached = {'x_grid': x_grid, 'y_grid': y_grid,
                'exclusion_mask': exclusion_mask}
 
-    # Compute per-peak metrics
+    # --- Pass 1: compute SNR for all peaks (cheap) ---
+    snr_results = []
+    for p in peaks:
+        snr_results.append(compute_peak_snr(power, p, peaks, fft_grid,
+                                            _cached=_cached))
+
+    # --- Pass 2: FWHM with policy gating ---
+    fwhm_method = fwhm_config.method if fwhm_config.enabled else "proxy_only"
+    curve_fits_remaining = fwhm_config.max_per_tile
+
+    # For "auto" mode, sort peaks by SNR descending to prioritise high-SNR
+    # peaks for the limited curve_fit budget.
+    if fwhm_method == "auto":
+        ranked_indices = sorted(range(len(peaks)),
+                                key=lambda i: snr_results[i].snr,
+                                reverse=True)
+    else:
+        ranked_indices = list(range(len(peaks)))
+
+    fwhm_results = [None] * len(peaks)
+    for idx in ranked_indices:
+        p = peaks[idx]
+        snr_val = snr_results[idx].snr
+        use_curve_fit = False
+
+        if fwhm_method == "curve_fit":
+            use_curve_fit = True
+        elif fwhm_method == "auto":
+            use_curve_fit = (snr_val >= fwhm_config.min_snr_for_fit
+                             and curve_fits_remaining > 0)
+
+        if use_curve_fit:
+            fwhm_results[idx] = measure_peak_fwhm(
+                power, p, fft_grid, maxfev=fwhm_config.maxfev)
+            curve_fits_remaining -= 1
+        else:
+            fwhm_results[idx] = measure_peak_fwhm_proxy(power, p, fft_grid)
+
+    # --- Build per-peak metrics ---
     peak_metrics = []
     best_snr = 0.0
     best_orientation = 0.0
 
-    for p in peaks:
-        # SNR
-        snr_result = compute_peak_snr(power, p, peaks, fft_grid, _cached=_cached)
-
-        # FWHM
-        fwhm_result = measure_peak_fwhm(power, p, fft_grid)
+    for i, p in enumerate(peaks):
+        snr_result = snr_results[i]
+        fwhm_result = fwhm_results[i]
 
         # Update peak's fwhm for downstream
         p.fwhm = fwhm_result.fwhm_q if fwhm_result.fwhm_valid else 0.0

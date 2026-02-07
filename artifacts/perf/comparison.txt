@@ -1,0 +1,45 @@
+============================================================
+Performance Comparison: Baseline vs After
+============================================================
+Workload: 500 tiles, 256x256, 6 peaks/tile (6000 peaks)
+Tier counts unchanged: A=500, B=0, REJECTED=0
+
+                           BASELINE      AFTER       CHANGE
+-------------------------------------------------------------
+Total time (s)              20.202       6.002       -70.3%
+Tiles/sec                   24.75       83.30       +3.37x
+Peaks/sec                  297.00      999.64       +3.37x
+Tile time mean (ms)         40.40       12.00       -70.3%
+
+--- FWHM breakdown ---
+Total FWHM time (s)         16.705       2.760       -83.5%
+FWHM % of total             82.7%       46.0%       -36.7pp
+curve_fit calls              6000        1000       -83.3%
+proxy calls                     0        5000          new
+curve_fit mean (ms)          2.784       2.617        -6.0%
+proxy mean (ms)                 --       0.029         new
+FWHM median (ms)             2.538       0.026       -99.0%
+
+--- FWHM method distribution ---
+gaussian_2d                    134           0
+wedge_fallback                5866        1173
+moment_proxy                     0        4827
+
+--- Scientific correctness ---
+Tier A count:               500         500         same
+Tier B count:                 0           0         same
+REJECTED count:               0           0         same
+SNR computation:          unchanged (decoupled from FWHM)
+
+============================================================
+Summary of changes:
+  B1: Cached 11x11 grids at module level (eliminates 38k allocations)
+  B2: Reduced curve_fit maxfev 2000 -> 500 (configurable)
+  C1: Two-stage FWHM: moment proxy for all, curve_fit only for
+      top-2 high-SNR peaks per tile (auto mode, configurable)
+  D:  Time-based progress logging with ETA in build_gated_tile_grid
+
+Remaining bottleneck: curve_fit still ~2.6ms/call (1000 calls =
+2.6s), now 44% of total. Further reduction possible by tightening
+max_per_tile or raising min_snr_for_fit.
+============================================================

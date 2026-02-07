@@ -6,13 +6,14 @@ Gates G6, G7, G8.
 """
 
 import logging
+import time
 import numpy as np
 import psutil
 from typing import List, Optional
 
 from src.pipeline_config import (
     TilePeakSet, TileClassification, TierSummary, GatedTileGrid,
-    TierConfig, PeakGateConfig,
+    TierConfig, PeakGateConfig, FWHMConfig,
 )
 from src.fft_coords import FFTGrid
 from src.fft_peak_detection import classify_tile
@@ -27,6 +28,8 @@ def build_gated_tile_grid(peak_sets: List[TilePeakSet],
                           tile_size: int,
                           tier_config: TierConfig = None,
                           peak_gate_config: PeakGateConfig = None,
+                          fwhm_config: FWHMConfig = None,
+                          log_interval_s: float = 5.0,
                           ) -> GatedTileGrid:
     """Classify all tiles and build the unified GatedTileGrid.
 
@@ -36,7 +39,8 @@ def build_gated_tile_grid(peak_sets: List[TilePeakSet],
     skipped_mask : (n_rows, n_cols) bool
     fft_grid : FFTGrid for individual tiles
     tile_size : int
-    tier_config, peak_gate_config : optional overrides
+    tier_config, peak_gate_config, fwhm_config : optional overrides
+    log_interval_s : seconds between progress log lines (default 5)
 
     Returns
     -------
@@ -46,6 +50,8 @@ def build_gated_tile_grid(peak_sets: List[TilePeakSet],
         tier_config = TierConfig()
     if peak_gate_config is None:
         peak_gate_config = PeakGateConfig()
+    if fwhm_config is None:
+        fwhm_config = FWHMConfig()
 
     n_rows, n_cols = skipped_mask.shape
     tile_grid = FFTGrid(tile_size, tile_size, fft_grid.pixel_size_nm)
@@ -57,13 +63,19 @@ def build_gated_tile_grid(peak_sets: List[TilePeakSet],
     fwhm_map = np.zeros((n_rows, n_cols))
     orientation_map = np.full((n_rows, n_cols), np.nan)
 
-    # Memory logging
+    # --- Progress tracking ---
     process = psutil.Process()
     n_total = len(peak_sets)
-    log_interval = max(1, n_total // 10)  # Log ~10 times
     initial_mem = process.memory_info().rss / 1024**3
-    logger.info(f"MEMORY: Starting tile classification. Initial RSS: {initial_mem:.2f} GB")
-    print(f"MEMORY: Starting tile classification ({n_total} tiles). Initial RSS: {initial_mem:.2f} GB", flush=True)
+    t_start = time.monotonic()
+    t_last_log = t_start
+    tiles_done = 0
+    peaks_done = 0
+
+    msg = (f"Classification: starting {n_total} tiles "
+           f"(RSS {initial_mem:.2f} GB)")
+    logger.info(msg)
+    print(msg, flush=True)
 
     for i, ps in enumerate(peak_sets):
         r, c = ps.tile_row, ps.tile_col
@@ -74,7 +86,8 @@ def build_gated_tile_grid(peak_sets: List[TilePeakSet],
             classifications[r, c] = None
             continue
 
-        tc = classify_tile(ps, tile_grid, tier_config, peak_gate_config)
+        tc = classify_tile(ps, tile_grid, tier_config, peak_gate_config,
+                           fwhm_config)
         classifications[r, c] = tc
         tier_map[r, c] = tc.tier
         snr_map[r, c] = tc.best_snr
@@ -87,16 +100,33 @@ def build_gated_tile_grid(peak_sets: List[TilePeakSet],
             if valid_fwhms:
                 fwhm_map[r, c] = min(valid_fwhms)
 
-        # Log memory periodically
-        if (i + 1) % log_interval == 0:
+        tiles_done += 1
+        peaks_done += len(ps.peaks)
+
+        # --- Time-based progress logging ---
+        t_now = time.monotonic()
+        if t_now - t_last_log >= log_interval_s:
+            elapsed = t_now - t_start
+            tiles_per_s = tiles_done / elapsed if elapsed > 0 else 0
+            peaks_per_s = peaks_done / elapsed if elapsed > 0 else 0
+            remaining = (n_total - i - 1) / tiles_per_s if tiles_per_s > 0 else 0
             mem_gb = process.memory_info().rss / 1024**3
             pct = 100 * (i + 1) / n_total
-            logger.info(f"MEMORY: Classification {i+1}/{n_total} ({pct:.0f}%) - RSS: {mem_gb:.2f} GB")
-            print(f"MEMORY: Classification {i+1}/{n_total} ({pct:.0f}%) - RSS: {mem_gb:.2f} GB", flush=True)
 
+            msg = (f"Classification: {i+1}/{n_total} ({pct:.0f}%) | "
+                   f"{tiles_per_s:.1f} tiles/s, {peaks_per_s:.0f} peaks/s | "
+                   f"ETA {remaining:.0f}s | RSS {mem_gb:.2f} GB")
+            logger.info(msg)
+            print(msg, flush=True)
+            t_last_log = t_now
+
+    t_total = time.monotonic() - t_start
     final_mem = process.memory_info().rss / 1024**3
-    logger.info(f"MEMORY: Classification complete. Final RSS: {final_mem:.2f} GB (delta: {final_mem - initial_mem:.2f} GB)")
-    print(f"MEMORY: Classification complete. Final RSS: {final_mem:.2f} GB (delta: +{final_mem - initial_mem:.2f} GB)", flush=True)
+    msg = (f"Classification: done {tiles_done} tiles, {peaks_done} peaks "
+           f"in {t_total:.1f}s ({tiles_done/max(t_total,0.001):.1f} tiles/s) | "
+           f"RSS {final_mem:.2f} GB (delta +{final_mem - initial_mem:.2f} GB)")
+    logger.info(msg)
+    print(msg, flush=True)
 
     # Tier summary
     tier_a_mask = tier_map == "A"
