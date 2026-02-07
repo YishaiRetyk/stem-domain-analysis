@@ -16,6 +16,7 @@ This script automates the entire analysis pipeline:
 """
 
 import argparse
+import gc
 import sys
 import json
 from pathlib import Path
@@ -719,6 +720,7 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
     9. VALIDATION + REPORTING
     """
     import logging
+    import psutil
     from src.fft_coords import FFTGrid
     from src.pipeline_config import PipelineConfig, GPAConfig, TierConfig
     from src.preprocess_fft_safe import preprocess_fft_safe
@@ -730,6 +732,14 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
     from src.gates import evaluate_gate
     from src.validation import validate_pipeline
     from src.reporting import save_pipeline_artifacts, save_json
+    
+    # Memory tracking
+    process = psutil.Process()
+    def log_memory(stage: str):
+        mem = process.memory_info()
+        rss_gb = mem.rss / 1024**3
+        vms_gb = mem.vms / 1024**3
+        print(f"MEMORY [{stage}]: RSS={rss_gb:.2f} GB, VMS={vms_gb:.2f} GB", flush=True)
 
     # Configure logging
     log_level = logging.DEBUG if args.verbose else logging.INFO
@@ -774,6 +784,7 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
     print(f"  Tier A SNR: {config.tier.tier_a_snr}, Tier B: {config.tier.tier_b_snr}")
 
     # --- Step 1: Input validation (G1) ---
+    log_memory("Start")
     print("\n[1/9] Input validation...")
     g1_checks = {
         "is_2d": image.ndim == 2,
@@ -793,6 +804,7 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
     fft_grid = FFTGrid(H, W, pixel_size)
 
     # --- Step 2: Branch A preprocessing (FFT-safe) ---
+    log_memory("Before Branch A")
     print("\n[2/9] Branch A: FFT-safe preprocessing...")
     preproc_record = preprocess_fft_safe(image, config.preprocessing)
     gate_results["G2"] = evaluate_gate("G2", {
@@ -803,11 +815,13 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
     print(f"  G2 {'PASS' if gate_results['G2'].passed else 'FAIL (DEGRADE)'}")
 
     # --- Step 3: Branch B preprocessing (segmentation) ---
+    log_memory("Before Branch B")
     print("\n[3/9] Branch B: Segmentation preprocessing...")
     seg_record = preprocess_segmentation(image, config.segmentation)
     print(f"  Output range: [{seg_record.image_seg.min():.3f}, {seg_record.image_seg.max():.3f}]")
 
     # --- Step 4: Early ROI ---
+    log_memory("Before ROI")
     print("\n[4/9] Early ROI masking...")
     roi_result = compute_roi_mask(seg_record.image_seg, config.roi)
     roi_grid = downsample_to_tile_grid(
@@ -825,6 +839,7 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
         print("  Using full-image ROI (fallback)")
 
     # --- Step 5: Global FFT ---
+    log_memory("Before Global FFT")
     print("\n[5/9] Global FFT analysis...")
     global_fft_result = compute_global_fft(preproc_record.image_fft, fft_grid, config.global_fft)
     d_dom = global_fft_result.d_dom
@@ -845,6 +860,7 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
         q_ranges.append((1.0 / args.d_max, 1.0 / args.d_min))
 
     # --- Step 6: Tile FFT + Two-tier classification ---
+    log_memory("Before Tile FFT")
     print("\n[6/9] Tile FFT + Two-tier classification...")
 
     # G5: tiling adequacy
@@ -881,6 +897,11 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
         peak_sets, skipped_mask, tile_fft_grid, config.tile_size,
         tier_config=config.tier, peak_gate_config=config.peak_gates,
     )
+
+    # Free tile power spectra — no longer needed after classification
+    for ps in peak_sets:
+        ps.power_spectrum = None
+    gc.collect()
 
     ts = gated_grid.tier_summary
     print(f"  Tier A: {ts.n_tier_a}, Tier B: {ts.n_tier_b}, "

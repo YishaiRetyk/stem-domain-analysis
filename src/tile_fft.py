@@ -8,7 +8,9 @@ Gate G5: tile_size_px / (d_dom_nm / pixel_size_nm) >= 20 periods.
 """
 
 import logging
+import gc
 import numpy as np
+import psutil
 from scipy.signal import windows
 from scipy import ndimage
 from typing import List, Optional, Tuple
@@ -65,16 +67,22 @@ def extract_tile_peaks(power: np.ndarray,
     # Mask DC
     y, x = np.ogrid[:tile_size, :tile_size]
     dc_mask = ((y - fft_grid.dc_y) ** 2 + (x - fft_grid.dc_x) ** 2) <= dc_mask_radius ** 2
-    power_masked = power.copy()
-    power_masked[dc_mask] = 0
 
-    # Q-range mask
-    if q_ranges:
+    # When q_ranges are provided, many pixels get zeroed — need a full copy.
+    # Otherwise, mask DC in-place and restore after detection.
+    needs_copy = q_ranges is not None
+    if needs_copy:
+        power_masked = power.copy()
+        power_masked[dc_mask] = 0
         q_mag = fft_grid.q_mag_grid()
         q_mask = np.zeros_like(power_masked, dtype=bool)
         for q_min, q_max in q_ranges:
             q_mask |= (q_mag >= q_min) & (q_mag <= q_max)
         power_masked[~q_mask] = 0
+    else:
+        dc_saved = power[dc_mask].copy()  # small (~28 pixels)
+        power[dc_mask] = 0
+        power_masked = power  # alias, no copy
 
     # Find local maxima
     footprint = np.ones((local_max_size, local_max_size))
@@ -82,6 +90,8 @@ def extract_tile_peaks(power: np.ndarray,
 
     max_val = power_masked.max()
     if max_val == 0:
+        if not needs_copy:
+            power[dc_mask] = dc_saved
         return []
 
     threshold = peak_threshold_frac * max_val
@@ -89,6 +99,8 @@ def extract_tile_peaks(power: np.ndarray,
 
     peak_y, peak_x = np.where(peaks_mask)
     if len(peak_y) == 0:
+        if not needs_copy:
+            power[dc_mask] = dc_saved
         return []
 
     peaks = []
@@ -109,6 +121,10 @@ def extract_tile_peaks(power: np.ndarray,
             intensity=float(power[int(py), int(px)]),
             fwhm=0.0,  # filled later by fft_peak_detection
         ))
+
+    # Restore in-place DC modification
+    if not needs_copy:
+        power[dc_mask] = dc_saved
 
     return peaks
 
@@ -179,13 +195,24 @@ def process_all_tiles(image_fft: np.ndarray,
     """
     info = get_tiling_info(image_fft.shape, tile_size, stride)
     n_rows, n_cols = info["grid_shape"]
+    n_total = n_rows * n_cols
     window = create_2d_hann_window(tile_size)
 
     tile_grid = FFTGrid(tile_size, tile_size, fft_grid.pixel_size_nm)
     peak_sets: List[TilePeakSet] = []
     skipped = np.zeros((n_rows, n_cols), dtype=bool)
 
+    # Memory logging
+    process = psutil.Process()
+    log_interval = max(1, n_total // 20)  # Log ~20 times
+    initial_mem = process.memory_info().rss / 1024**3
+    logger.info(f"MEMORY: Starting tile processing. Initial RSS: {initial_mem:.2f} GB")
+    print(f"MEMORY: Starting tile processing ({n_total} tiles). Initial RSS: {initial_mem:.2f} GB")
+
+    tile_count = 0
     for tile, row, col, y, x in tile_generator(image_fft, tile_size, stride):
+        tile_count += 1
+        
         # ROI check
         if roi_mask_grid is not None and row < roi_mask_grid.shape[0] and col < roi_mask_grid.shape[1]:
             if not roi_mask_grid[row, col]:
@@ -202,5 +229,16 @@ def process_all_tiles(image_fft: np.ndarray,
             tile_col=col,
             power_spectrum=power,
         ))
+
+        # Log memory periodically
+        if tile_count % log_interval == 0:
+            mem_gb = process.memory_info().rss / 1024**3
+            pct = 100 * tile_count / n_total
+            logger.info(f"MEMORY: Tile {tile_count}/{n_total} ({pct:.0f}%) - RSS: {mem_gb:.2f} GB")
+            print(f"MEMORY: Tile {tile_count}/{n_total} ({pct:.0f}%) - RSS: {mem_gb:.2f} GB", flush=True)
+
+    final_mem = process.memory_info().rss / 1024**3
+    logger.info(f"MEMORY: Tile processing complete. Final RSS: {final_mem:.2f} GB (delta: {final_mem - initial_mem:.2f} GB)")
+    print(f"MEMORY: Tile processing complete. Final RSS: {final_mem:.2f} GB (delta: +{final_mem - initial_mem:.2f} GB)", flush=True)
 
     return peak_sets, skipped

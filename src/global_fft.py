@@ -90,12 +90,11 @@ def compute_global_fft(image_fft: np.ndarray,
     r_int = r_px.astype(int)
     max_r = min(crop_grid.dc_x, crop_grid.dc_y, r_int.max())
 
-    radial_sum = np.zeros(max_r + 1)
-    radial_count = np.zeros(max_r + 1)
-    for ri in range(max_r + 1):
-        m = r_int == ri
-        radial_sum[ri] = np.sum(power[m])
-        radial_count[ri] = np.sum(m)
+    r_flat = r_int.ravel()
+    valid = r_flat <= max_r
+    radial_sum = np.bincount(r_flat[valid], weights=power.ravel()[valid],
+                             minlength=max_r + 1)
+    radial_count = np.bincount(r_flat[valid], minlength=max_r + 1).astype(float)
     radial_count[radial_count == 0] = 1
     radial_profile = radial_sum / radial_count
 

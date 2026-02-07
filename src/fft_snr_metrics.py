@@ -7,6 +7,7 @@ Gates G6, G7, G8.
 
 import logging
 import numpy as np
+import psutil
 from typing import List, Optional
 
 from src.pipeline_config import (
@@ -56,7 +57,15 @@ def build_gated_tile_grid(peak_sets: List[TilePeakSet],
     fwhm_map = np.zeros((n_rows, n_cols))
     orientation_map = np.full((n_rows, n_cols), np.nan)
 
-    for ps in peak_sets:
+    # Memory logging
+    process = psutil.Process()
+    n_total = len(peak_sets)
+    log_interval = max(1, n_total // 10)  # Log ~10 times
+    initial_mem = process.memory_info().rss / 1024**3
+    logger.info(f"MEMORY: Starting tile classification. Initial RSS: {initial_mem:.2f} GB")
+    print(f"MEMORY: Starting tile classification ({n_total} tiles). Initial RSS: {initial_mem:.2f} GB", flush=True)
+
+    for i, ps in enumerate(peak_sets):
         r, c = ps.tile_row, ps.tile_col
         if r >= n_rows or c >= n_cols:
             continue
@@ -77,6 +86,17 @@ def build_gated_tile_grid(peak_sets: List[TilePeakSet],
             valid_fwhms = [p["fwhm"] for p in tc.peaks if p.get("fwhm_valid", False)]
             if valid_fwhms:
                 fwhm_map[r, c] = min(valid_fwhms)
+
+        # Log memory periodically
+        if (i + 1) % log_interval == 0:
+            mem_gb = process.memory_info().rss / 1024**3
+            pct = 100 * (i + 1) / n_total
+            logger.info(f"MEMORY: Classification {i+1}/{n_total} ({pct:.0f}%) - RSS: {mem_gb:.2f} GB")
+            print(f"MEMORY: Classification {i+1}/{n_total} ({pct:.0f}%) - RSS: {mem_gb:.2f} GB", flush=True)
+
+    final_mem = process.memory_info().rss / 1024**3
+    logger.info(f"MEMORY: Classification complete. Final RSS: {final_mem:.2f} GB (delta: {final_mem - initial_mem:.2f} GB)")
+    print(f"MEMORY: Classification complete. Final RSS: {final_mem:.2f} GB (delta: +{final_mem - initial_mem:.2f} GB)", flush=True)
 
     # Tier summary
     tier_a_mask = tier_map == "A"

@@ -9,6 +9,7 @@ Strain via smoothed displacement fields (B5).
 Gates G10 (phase noise + unwrap quality), G11 (strain sanity).
 """
 
+import gc
 import logging
 import numpy as np
 from scipy import ndimage
@@ -168,7 +169,9 @@ def compute_gpa_phase(image_fft: np.ndarray,
 
     # Extract g-component
     filtered = FT_shifted * mask
+    del FT, FT_shifted, mask
     H_g_prime = np.fft.ifft2(np.fft.ifftshift(filtered))
+    del filtered
 
     # Subpixel-correct demodulation via real-space phase ramp (F2)
     row_nm = np.arange(H).reshape(-1, 1) * px
@@ -176,8 +179,10 @@ def compute_gpa_phase(image_fft: np.ndarray,
     phase_ramp = np.exp(-2j * np.pi * (g_vector.gx * col_nm + g_vector.gy * row_nm))
 
     H_g = H_g_prime * phase_ramp
+    del H_g_prime, phase_ramp
     phase_raw = np.angle(H_g)
     amplitude = np.abs(H_g)
+    del H_g
 
     # Amplitude mask (B5)
     amp_threshold = amplitude_threshold * np.max(amplitude)
@@ -193,17 +198,16 @@ def compute_gpa_phase(image_fft: np.ndarray,
 
     # Post-mask with eroded amplitude mask (F3)
     amplitude_mask_eroded = ndimage.binary_erosion(amplitude_mask, iterations=2)
-    phase_unwrapped_masked = phase_unwrapped.copy()
-    phase_unwrapped_masked[~amplitude_mask_eroded] = np.nan
+    phase_unwrapped[~amplitude_mask_eroded] = np.nan
 
     # Unwrap quality
-    n_valid = int(np.sum(amplitude_mask_eroded & ~np.isnan(phase_unwrapped_masked)))
+    n_valid = int(np.sum(amplitude_mask_eroded & ~np.isnan(phase_unwrapped)))
     n_amp_masked = int(np.sum(amplitude_mask))
     unwrap_success = n_valid / max(n_amp_masked, 1)
 
     return GPAPhaseResult(
         phase_raw=phase_raw.astype(np.float32),
-        phase_unwrapped=phase_unwrapped_masked.astype(np.float32),
+        phase_unwrapped=phase_unwrapped.astype(np.float32),
         amplitude=amplitude.astype(np.float32),
         amplitude_mask=amplitude_mask_eroded,
         g_vector=g_vector,
@@ -357,6 +361,7 @@ def run_gpa_full(image_fft: np.ndarray,
         phases[key] = phase_result
         qc[f"phase_noise_{key}"] = sigma_phi
         qc[f"unwrap_success_{key}"] = phase_result.unwrap_success_fraction
+        gc.collect()
 
     # Displacement and strain if 2 non-collinear g-vectors
     displacement = None
@@ -513,6 +518,8 @@ def run_gpa_region(image_fft: np.ndarray,
                 phase_result.phase_unwrapped[y_min:y_max, x_min:x_max]
             combined_amplitude_mask[key][y_min:y_max, x_min:x_max] |= \
                 phase_result.amplitude_mask[y_min:y_max, x_min:x_max]
+            del phase_result
+        gc.collect()
 
     # Build combined phase results
     for gi, gv in enumerate(g_vectors[:2]):

@@ -48,6 +48,9 @@ class FFTGrid:
         self.qx_scale = 1.0 / (width * pixel_size_nm)   # cycles/nm per pixel in x
         self.qy_scale = 1.0 / (height * pixel_size_nm)  # cycles/nm per pixel in y
 
+        # Grid cache — avoids recomputing full (H,W) arrays on repeated calls
+        self._cache: dict = {}
+
     # ------------------------------------------------------------------
     # Coordinate conversions
     # ------------------------------------------------------------------
@@ -87,38 +90,48 @@ class FFTGrid:
     # ------------------------------------------------------------------
 
     def q_mag_grid(self) -> np.ndarray:
-        """Return (H, W) array of |q| in cycles/nm."""
-        y, x = np.mgrid[:self.height, :self.width]
-        qx = (x - self.dc_x) * self.qx_scale
-        qy = (y - self.dc_y) * self.qy_scale
-        return np.sqrt(qx**2 + qy**2)
+        """Return (H, W) array of |q| in cycles/nm. Cached after first call."""
+        if 'q_mag' not in self._cache:
+            y, x = np.mgrid[:self.height, :self.width]
+            qx = (x - self.dc_x) * self.qx_scale
+            qy = (y - self.dc_y) * self.qy_scale
+            self._cache['q_mag'] = np.sqrt(qx**2 + qy**2)
+        return self._cache['q_mag']
 
     def qx_grid(self) -> np.ndarray:
-        """Return (H, W) array of qx values in cycles/nm."""
-        x = np.arange(self.width)[np.newaxis, :]
-        return (x - self.dc_x) * self.qx_scale * np.ones((self.height, 1))
+        """Return (H, W) array of qx values in cycles/nm. Cached after first call."""
+        if 'qx' not in self._cache:
+            x = np.arange(self.width)[np.newaxis, :]
+            self._cache['qx'] = (x - self.dc_x) * self.qx_scale * np.ones((self.height, 1))
+        return self._cache['qx']
 
     def qy_grid(self) -> np.ndarray:
-        """Return (H, W) array of qy values in cycles/nm."""
-        y = np.arange(self.height)[:, np.newaxis]
-        return (y - self.dc_y) * self.qy_scale * np.ones((1, self.width))
+        """Return (H, W) array of qy values in cycles/nm. Cached after first call."""
+        if 'qy' not in self._cache:
+            y = np.arange(self.height)[:, np.newaxis]
+            self._cache['qy'] = (y - self.dc_y) * self.qy_scale * np.ones((1, self.width))
+        return self._cache['qy']
 
     def angle_grid_deg(self) -> np.ndarray:
-        """Return (H, W) array of angles in degrees from DC center.
+        """Return (H, W) array of angles in degrees from DC center. Cached.
 
         Uses arctan2(qy, qx), range (-180, 180].
         """
-        y, x = np.mgrid[:self.height, :self.width]
-        qx = (x - self.dc_x) * self.qx_scale
-        qy = (y - self.dc_y) * self.qy_scale
-        return np.degrees(np.arctan2(qy, qx))
+        if 'angle_deg' not in self._cache:
+            y, x = np.mgrid[:self.height, :self.width]
+            qx = (x - self.dc_x) * self.qx_scale
+            qy = (y - self.dc_y) * self.qy_scale
+            self._cache['angle_deg'] = np.degrees(np.arctan2(qy, qx))
+        return self._cache['angle_deg']
 
     def angle_grid_rad(self) -> np.ndarray:
-        """Return (H, W) array of angles in radians from DC center."""
-        y, x = np.mgrid[:self.height, :self.width]
-        qx = (x - self.dc_x) * self.qx_scale
-        qy = (y - self.dc_y) * self.qy_scale
-        return np.arctan2(qy, qx)
+        """Return (H, W) array of angles in radians from DC center. Cached."""
+        if 'angle_rad' not in self._cache:
+            y, x = np.mgrid[:self.height, :self.width]
+            qx = (x - self.dc_x) * self.qx_scale
+            qy = (y - self.dc_y) * self.qy_scale
+            self._cache['angle_rad'] = np.arctan2(qy, qx)
+        return self._cache['angle_rad']
 
     # ------------------------------------------------------------------
     # Physics helpers
