@@ -409,6 +409,15 @@ class ValidationConfig:
 
 
 @dataclass
+class DeviceConfig:
+    """GPU / compute-device configuration."""
+    device: str = "auto"           # "auto" | "gpu" | "cpu"
+    device_id: int = 0
+    tile_batch_size: int = 0       # 0 = auto-size from GPU memory
+    gpu_memory_fraction: float = 0.7
+
+
+@dataclass
 class PipelineConfig:
     """Top-level pipeline configuration."""
     pixel_size_nm: float = 0.127
@@ -423,6 +432,7 @@ class PipelineConfig:
     gpa: GPAConfig = field(default_factory=GPAConfig)
     peak_finding: PeakFindingConfig = field(default_factory=PeakFindingConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
+    device: DeviceConfig = field(default_factory=DeviceConfig)
 
     def to_dict(self) -> dict:
         """Serialise to a JSON-safe dict."""
@@ -447,6 +457,7 @@ class PipelineConfig:
             "gpa": (GPAConfig, "gpa"),
             "peak_finding": (PeakFindingConfig, "peak_finding"),
             "validation": (ValidationConfig, "validation"),
+            "device": (DeviceConfig, "device"),
         }
         for attr, (klass, key) in _mapping.items():
             if key in d and isinstance(d[key], dict):

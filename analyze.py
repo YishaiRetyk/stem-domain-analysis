@@ -778,6 +778,16 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
     if args.no_peak_finding:
         config.peak_finding.enabled = False
 
+    # --- GPU / device context ---
+    from src.gpu_backend import DeviceContext, get_gpu_info
+    device_choice = getattr(args, 'device', config.device.device)
+    ctx = DeviceContext.create(device_choice, device_id=config.device.device_id)
+    if ctx.using_gpu:
+        info = get_gpu_info(config.device.device_id)
+        print(f"  GPU: {info.device_name} ({info.free_memory_gb:.1f}/{info.total_memory_gb:.1f} GB free)")
+    else:
+        print(f"  Device: CPU")
+
     H, W = image.shape
     print(f"\n  Image: {H}x{W}, pixel_size={pixel_size:.6f} nm")
     print(f"  Tile: {config.tile_size}, stride: {config.stride}")
@@ -841,7 +851,7 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
     # --- Step 5: Global FFT ---
     log_memory("Before Global FFT")
     print("\n[5/9] Global FFT analysis...")
-    global_fft_result = compute_global_fft(preproc_record.image_fft, fft_grid, config.global_fft)
+    global_fft_result = compute_global_fft(preproc_record.image_fft, fft_grid, config.global_fft, ctx=ctx)
     d_dom = global_fft_result.d_dom
 
     best_global_snr = max((p.snr for p in global_fft_result.peaks), default=0)
@@ -890,6 +900,7 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
         preproc_record.image_fft, roi_grid, fft_grid,
         tile_size=config.tile_size, stride=config.stride,
         q_ranges=q_ranges if q_ranges else None,
+        ctx=ctx,
     )
 
     tile_fft_grid = FFTGrid(config.tile_size, config.tile_size, pixel_size)
@@ -1132,6 +1143,9 @@ Examples:
     parser.add_argument('--report-format', type=str, choices=['json', 'html', 'both'],
                         default='json', dest='report_format',
                         help='Report output format (default: json)')
+    parser.add_argument('--device', type=str, default='auto',
+                        choices=['auto', 'gpu', 'cpu'],
+                        help='Compute device (default: auto-detect GPU)')
 
     args = parser.parse_args()
     

@@ -11,13 +11,16 @@ import logging
 import numpy as np
 from scipy.signal import windows, find_peaks
 from scipy.ndimage import map_coordinates
-from typing import List, Optional
+from typing import List, Optional, TYPE_CHECKING
 
 from src.fft_coords import FFTGrid
 from src.pipeline_config import (
     GVector, GlobalPeak, GlobalFFTResult, GlobalFFTConfig,
 )
 from src.gates import evaluate_gate
+
+if TYPE_CHECKING:
+    from src.gpu_backend import DeviceContext
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +41,8 @@ def _angular_distance_deg(a1: float, a2: float) -> float:
 
 def compute_global_fft(image_fft: np.ndarray,
                        fft_grid: FFTGrid,
-                       config: GlobalFFTConfig = None) -> GlobalFFTResult:
+                       config: GlobalFFTConfig = None,
+                       ctx: Optional["DeviceContext"] = None) -> GlobalFFTResult:
     """Run full-image FFT and extract g-vectors.
 
     Parameters
@@ -71,12 +75,26 @@ def compute_global_fft(image_fft: np.ndarray,
 
     # Hann window
     window = np.outer(windows.hann(crop_h), windows.hann(crop_w))
-    windowed = cropped.astype(np.float64) * window
 
-    # FFT
-    fft_result = np.fft.fft2(windowed)
-    fft_shifted = np.fft.fftshift(fft_result)
-    power = np.abs(fft_shifted) ** 2
+    # FFT (GPU or CPU)
+    if ctx is not None and ctx.using_gpu:
+        cropped_d = ctx.to_device(cropped.astype(np.float64))
+        window_d = ctx.to_device(window)
+        windowed_d = cropped_d * window_d
+        del cropped_d, window_d
+        fft_result = ctx.fft2(windowed_d)
+        del windowed_d
+        fft_shifted = ctx.fftshift(fft_result)
+        del fft_result
+        power_d = ctx.xp.abs(fft_shifted) ** 2
+        del fft_shifted
+        power = ctx.to_host(power_d)
+        del power_d
+    else:
+        windowed = cropped.astype(np.float64) * window
+        fft_result = np.fft.fft2(windowed)
+        fft_shifted = np.fft.fftshift(fft_result)
+        power = np.abs(fft_shifted) ** 2
 
     # Build FFTGrid for the cropped image
     crop_grid = FFTGrid(crop_h, crop_w, fft_grid.pixel_size_nm)

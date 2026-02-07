@@ -3,6 +3,7 @@ Tile-based FFT Computation (WS3).
 
 Refactored from radial_analysis.py. Uses FFTGrid for all coordinate conversions.
 Supports ROI-aware processing: skips tiles where ROI coverage < threshold.
+GPU-accelerated batched FFT via DeviceContext when available.
 
 Gate G5: tile_size_px / (d_dom_nm / pixel_size_nm) >= 20 periods.
 """
@@ -13,12 +14,15 @@ import numpy as np
 import psutil
 from scipy.signal import windows
 from scipy import ndimage
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, TYPE_CHECKING
 
 from src.fft_coords import FFTGrid
 from src.pipeline_config import TilePeak, TilePeakSet
 from src.fft_features import tile_generator, get_tiling_info, create_2d_hann_window
 from src.gates import evaluate_gate
+
+if TYPE_CHECKING:
+    from src.gpu_backend import DeviceContext
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +36,33 @@ def compute_tile_fft(tile: np.ndarray, window: np.ndarray) -> np.ndarray:
     fft_result = np.fft.fft2(windowed)
     fft_shifted = np.fft.fftshift(fft_result)
     return np.abs(fft_shifted) ** 2
+
+
+def compute_tile_fft_batch(tiles: np.ndarray, window: np.ndarray,
+                           ctx: "DeviceContext") -> np.ndarray:
+    """Batch FFT for multiple tiles.
+
+    Parameters
+    ----------
+    tiles : (B, H, W) float array
+    window : (H, W) Hann window
+    ctx : DeviceContext
+
+    Returns
+    -------
+    power : (B, H, W) float64 power spectra (on host)
+    """
+    tiles_d = ctx.to_device(tiles.astype(np.float64))
+    window_d = ctx.to_device(window)
+    windowed = tiles_d * window_d          # broadcasts (B,H,W) * (H,W)
+    del tiles_d, window_d
+    fft_result = ctx.fft2(windowed, axes=(-2, -1))
+    del windowed
+    fft_shifted = ctx.fftshift(fft_result, axes=(-2, -1))
+    del fft_result
+    power = ctx.xp.abs(fft_shifted) ** 2
+    del fft_shifted
+    return ctx.to_host(power)
 
 
 def extract_tile_peaks(power: np.ndarray,
@@ -175,6 +206,7 @@ def process_all_tiles(image_fft: np.ndarray,
                       tile_size: int,
                       stride: int,
                       q_ranges: Optional[List[Tuple[float, float]]] = None,
+                      ctx: Optional["DeviceContext"] = None,
                       ) -> Tuple[List[TilePeakSet], np.ndarray]:
     """Process all tiles, extracting peaks from each.
 
@@ -188,6 +220,8 @@ def process_all_tiles(image_fft: np.ndarray,
         Full-image grid (used only for pixel_size).
     tile_size, stride : int
     q_ranges : optional seeded q-ranges.
+    ctx : DeviceContext, optional
+        When provided and using GPU, tiles are processed in batches.
 
     Returns
     -------
@@ -199,8 +233,6 @@ def process_all_tiles(image_fft: np.ndarray,
     window = create_2d_hann_window(tile_size)
 
     tile_grid = FFTGrid(tile_size, tile_size, fft_grid.pixel_size_nm)
-    peak_sets: List[TilePeakSet] = []
-    skipped = np.zeros((n_rows, n_cols), dtype=bool)
 
     # Memory logging
     process = psutil.Process()
@@ -209,10 +241,38 @@ def process_all_tiles(image_fft: np.ndarray,
     logger.info(f"MEMORY: Starting tile processing. Initial RSS: {initial_mem:.2f} GB")
     print(f"MEMORY: Starting tile processing ({n_total} tiles). Initial RSS: {initial_mem:.2f} GB")
 
+    # Dispatch to GPU-batched or sequential CPU path
+    if ctx is not None and ctx.using_gpu:
+        peak_sets, skipped = _process_tiles_gpu(
+            image_fft, roi_mask_grid, tile_grid, window,
+            tile_size, stride, n_rows, n_cols, q_ranges, ctx,
+            process, log_interval, initial_mem,
+        )
+    else:
+        peak_sets, skipped = _process_tiles_cpu(
+            image_fft, roi_mask_grid, tile_grid, window,
+            tile_size, stride, n_rows, n_cols, n_total, q_ranges,
+            process, log_interval, initial_mem,
+        )
+
+    final_mem = process.memory_info().rss / 1024**3
+    logger.info(f"MEMORY: Tile processing complete. Final RSS: {final_mem:.2f} GB (delta: {final_mem - initial_mem:.2f} GB)")
+    print(f"MEMORY: Tile processing complete. Final RSS: {final_mem:.2f} GB (delta: +{final_mem - initial_mem:.2f} GB)", flush=True)
+
+    return peak_sets, skipped
+
+
+def _process_tiles_cpu(image_fft, roi_mask_grid, tile_grid, window,
+                       tile_size, stride, n_rows, n_cols, n_total,
+                       q_ranges, process, log_interval, initial_mem):
+    """Sequential CPU tile processing (original path)."""
+    peak_sets: List[TilePeakSet] = []
+    skipped = np.zeros((n_rows, n_cols), dtype=bool)
+
     tile_count = 0
     for tile, row, col, y, x in tile_generator(image_fft, tile_size, stride):
         tile_count += 1
-        
+
         # ROI check
         if roi_mask_grid is not None and row < roi_mask_grid.shape[0] and col < roi_mask_grid.shape[1]:
             if not roi_mask_grid[row, col]:
@@ -237,8 +297,105 @@ def process_all_tiles(image_fft: np.ndarray,
             logger.info(f"MEMORY: Tile {tile_count}/{n_total} ({pct:.0f}%) - RSS: {mem_gb:.2f} GB")
             print(f"MEMORY: Tile {tile_count}/{n_total} ({pct:.0f}%) - RSS: {mem_gb:.2f} GB", flush=True)
 
-    final_mem = process.memory_info().rss / 1024**3
-    logger.info(f"MEMORY: Tile processing complete. Final RSS: {final_mem:.2f} GB (delta: {final_mem - initial_mem:.2f} GB)")
-    print(f"MEMORY: Tile processing complete. Final RSS: {final_mem:.2f} GB (delta: +{final_mem - initial_mem:.2f} GB)", flush=True)
+    return peak_sets, skipped
+
+
+def _process_tiles_gpu(image_fft, roi_mask_grid, tile_grid, window,
+                       tile_size, stride, n_rows, n_cols, q_ranges, ctx,
+                       process, log_interval, initial_mem):
+    """Batched GPU tile processing with OOM recovery."""
+    n_total = n_rows * n_cols
+
+    # 1. Collect tile positions, separating valid from skipped
+    valid_tiles = []   # (row, col, y, x)
+    skipped = np.zeros((n_rows, n_cols), dtype=bool)
+
+    for _tile, row, col, y, x in tile_generator(image_fft, tile_size, stride):
+        if roi_mask_grid is not None and row < roi_mask_grid.shape[0] and col < roi_mask_grid.shape[1]:
+            if not roi_mask_grid[row, col]:
+                skipped[row, col] = True
+                continue
+        valid_tiles.append((row, col, y, x))
+
+    # Pre-allocate result dict keyed by (row, col)
+    result_map = {}
+
+    # Add skipped entries
+    for row in range(n_rows):
+        for col in range(n_cols):
+            if skipped[row, col]:
+                result_map[(row, col)] = TilePeakSet(peaks=[], tile_row=row, tile_col=col)
+
+    # 2. Auto-size batches
+    batch_size = ctx.max_batch_tiles(tile_size)
+    logger.info(f"GPU batch size: {batch_size} tiles")
+
+    # 3. Process in batches
+    processed_count = 0
+    i = 0
+    while i < len(valid_tiles):
+        batch_entries = valid_tiles[i:i + batch_size]
+        b = len(batch_entries)
+
+        # Stack tiles into (B, H, W) array
+        tile_stack = np.empty((b, tile_size, tile_size), dtype=np.float64)
+        for j, (row, col, y, x) in enumerate(batch_entries):
+            tile_stack[j] = image_fft[y:y + tile_size, x:x + tile_size]
+
+        # Try GPU batch FFT
+        try:
+            power_batch = compute_tile_fft_batch(tile_stack, window, ctx)
+        except Exception as e:
+            err_name = type(e).__name__
+            if "OutOfMemory" in err_name or "MemoryError" in err_name:
+                # OOM recovery: halve batch size and retry
+                ctx.clear_memory_pool()
+                batch_size = max(1, batch_size // 2)
+                logger.warning(f"GPU OOM — reducing batch to {batch_size}")
+                if batch_size == 1 and b == 1:
+                    # Batch=1 also failed; fall back to CPU for this tile
+                    logger.warning("GPU batch=1 OOM — falling back to CPU for this tile")
+                    row, col, y, x = batch_entries[0]
+                    tile_data = image_fft[y:y + tile_size, x:x + tile_size]
+                    power = compute_tile_fft(tile_data, window)
+                    peaks = extract_tile_peaks(power, tile_grid, q_ranges=q_ranges)
+                    result_map[(row, col)] = TilePeakSet(
+                        peaks=peaks, tile_row=row, tile_col=col,
+                        power_spectrum=power,
+                    )
+                    i += 1
+                    processed_count += 1
+                    continue
+                # Retry with smaller batch (don't advance i)
+                continue
+            else:
+                raise
+
+        del tile_stack
+
+        # Extract peaks on CPU for each tile in the batch
+        for j, (row, col, y, x) in enumerate(batch_entries):
+            power = power_batch[j]
+            peaks = extract_tile_peaks(power, tile_grid, q_ranges=q_ranges)
+            result_map[(row, col)] = TilePeakSet(
+                peaks=peaks, tile_row=row, tile_col=col,
+                power_spectrum=power,
+            )
+
+        del power_batch
+        i += b
+        processed_count += b
+
+        # Memory logging
+        if processed_count % max(1, log_interval) < b:
+            mem_gb = process.memory_info().rss / 1024**3
+            pct = 100 * processed_count / max(1, len(valid_tiles))
+            logger.info(f"MEMORY: GPU batch tile {processed_count}/{len(valid_tiles)} ({pct:.0f}%) - RSS: {mem_gb:.2f} GB")
+            print(f"MEMORY: GPU batch tile {processed_count}/{len(valid_tiles)} ({pct:.0f}%) - RSS: {mem_gb:.2f} GB", flush=True)
+
+    # 4. Assemble results in tile_generator order
+    peak_sets: List[TilePeakSet] = []
+    for _tile, row, col, y, x in tile_generator(image_fft, tile_size, stride):
+        peak_sets.append(result_map[(row, col)])
 
     return peak_sets, skipped

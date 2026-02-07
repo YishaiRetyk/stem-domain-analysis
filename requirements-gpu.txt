@@ -1,0 +1,2 @@
+# GPU acceleration (optional). Pick the CuPy wheel matching your CUDA version:
+cupy-cuda12x>=13.0
