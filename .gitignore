@@ -63,6 +63,9 @@ htmlcov/
 *.h5
 *.hdf5
 
+# Input directories
+inputs/
+
 # Output directories
 outputs/
 artifacts/
