@@ -428,6 +428,13 @@ class DeviceConfig:
 
 
 @dataclass
+class VizConfig:
+    """PNG visualization configuration."""
+    enabled: bool = True
+    dpi: int = 150
+
+
+@dataclass
 class PipelineConfig:
     """Top-level pipeline configuration."""
     pixel_size_nm: float = 0.127
@@ -443,6 +450,7 @@ class PipelineConfig:
     peak_finding: PeakFindingConfig = field(default_factory=PeakFindingConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     device: DeviceConfig = field(default_factory=DeviceConfig)
+    viz: VizConfig = field(default_factory=VizConfig)
 
     def to_dict(self) -> dict:
         """Serialise to a JSON-safe dict."""
@@ -468,6 +476,7 @@ class PipelineConfig:
             "peak_finding": (PeakFindingConfig, "peak_finding"),
             "validation": (ValidationConfig, "validation"),
             "device": (DeviceConfig, "device"),
+            "viz": (VizConfig, "viz"),
         }
         for attr, (klass, key) in _mapping.items():
             if key in d and isinstance(d[key], dict):

@@ -777,6 +777,9 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
         config.gpa.enabled = False
     if args.no_peak_finding:
         config.peak_finding.enabled = False
+    if args.no_viz:
+        config.viz.enabled = False
+    config.viz.dpi = args.viz_dpi
 
     # --- GPU / device context ---
     from src.gpu_backend import DeviceContext, get_gpu_info
@@ -893,6 +896,12 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
             roi_result=roi_result, global_fft_result=global_fft_result,
             validation_report=report,
         )
+        if config.viz.enabled:
+            from src.hybrid_viz import save_pipeline_visualizations
+            save_pipeline_visualizations(
+                output_path, config=config, fft_grid=fft_grid,
+                raw_image=image, global_fft_result=global_fft_result,
+            )
         return 1
     print(f"  Periods/tile: {periods:.1f} (G5 PASS)")
 
@@ -977,6 +986,7 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
     # --- Step 8: Peak finding ---
     lattice_validation = None
     peaks = None
+    peak_image = None
     if config.peak_finding.enabled and d_dom is not None:
         print("\n[8/9] Peak finding...")
         from src.peak_finding import (
@@ -1036,6 +1046,18 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
         peaks=peaks,
         validation_report=report,
     )
+
+    # --- PNG visualizations ---
+    if config.viz.enabled:
+        from src.hybrid_viz import save_pipeline_visualizations
+        viz_saved = save_pipeline_visualizations(
+            output_path, config=config, fft_grid=fft_grid,
+            raw_image=image, global_fft_result=global_fft_result,
+            gated_grid=gated_grid, gpa_result=gpa_result,
+            peaks=peaks, lattice_validation=lattice_validation,
+            bandpass_image=peak_image, validation_report=report,
+        )
+        saved.update(viz_saved)
 
     # --- Summary ---
     print("\n" + "=" * 60)
@@ -1147,6 +1169,10 @@ Examples:
     parser.add_argument('--device', type=str, default='auto',
                         choices=['auto', 'gpu', 'cpu'],
                         help='Compute device (default: auto-detect GPU)')
+    parser.add_argument('--viz-dpi', type=int, default=150, dest='viz_dpi',
+                        help='DPI for PNG visualizations (default: 150)')
+    parser.add_argument('--no-viz', action='store_true', dest='no_viz',
+                        help='Skip PNG visualization generation')
 
     args = parser.parse_args()
     
