@@ -530,7 +530,7 @@ def validate_spatial_coherence(
     # Compute orientation entropy (how random are the orientations?)
     orientations = orientation_map[peak_mask]
     # Bin orientations into 12 sectors (30° each)
-    orientation_bins = np.histogram(orientations, bins=12, range=(-180, 180))[0]
+    orientation_bins = np.histogram(orientations, bins=12, range=(0, 180))[0]
     orientation_probs = orientation_bins / orientation_bins.sum()
     orientation_probs = orientation_probs[orientation_probs > 0]
     orientation_entropy = -np.sum(orientation_probs * np.log2(orientation_probs)) / np.log2(12)  # Normalized
@@ -554,7 +554,7 @@ def validate_spatial_coherence(
                     neighbor_angle = orientation_map[nr, nc]
                     # Angle difference (handling wrap-around)
                     diff = abs(angle - neighbor_angle)
-                    diff = min(diff, 360 - diff)
+                    diff = min(diff, 180 - diff)
                     if diff < 30:  # Within 30° counts as agreement
                         neighbor_agreement += 1
                     neighbor_count += 1

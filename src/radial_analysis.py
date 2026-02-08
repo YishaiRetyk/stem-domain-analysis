@@ -200,10 +200,10 @@ def analyze_tile_peaks(tile: np.ndarray, pixel_size_nm: float,
     peak_q = peak_r * q_scale
     
     # Compute orientation (angle from center)
-    # atan2 gives angle from -180 to 180
+    # Map to [0, 180) — Friedel symmetry means θ and θ+180° are equivalent
     dx = peak_x - center
     dy = peak_y - center
-    orientation = np.degrees(np.arctan2(dy, dx))
+    orientation = np.degrees(np.arctan2(dy, dx)) % 180
     
     # Confidence based on peak intensity relative to threshold
     confidence = min(1.0, peak_intensity / (threshold * 3))
@@ -438,8 +438,8 @@ def save_orientation_map(image: np.ndarray, peak_mask: np.ndarray,
             x = col * stride
             angle = orientation_map[row, col]
 
-            # Map angle (-180 to 180) to hue (0 to 1)
-            hue = (angle + 180) / 360
+            # Map angle (0 to 180) to hue (0 to 1)
+            hue = angle / 180
 
             # HSV to RGB
             rgb = hsv_to_rgb([hue, 0.8, 0.9])
@@ -457,7 +457,7 @@ def save_orientation_map(image: np.ndarray, peak_mask: np.ndarray,
         add_scalebar(ax, pixel_size_nm, image.shape, location='lower right', color='white')
 
     # Add colorbar for angle
-    sm = plt.cm.ScalarMappable(cmap='hsv', norm=plt.Normalize(-180, 180))
+    sm = plt.cm.ScalarMappable(cmap='hsv', norm=plt.Normalize(0, 180))
     sm.set_array([])
     cbar = plt.colorbar(sm, ax=ax, label='Angle (Degrees)')
 
