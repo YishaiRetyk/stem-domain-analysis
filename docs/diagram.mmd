@@ -5,7 +5,8 @@ flowchart TB
     %% STEM DOMAIN ANALYSIS - HYBRID PIPELINE WORKFLOW (--hybrid)
     %% ============================================================
     %% 9-stage pipeline with two-branch preprocessing,
-    %% two-tier SNR classification, and quality gates G1-G12.
+    %% two-tier SNR classification, quality gates G1-G12,
+    %% and 25 output artifacts (8 data + 17 PNG).
     %% ============================================================
 
     subgraph INPUT["1/9 INPUT VALIDATION"]
@@ -209,48 +210,71 @@ flowchart TB
         VAL_GATES --> VAL_METRICS --> VAL_PASS
     end
 
-    subgraph OUTPUT["Output Artifacts"]
+    subgraph OUTPUT["Output Artifacts (25 files)"]
         direction TB
 
-        subgraph OUT_DATA["Data Artifacts (JSON / NPY)"]
-            direction LR
-            ART_PARAMS[("parameters.json<br/><i>v3.0, all config + results</i>")]
-            ART_REPORT[("report.json<br/><i>gates, summary, diagnostics</i>")]
-            ART_GVEC[("global_g_vectors.json")]
-            ART_TIER[("tier_map.npy<br/><i>0=skip, 1=reject, 2=B, 3=A</i>")]
-            ART_GPA_MODE[("gpa_mode_decision.json")]
-            ART_GPA_REF[("gpa_reference.json")]
-            ART_PEAKS[("atom_peaks.npy<br/><i>(N,5): x,y,int,sx,sy</i>")]
-            ART_PEAKSTATS[("peak_stats.json")]
+        subgraph OUT_DATA["Data Artifacts (8 files)"]
+            direction TB
+
+            subgraph OUT_JSON["JSON"]
+                direction LR
+                ART_PARAMS[("parameters.json<br/><i>v3.0: all config, preproc,<br/>ROI, FFT, tier, GPA,<br/>peak, gate results</i>")]
+                ART_REPORT[("report.json<br/><i>gates, pass/fail, summary,<br/>timestamp, diagnostics</i>")]
+                ART_GVEC[("global_g_vectors.json<br/><i>frequency_unit + gx,gy<br/>per g-vector</i>")]
+                ART_PEAKSTATS[("peak_stats.json<br/><i>fraction_valid, mean/std<br/>NN distance, n_peaks</i>")]
+                ART_GPA_MODE[("gpa_mode_decision.json<br/><i>selected mode, metrics,<br/>confidence, reason</i>")]
+                ART_GPA_REF[("gpa_reference.json<br/><i>center tile, bbox, orient<br/>mean/std, SNR, entropy</i>")]
+            end
+
+            subgraph OUT_NPY["NumPy Binary"]
+                direction LR
+                ART_TIER[("tier_map.npy<br/><i>uint8 (n_rows, n_cols)<br/>0=skip, 1=reject, 2=B, 3=A</i>")]
+                ART_PEAKS[("atom_peaks.npy<br/><i>float64 (N, 5)<br/>x, y, intensity, sigma_x, sigma_y</i>")]
+            end
         end
 
-        subgraph OUT_VIZ["PNG Visualizations (--no-viz to skip)"]
-            direction LR
+        subgraph OUT_VIZ["PNG Visualizations (17 files, --no-viz to skip, --viz-dpi to set resolution)"]
+            direction TB
 
-            subgraph VIZ_INPUT["Input"]
-                VIZ_ORIG[("input_original.png<br/><i>Grayscale + scale bar</i>")]
+            subgraph VIZ_ROW1["Input + Global FFT (3 files)"]
+                direction LR
+                VIZ_ORIG[("input_original.png<br/><i>Grayscale image<br/>with calibrated scale bar</i>")]
+                VIZ_RADIAL[("globalfft_radial_profile.png<br/><i>q vs log-intensity<br/>background fit curve<br/>peak markers + d-spacing labels</i>")]
+                VIZ_POWER[("globalfft_power_spectrum.png<br/><i>Log |FFT|^2, inferno cmap<br/>cyan arrows for g-vectors<br/>d-spacing annotations</i>")]
             end
 
-            subgraph VIZ_FFT["Global FFT"]
-                VIZ_RADIAL[("globalfft_radial_profile.png<br/><i>q vs intensity, peaks annotated</i>")]
-                VIZ_POWER[("globalfft_power_spectrum.png<br/><i>Log-scale + g-vector arrows</i>")]
+            subgraph VIZ_ROW2["Tile Classification Maps (3 files)"]
+                direction LR
+                VIZ_TIERMAP[("tiles_tier_map.png<br/><i>Discrete colormap<br/>green=A, yellow=B<br/>red=rejected, gray=skipped<br/>legend with counts</i>")]
+                VIZ_SNRMAP[("tiles_snr_map.png<br/><i>Viridis heatmap<br/>colorbar: Peak SNR<br/>masked where skipped</i>")]
+                VIZ_ORIENTMAP[("tiles_orientation_map.png<br/><i>HSV cyclic cmap 0-180 deg<br/>masked where skipped<br/>or rejected</i>")]
             end
 
-            subgraph VIZ_TILES["Tile Maps"]
-                VIZ_TIERMAP[("tiles_tier_map.png<br/><i>Green=A, Yellow=B, Red=rejected</i>")]
-                VIZ_SNRMAP[("tiles_snr_map.png<br/><i>Viridis heatmap</i>")]
-                VIZ_ORIENTMAP[("tiles_orientation_map.png<br/><i>HSV cyclic cmap</i>")]
+            subgraph VIZ_ROW3["GPA Phase + Amplitude (2x per g-vector)"]
+                direction LR
+                VIZ_PHASE0[("gpa_phase_g0.png<br/><i>Unwrapped phase (rad)<br/>twilight cmap<br/>NaN regions = gray</i>")]
+                VIZ_PHASE1[("gpa_phase_g1.png<br/><i>Unwrapped phase (rad)<br/>twilight cmap<br/>NaN regions = gray</i>")]
+                VIZ_AMP0[("gpa_amplitude_g0.png<br/><i>Amplitude, inferno cmap<br/>cyan contour at<br/>mask boundary</i>")]
+                VIZ_AMP1[("gpa_amplitude_g1.png<br/><i>Amplitude, inferno cmap<br/>cyan contour at<br/>mask boundary</i>")]
             end
 
-            subgraph VIZ_GPA["GPA (per g-vector)"]
-                VIZ_PHASE[("gpa_phase_g{0,1}.png<br/><i>Unwrapped, twilight cmap</i>")]
-                VIZ_AMP[("gpa_amplitude_g{0,1}.png<br/><i>Inferno + mask contour</i>")]
-                VIZ_DISP[("gpa_displacement_u{x,y}.png<br/><i>RdBu_r, colorbar in nm</i>")]
-                VIZ_STRAIN[("gpa_strain_{exx,eyy,exy,rot}.png<br/><i>RdBu_r, symmetric +/-5%</i>")]
+            subgraph VIZ_ROW4["GPA Displacement (2 files)"]
+                direction LR
+                VIZ_UX[("gpa_displacement_ux.png<br/><i>X displacement (nm)<br/>RdBu_r centred at 0<br/>colorbar in nm</i>")]
+                VIZ_UY[("gpa_displacement_uy.png<br/><i>Y displacement (nm)<br/>RdBu_r centred at 0<br/>colorbar in nm</i>")]
             end
 
-            subgraph VIZ_PEAKS["Peak Finding"]
-                VIZ_LATTICE[("peaks_lattice_overlay.png<br/><i>NN connections by validity</i>")]
+            subgraph VIZ_ROW5["GPA Strain (4 files)"]
+                direction LR
+                VIZ_EXX[("gpa_strain_exx.png<br/><i>Extensional strain x<br/>RdBu_r, +/-5%</i>")]
+                VIZ_EYY[("gpa_strain_eyy.png<br/><i>Extensional strain y<br/>RdBu_r, +/-5%</i>")]
+                VIZ_EXY[("gpa_strain_exy.png<br/><i>Shear strain<br/>RdBu_r, +/-5%</i>")]
+                VIZ_ROT[("gpa_strain_rotation.png<br/><i>Rotation (deg)<br/>RdBu_r, +/-5 deg</i>")]
+            end
+
+            subgraph VIZ_ROW6["Peak Finding (1 file)"]
+                direction LR
+                VIZ_LATTICE[("peaks_lattice_overlay.png<br/><i>Bandpass image + cyan peaks<br/>NN connections:<br/>lime=valid, red=invalid</i>")]
             end
         end
     end
@@ -281,6 +305,40 @@ flowchart TB
     VALIDATION --> OUTPUT
 
     %% ============================================================
+    %% ARTIFACT PROVENANCE (which stage produces which artifact)
+    %% ============================================================
+
+    INPUT -->|"raw image"| VIZ_ORIG
+    GLOBAL_FFT -->|"radial_profile,<br/>q_values, background,<br/>peaks"| VIZ_RADIAL
+    GLOBAL_FFT -->|"power_spectrum,<br/>g_vectors"| VIZ_POWER
+    GLOBAL_FFT -->|"g_vectors"| ART_GVEC
+
+    TILE_FFT -->|"tier_map"| ART_TIER
+    TILE_FFT -->|"tier_map"| VIZ_TIERMAP
+    TILE_FFT -->|"snr_map"| VIZ_SNRMAP
+    TILE_FFT -->|"orientation_map"| VIZ_ORIENTMAP
+
+    GPA -->|"phases"| VIZ_PHASE0
+    GPA -->|"phases"| VIZ_PHASE1
+    GPA -->|"amplitude,<br/>amplitude_mask"| VIZ_AMP0
+    GPA -->|"amplitude,<br/>amplitude_mask"| VIZ_AMP1
+    GPA -->|"displacement.ux"| VIZ_UX
+    GPA -->|"displacement.uy"| VIZ_UY
+    GPA -->|"strain.exx"| VIZ_EXX
+    GPA -->|"strain.eyy"| VIZ_EYY
+    GPA -->|"strain.exy"| VIZ_EXY
+    GPA -->|"strain.rotation"| VIZ_ROT
+    GPA -->|"mode_decision"| ART_GPA_MODE
+    GPA -->|"reference_region"| ART_GPA_REF
+
+    PEAKFIND -->|"peaks"| ART_PEAKS
+    PEAKFIND -->|"lattice_validation"| ART_PEAKSTATS
+    PEAKFIND -->|"peaks + bandpass_image<br/>+ lattice_validation"| VIZ_LATTICE
+
+    VALIDATION -->|"config + all results"| ART_PARAMS
+    VALIDATION -->|"gates, summary"| ART_REPORT
+
+    %% ============================================================
     %% STYLING
     %% ============================================================
 
@@ -298,16 +356,18 @@ flowchart TB
     class IN_G1,PA_G2,ROI_G3,GF_G4,TF_G5,TF_G6,TF_G7,TF_G8 gateNode
     class GPA_G9,GPA_G10,GPA_G11,PF_G12 gateNode
 
-    %% Artifact nodes (green)
+    %% Data artifact nodes (green)
     classDef artifactNode fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#1b5e20
     class ART_PARAMS,ART_REPORT,ART_GVEC,ART_TIER artifactNode
     class ART_GPA_MODE,ART_GPA_REF,ART_PEAKS,ART_PEAKSTATS artifactNode
 
-    %% PNG visualization nodes (blue-green)
+    %% PNG visualization nodes (teal)
     classDef vizNode fill:#e0f7fa,stroke:#00695c,stroke-width:2px,color:#004d40
     class VIZ_ORIG,VIZ_RADIAL,VIZ_POWER vizNode
     class VIZ_TIERMAP,VIZ_SNRMAP,VIZ_ORIENTMAP vizNode
-    class VIZ_PHASE,VIZ_AMP,VIZ_DISP,VIZ_STRAIN vizNode
+    class VIZ_PHASE0,VIZ_PHASE1,VIZ_AMP0,VIZ_AMP1 vizNode
+    class VIZ_UX,VIZ_UY vizNode
+    class VIZ_EXX,VIZ_EYY,VIZ_EXY,VIZ_ROT vizNode
     class VIZ_LATTICE vizNode
 
     %% Stage subgraph styling
