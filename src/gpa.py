@@ -499,12 +499,23 @@ def run_gpa_full(image_fft: np.ndarray,
     phases: Dict[str, GPAPhaseResult] = {}
     qc: dict = {"frequency_unit": "cycles/nm"}
 
+    # Pre-compute FFT once and cache for all g-vector iterations
+    # (same optimisation already used by run_gpa_region)
+    if ctx is not None and ctx.using_gpu:
+        img_d = ctx.to_device(image_fft.astype(np.float64))
+        cached_ft_shifted = ctx.to_host(ctx.fftshift(ctx.fft2(img_d)))
+        del img_d
+        ctx.clear_memory_pool()
+    else:
+        cached_ft_shifted = np.fft.fftshift(np.fft.fft2(image_fft))
+
     for i, gv in enumerate(g_vectors[:2]):  # max 2 g-vectors
         key = f"g{i}"
         phase_result = compute_gpa_phase(
             image_fft, gv, mask_sigma, fft_grid,
             amplitude_threshold=config.amplitude_threshold,
             ctx=ctx,
+            _cached_ft_shifted=cached_ft_shifted,
         )
         # Phase noise in reference region
         sigma_phi = check_phase_noise(phase_result, ref_region.tiles,
@@ -529,6 +540,10 @@ def run_gpa_full(image_fft: np.ndarray,
         qc[f"phase_noise_{key}"] = sigma_phi
         qc[f"unwrap_success_{key}"] = phase_result.unwrap_success_fraction
         gc.collect()
+
+    # Free the cached FFT — no longer needed after phase extraction
+    del cached_ft_shifted
+    gc.collect()
 
     # Displacement and strain if 2 non-collinear g-vectors
     displacement = None

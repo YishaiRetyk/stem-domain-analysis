@@ -353,7 +353,8 @@ def classify_tile(peak_set: TilePeakSet,
                   tier_config: TierConfig = None,
                   peak_gate_config: PeakGateConfig = None,
                   fwhm_config: FWHMConfig = None,
-                  effective_q_min: float = 0.0) -> TileClassification:
+                  effective_q_min: float = 0.0,
+                  _precomputed_grids: dict = None) -> TileClassification:
     """Classify a tile as Tier A, Tier B, or REJECTED.
 
     Uses power_spectrum from peak_set for SNR and FWHM computation.
@@ -362,6 +363,13 @@ def classify_tile(peak_set: TilePeakSet,
     - ``auto``: proxy width for all peaks, curve_fit only for top-K high-SNR
     - ``proxy_only``: never run curve_fit
     - ``curve_fit``: always run curve_fit (legacy behaviour, slow)
+
+    Parameters
+    ----------
+    _precomputed_grids : dict, optional
+        Pre-computed ``{'y_grid': ..., 'x_grid': ...}`` arrays (same shape as
+        power spectrum).  Passed from ``build_gated_tile_grid`` to avoid
+        re-allocating identical grids for every tile.
     """
     if tier_config is None:
         tier_config = TierConfig()
@@ -379,9 +387,13 @@ def classify_tile(peak_set: TilePeakSet,
             n_non_collinear=0, best_snr=0, best_orientation_deg=0,
         )
 
-    # Pre-compute shared grids once (avoids O(P² × HW) recomputation)
+    # Reuse pre-computed grids when available (all tiles share the same shape)
     H, W = power.shape
-    y_grid, x_grid = np.mgrid[:H, :W]
+    if _precomputed_grids is not None and _precomputed_grids['y_grid'].shape == (H, W):
+        y_grid = _precomputed_grids['y_grid']
+        x_grid = _precomputed_grids['x_grid']
+    else:
+        y_grid, x_grid = np.mgrid[:H, :W]
     exclusion_mask = _build_exclusion_mask(x_grid, y_grid, peaks, fft_grid)
     _cached = {'x_grid': x_grid, 'y_grid': y_grid,
                'exclusion_mask': exclusion_mask}
@@ -392,6 +404,41 @@ def classify_tile(peak_set: TilePeakSet,
         snr_results.append(compute_peak_snr(power, p, peaks, fft_grid,
                                             _cached=_cached,
                                             effective_q_min=effective_q_min))
+
+    # --- Early rejection: skip FWHM if no peak reaches Tier B SNR ---
+    best_snr_val = max(s.snr for s in snr_results) if snr_results else 0.0
+    if best_snr_val < tier_config.tier_b_snr:
+        # No peak meets even the Tier B threshold; tile will be REJECTED
+        # regardless of FWHM, so skip the expensive measurement entirely.
+        peak_metrics = []
+        best_orientation = 0.0
+        for i, p in enumerate(peaks):
+            peak_metrics.append({
+                "qx": p.qx, "qy": p.qy, "q_mag": p.q_mag,
+                "snr": snr_results[i].snr,
+                "fwhm": 0.0,
+                "fwhm_valid": False,
+                "fwhm_method": "skipped_low_snr",
+                "fwhm_ok": True,
+            })
+            if snr_results[i].snr > best_snr_val:
+                best_orientation = p.angle_deg
+        symmetry_score, n_paired = check_symmetry(peaks, fft_grid)
+        n_non_collinear = count_non_collinear(peaks)
+        return TileClassification(
+            tier="REJECTED",
+            peaks=peak_metrics,
+            symmetry_score=symmetry_score,
+            n_non_collinear=n_non_collinear,
+            best_snr=best_snr_val,
+            best_orientation_deg=best_orientation,
+            gate_details={
+                "n_paired": n_paired,
+                "tier_a_snr_threshold": tier_config.tier_a_snr,
+                "tier_b_snr_threshold": tier_config.tier_b_snr,
+                "early_rejected": True,
+            },
+        )
 
     # --- Pass 2: FWHM with policy gating ---
     fwhm_method = fwhm_config.method if fwhm_config.enabled else "proxy_only"

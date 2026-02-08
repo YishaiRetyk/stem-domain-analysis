@@ -6,9 +6,11 @@ Gates G6, G7, G8.
 """
 
 import logging
+import os
 import time
 import numpy as np
 import psutil
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional
 
 from src.pipeline_config import (
@@ -22,6 +24,24 @@ from src.gates import evaluate_gate
 logger = logging.getLogger(__name__)
 
 
+def _classify_tile_batch(batch, tile_grid, tier_config, peak_gate_config,
+                         fwhm_config, effective_q_min, precomputed_grids):
+    """Classify a batch of tiles (worker function for ThreadPoolExecutor).
+
+    Each item in *batch* is ``(index, TilePeakSet)``.
+    Returns list of ``(index, TileClassification | None)``.
+    """
+    results = []
+    for idx, ps in batch:
+        tc = classify_tile(
+            ps, tile_grid, tier_config, peak_gate_config,
+            fwhm_config, effective_q_min=effective_q_min,
+            _precomputed_grids=precomputed_grids,
+        )
+        results.append((idx, tc))
+    return results
+
+
 def build_gated_tile_grid(peak_sets: List[TilePeakSet],
                           skipped_mask: np.ndarray,
                           fft_grid: FFTGrid,
@@ -31,6 +51,7 @@ def build_gated_tile_grid(peak_sets: List[TilePeakSet],
                           fwhm_config: FWHMConfig = None,
                           log_interval_s: float = 5.0,
                           effective_q_min: float = 0.0,
+                          n_workers: int = 0,
                           ) -> GatedTileGrid:
     """Classify all tiles and build the unified GatedTileGrid.
 
@@ -42,6 +63,9 @@ def build_gated_tile_grid(peak_sets: List[TilePeakSet],
     tile_size : int
     tier_config, peak_gate_config, fwhm_config : optional overrides
     log_interval_s : seconds between progress log lines (default 5)
+    n_workers : int
+        Number of parallel threads for tile classification.
+        0 (default) = ``min(4, cpu_count)``.  1 = sequential (no threading).
 
     Returns
     -------
@@ -64,38 +88,133 @@ def build_gated_tile_grid(peak_sets: List[TilePeakSet],
     fwhm_map = np.zeros((n_rows, n_cols))
     orientation_map = np.full((n_rows, n_cols), np.nan)
 
-    # --- Progress tracking ---
-    process = psutil.Process()
-    n_total = len(peak_sets)
-    initial_mem = process.memory_info().rss / 1024**3
-    t_start = time.monotonic()
-    t_last_log = t_start
-    tiles_done = 0
-    peaks_done = 0
+    # --- Pre-compute shared coordinate grids once (all tiles are tile_size×tile_size) ---
+    precomputed_grids = {
+        'y_grid': np.mgrid[:tile_size, :tile_size][0],
+        'x_grid': np.mgrid[:tile_size, :tile_size][1],
+    }
 
-    msg = (f"Classification: starting {n_total} tiles "
-           f"(RSS {initial_mem:.2f} GB)")
-    logger.info(msg)
-    print(msg, flush=True)
-
+    # --- Separate classifiable tiles from skipped tiles ---
+    classifiable = []  # (flat_index, TilePeakSet)
     for i, ps in enumerate(peak_sets):
         r, c = ps.tile_row, ps.tile_col
         if r >= n_rows or c >= n_cols:
             continue
-
         if skipped_mask[r, c]:
             classifications[r, c] = None
             continue
+        classifiable.append((i, ps))
 
-        tc = classify_tile(ps, tile_grid, tier_config, peak_gate_config,
-                           fwhm_config, effective_q_min=effective_q_min)
+    # --- Progress tracking ---
+    process = psutil.Process()
+    n_total = len(peak_sets)
+    n_classifiable = len(classifiable)
+    initial_mem = process.memory_info().rss / 1024**3
+    t_start = time.monotonic()
+
+    # Resolve worker count
+    if n_workers <= 0:
+        n_workers = min(4, os.cpu_count() or 1)
+    # Don't use threading for tiny workloads
+    use_parallel = n_workers > 1 and n_classifiable > 32
+
+    msg = (f"Classification: starting {n_total} tiles ({n_classifiable} classifiable, "
+           f"workers={n_workers if use_parallel else 1}) "
+           f"(RSS {initial_mem:.2f} GB)")
+    logger.info(msg)
+    print(msg, flush=True)
+
+    # --- Classify tiles (parallel or sequential) ---
+    tile_results = {}  # flat_index -> TileClassification
+
+    if use_parallel:
+        # Split classifiable tiles into chunks for thread workers
+        chunk_size = max(8, n_classifiable // (n_workers * 4))
+        chunks = [
+            classifiable[i:i + chunk_size]
+            for i in range(0, n_classifiable, chunk_size)
+        ]
+
+        completed = 0
+        t_last_log = t_start
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            futures = [
+                executor.submit(
+                    _classify_tile_batch, chunk, tile_grid,
+                    tier_config, peak_gate_config, fwhm_config,
+                    effective_q_min, precomputed_grids,
+                )
+                for chunk in chunks
+            ]
+            for future in futures:
+                batch_results = future.result()
+                for idx, tc in batch_results:
+                    tile_results[idx] = tc
+                completed += len(batch_results)
+
+                # Time-based progress logging
+                t_now = time.monotonic()
+                if t_now - t_last_log >= log_interval_s:
+                    elapsed = t_now - t_start
+                    tiles_per_s = completed / elapsed if elapsed > 0 else 0
+                    remaining = (n_classifiable - completed) / tiles_per_s if tiles_per_s > 0 else 0
+                    mem_gb = process.memory_info().rss / 1024**3
+                    pct = 100 * completed / n_classifiable
+
+                    msg = (f"Classification: {completed}/{n_classifiable} ({pct:.0f}%) | "
+                           f"{tiles_per_s:.1f} tiles/s | "
+                           f"ETA {remaining:.0f}s | RSS {mem_gb:.2f} GB")
+                    logger.info(msg)
+                    print(msg, flush=True)
+                    t_last_log = t_now
+    else:
+        # Sequential path (n_workers=1 or small workload)
+        tiles_done = 0
+        peaks_done = 0
+        t_last_log = t_start
+        for idx, ps in classifiable:
+            tc = classify_tile(
+                ps, tile_grid, tier_config, peak_gate_config,
+                fwhm_config, effective_q_min=effective_q_min,
+                _precomputed_grids=precomputed_grids,
+            )
+            tile_results[idx] = tc
+            tiles_done += 1
+            peaks_done += len(ps.peaks)
+
+            t_now = time.monotonic()
+            if t_now - t_last_log >= log_interval_s:
+                elapsed = t_now - t_start
+                tiles_per_s = tiles_done / elapsed if elapsed > 0 else 0
+                peaks_per_s = peaks_done / elapsed if elapsed > 0 else 0
+                remaining = (n_classifiable - tiles_done) / tiles_per_s if tiles_per_s > 0 else 0
+                mem_gb = process.memory_info().rss / 1024**3
+                pct = 100 * tiles_done / n_classifiable
+
+                msg = (f"Classification: {tiles_done}/{n_classifiable} ({pct:.0f}%) | "
+                       f"{tiles_per_s:.1f} tiles/s, {peaks_per_s:.0f} peaks/s | "
+                       f"ETA {remaining:.0f}s | RSS {mem_gb:.2f} GB")
+                logger.info(msg)
+                print(msg, flush=True)
+                t_last_log = t_now
+
+    # --- Merge results into output arrays ---
+    tiles_done = 0
+    peaks_done = 0
+    for i, ps in enumerate(peak_sets):
+        r, c = ps.tile_row, ps.tile_col
+        if r >= n_rows or c >= n_cols:
+            continue
+        if i not in tile_results:
+            continue
+
+        tc = tile_results[i]
         classifications[r, c] = tc
         tier_map[r, c] = tc.tier
         snr_map[r, c] = tc.best_snr
         symmetry_map[r, c] = tc.symmetry_score
         orientation_map[r, c] = tc.best_orientation_deg
 
-        # Best FWHM from peak metrics
         if tc.peaks:
             valid_fwhms = [p["fwhm"] for p in tc.peaks if p.get("fwhm_valid", False)]
             if valid_fwhms:
@@ -103,23 +222,6 @@ def build_gated_tile_grid(peak_sets: List[TilePeakSet],
 
         tiles_done += 1
         peaks_done += len(ps.peaks)
-
-        # --- Time-based progress logging ---
-        t_now = time.monotonic()
-        if t_now - t_last_log >= log_interval_s:
-            elapsed = t_now - t_start
-            tiles_per_s = tiles_done / elapsed if elapsed > 0 else 0
-            peaks_per_s = peaks_done / elapsed if elapsed > 0 else 0
-            remaining = (n_total - i - 1) / tiles_per_s if tiles_per_s > 0 else 0
-            mem_gb = process.memory_info().rss / 1024**3
-            pct = 100 * (i + 1) / n_total
-
-            msg = (f"Classification: {i+1}/{n_total} ({pct:.0f}%) | "
-                   f"{tiles_per_s:.1f} tiles/s, {peaks_per_s:.0f} peaks/s | "
-                   f"ETA {remaining:.0f}s | RSS {mem_gb:.2f} GB")
-            logger.info(msg)
-            print(msg, flush=True)
-            t_last_log = t_now
 
     t_total = time.monotonic() - t_start
     final_mem = process.memory_info().rss / 1024**3

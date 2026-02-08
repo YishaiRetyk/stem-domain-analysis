@@ -355,6 +355,7 @@ class FWHMConfig:
     maxfev: int = 500              # max iterations for curve_fit (was 2000)
     max_per_tile: int = 2          # max curve_fit calls per tile
     min_snr_for_fit: float = 5.0   # only curve_fit if peak SNR >= this
+    n_workers: int = 0             # parallel classification threads (0 = auto)
 
 
 @dataclass
@@ -453,6 +454,7 @@ class PipelineConfig:
     segmentation: SegmentationPreprocConfig = field(default_factory=SegmentationPreprocConfig)
     roi: ROIConfig = field(default_factory=ROIConfig)
     tier: TierConfig = field(default_factory=TierConfig)
+    fwhm: FWHMConfig = field(default_factory=FWHMConfig)
     peak_gates: PeakGateConfig = field(default_factory=PeakGateConfig)
     global_fft: GlobalFFTConfig = field(default_factory=GlobalFFTConfig)
     gpa: GPAConfig = field(default_factory=GPAConfig)
@@ -480,6 +482,7 @@ class PipelineConfig:
             "segmentation": (SegmentationPreprocConfig, "segmentation"),
             "roi": (ROIConfig, "roi"),
             "tier": (TierConfig, "tier"),
+            "fwhm": (FWHMConfig, "fwhm"),
             "peak_gates": (PeakGateConfig, "peak_gates"),
             "global_fft": (GlobalFFTConfig, "global_fft"),
             "gpa": (GPAConfig, "gpa"),

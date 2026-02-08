@@ -722,7 +722,7 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
     import logging
     import psutil
     from src.fft_coords import FFTGrid, compute_effective_q_min
-    from src.pipeline_config import PipelineConfig, GPAConfig, TierConfig
+    from src.pipeline_config import PipelineConfig, GPAConfig, TierConfig, FWHMConfig
     from src.preprocess_fft_safe import preprocess_fft_safe
     from src.preprocess_segmentation import preprocess_segmentation
     from src.roi_masking import compute_roi_mask, downsample_to_tile_grid
@@ -786,6 +786,8 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
         config.low_q.q_min_cycles_per_nm = args.q_min_override
         config.low_q.auto_q_min = False
         config.low_q.enabled = True
+    if args.n_workers:
+        config.fwhm.n_workers = args.n_workers
 
     # --- GPU / device context ---
     from src.gpu_backend import DeviceContext, get_gpu_info
@@ -945,7 +947,9 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
     gated_grid = build_gated_tile_grid(
         peak_sets, skipped_mask, tile_fft_grid, config.tile_size,
         tier_config=config.tier, peak_gate_config=config.peak_gates,
+        fwhm_config=config.fwhm,
         effective_q_min=tile_effective_q_min,
+        n_workers=config.fwhm.n_workers,
     )
 
     # Free tile power spectra — no longer needed after classification
@@ -1214,6 +1218,8 @@ Examples:
                         help='Override low-q exclusion threshold (cycles/nm), disables auto')
     parser.add_argument('--no-low-q-exclusion', action='store_true', dest='no_low_q_exclusion',
                         help='Disable low-q / DC exclusion entirely')
+    parser.add_argument('--workers', type=int, default=0, dest='n_workers',
+                        help='Parallel threads for tile classification (0=auto, 1=sequential)')
 
     args = parser.parse_args()
     
