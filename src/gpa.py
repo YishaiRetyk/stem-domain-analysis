@@ -451,15 +451,35 @@ def compute_strain_field(displacement: DisplacementField,
 # GPA Execution (full and region modes)
 # ======================================================================
 
-def _determine_mask_sigma(g_vectors: List[GVector], config: GPAConfig) -> float:
-    """Determine the Gaussian mask radius in q-space."""
+def _determine_mask_sigma(g_vectors: List[GVector], config: GPAConfig,
+                          effective_q_min: float = 0.0) -> float:
+    """Determine the Gaussian mask radius in q-space.
+
+    When effective_q_min > 0, clamp sigma to 0.18 * min(|g|) so the
+    Gaussian mask at g has negligible DC leakage (G(0) < 1e-6).
+    """
     if config.mask_radius_q != "auto":
-        return float(config.mask_radius_q)
-    # Auto: 0.5 * min(peak FWHM)
-    fwhms = [g.fwhm for g in g_vectors if g.fwhm > 0]
-    if fwhms:
-        return 0.5 * min(fwhms)
-    return 0.06  # safe default
+        sigma = float(config.mask_radius_q)
+    else:
+        # Auto: 0.5 * min(peak FWHM)
+        fwhms = [g.fwhm for g in g_vectors if g.fwhm > 0]
+        if fwhms:
+            sigma = 0.5 * min(fwhms)
+        else:
+            sigma = 0.06  # safe default
+
+    # DC-safety clamp: sigma <= 0.18 * min(|g|)
+    if effective_q_min > 0 and g_vectors:
+        g_magnitudes = [g.magnitude for g in g_vectors if g.magnitude > 0]
+        if g_magnitudes:
+            max_safe_sigma = 0.18 * min(g_magnitudes)
+            if sigma > max_safe_sigma:
+                logger.warning("GPA mask sigma clamped: %.4f → %.4f "
+                               "(0.18 × min|g|=%.4f) for DC safety",
+                               sigma, max_safe_sigma, min(g_magnitudes))
+                sigma = max_safe_sigma
+
+    return sigma
 
 
 def run_gpa_full(image_fft: np.ndarray,
@@ -469,12 +489,13 @@ def run_gpa_full(image_fft: np.ndarray,
                  config: GPAConfig = None,
                  tile_size: int = 256,
                  stride: int = 128,
-                 ctx=None) -> GPAResult:
+                 ctx=None,
+                 effective_q_min: float = 0.0) -> GPAResult:
     """Full-image GPA mode."""
     if config is None:
         config = GPAConfig()
 
-    mask_sigma = _determine_mask_sigma(g_vectors, config)
+    mask_sigma = _determine_mask_sigma(g_vectors, config, effective_q_min=effective_q_min)
     phases: Dict[str, GPAPhaseResult] = {}
     qc: dict = {"frequency_unit": "cycles/nm"}
 
@@ -580,7 +601,7 @@ def run_gpa_full(image_fft: np.ndarray,
         reference_region=ref_region,
         mode_decision=mode_decision,
         qc=qc,
-        diagnostics={"mask_sigma_q": mask_sigma},
+        diagnostics={"mask_sigma_q": mask_sigma, "effective_q_min": effective_q_min},
     )
 
 
@@ -591,7 +612,8 @@ def run_gpa_region(image_fft: np.ndarray,
                    config: GPAConfig = None,
                    tile_size: int = 256,
                    stride: int = 128,
-                   ctx=None) -> GPAResult:
+                   ctx=None,
+                   effective_q_min: float = 0.0) -> GPAResult:
     """Region-wise GPA mode.
 
     Segments Tier A tiles into connected domains.
@@ -605,7 +627,7 @@ def run_gpa_region(image_fft: np.ndarray,
         config = GPAConfig()
 
     H, W = image_fft.shape
-    mask_sigma = _determine_mask_sigma(g_vectors, config)
+    mask_sigma = _determine_mask_sigma(g_vectors, config, effective_q_min=effective_q_min)
 
     # Pre-compute FFT once and cache for all compute_gpa_phase calls
     if ctx is not None and ctx.using_gpu:
@@ -724,7 +746,8 @@ def run_gpa_region(image_fft: np.ndarray,
         reference_region=best_ref_region,
         mode_decision=mode_decision,
         qc=qc,
-        diagnostics={"mask_sigma_q": mask_sigma, "n_domains": n_domains},
+        diagnostics={"mask_sigma_q": mask_sigma, "n_domains": n_domains,
+                      "effective_q_min": effective_q_min},
     )
 
 
@@ -740,7 +763,8 @@ def run_gpa(image_fft: np.ndarray,
             config: GPAConfig = None,
             tile_size: int = 256,
             stride: int = 128,
-            ctx=None) -> Optional[GPAResult]:
+            ctx=None,
+            effective_q_min: float = 0.0) -> Optional[GPAResult]:
     """Run GPA with mode auto-selection and failure handling.
 
     Returns GPAResult or None if skipped.
@@ -762,12 +786,14 @@ def run_gpa(image_fft: np.ndarray,
         if mode_decision.selected_mode == "full":
             ref_region = select_reference_region(gated_grid)
             result = run_gpa_full(image_fft, g_vectors, ref_region, fft_grid,
-                                  config, tile_size, stride, ctx=ctx)
+                                  config, tile_size, stride, ctx=ctx,
+                                  effective_q_min=effective_q_min)
             result.mode_decision = mode_decision
             return result
         else:
             result = run_gpa_region(image_fft, g_vectors, gated_grid, fft_grid,
-                                    config, tile_size, stride, ctx=ctx)
+                                    config, tile_size, stride, ctx=ctx,
+                                    effective_q_min=effective_q_min)
             result.mode_decision = mode_decision
             return result
 
@@ -778,7 +804,8 @@ def run_gpa(image_fft: np.ndarray,
             logger.info("Falling back to region-wise GPA")
             try:
                 result = run_gpa_region(image_fft, g_vectors, gated_grid, fft_grid,
-                                        config, tile_size, stride, ctx=ctx)
+                                        config, tile_size, stride, ctx=ctx,
+                                        effective_q_min=effective_q_min)
                 result.mode_decision = mode_decision
                 result.diagnostics["fallback"] = True
                 return result

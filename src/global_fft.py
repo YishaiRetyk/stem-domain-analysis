@@ -42,7 +42,8 @@ def _angular_distance_deg(a1: float, a2: float) -> float:
 def compute_global_fft(image_fft: np.ndarray,
                        fft_grid: FFTGrid,
                        config: GlobalFFTConfig = None,
-                       ctx: Optional["DeviceContext"] = None) -> GlobalFFTResult:
+                       ctx: Optional["DeviceContext"] = None,
+                       effective_q_min: float = 0.0) -> GlobalFFTResult:
     """Run full-image FFT and extract g-vectors.
 
     Parameters
@@ -121,7 +122,8 @@ def compute_global_fft(image_fft: np.ndarray,
 
     # Background fit (reuse logic from peak_discovery)
     background = _fit_background(q_values, radial_profile,
-                                 degree=config.background_poly_degree)
+                                 degree=config.background_poly_degree,
+                                 effective_q_min=effective_q_min)
     corrected = radial_profile - background
 
     # Noise floor
@@ -133,8 +135,10 @@ def compute_global_fft(image_fft: np.ndarray,
 
     # Find radial peaks
     radial_peaks = _find_radial_peaks(q_values, corrected, noise_floor,
-                                       min_snr=config.min_peak_snr)
+                                       min_snr=config.min_peak_snr,
+                                       effective_q_min=effective_q_min)
     diagnostics["n_radial_peaks"] = len(radial_peaks)
+    diagnostics["effective_q_min"] = effective_q_min
 
     # Convert to GlobalPeak list
     peaks = []
@@ -192,9 +196,13 @@ def compute_global_fft(image_fft: np.ndarray,
 # ======================================================================
 
 def _fit_background(q_values: np.ndarray, profile: np.ndarray,
-                    degree: int = 6, exclude_dc: int = 5) -> np.ndarray:
+                    degree: int = 6, exclude_dc: int = 5,
+                    effective_q_min: float = 0.0) -> np.ndarray:
     """Iterative reweighted polynomial background fit in log space."""
-    valid = (profile > 0) & (np.arange(len(profile)) >= exclude_dc)
+    if effective_q_min > 0:
+        valid = (profile > 0) & (q_values >= effective_q_min)
+    else:
+        valid = (profile > 0) & (np.arange(len(profile)) >= exclude_dc)
     if np.sum(valid) < degree + 1:
         return np.zeros_like(profile)
 
@@ -214,7 +222,12 @@ def _fit_background(q_values: np.ndarray, profile: np.ndarray,
     background = np.zeros_like(profile)
     if coeffs is not None:
         background[valid] = 10 ** np.polyval(coeffs, q_values[valid])
-    background[:exclude_dc] = profile[:exclude_dc]
+    # Fill excluded region with raw profile values
+    if effective_q_min > 0:
+        excluded = q_values < effective_q_min
+        background[excluded] = profile[excluded]
+    else:
+        background[:exclude_dc] = profile[:exclude_dc]
     return background
 
 
@@ -223,11 +236,13 @@ def _fit_background(q_values: np.ndarray, profile: np.ndarray,
 # ======================================================================
 
 def _find_radial_peaks(q_values, corrected, noise_floor,
-                       min_q=0.5, max_q=15.0, min_snr=2.0):
+                       min_q=0.5, max_q=15.0, min_snr=2.0,
+                       effective_q_min: float = 0.0):
     """Find peaks in the background-corrected radial profile."""
     from scipy.signal import savgol_filter
 
-    valid_mask = (q_values >= min_q) & (q_values <= max_q)
+    actual_min_q = max(min_q, effective_q_min)
+    valid_mask = (q_values >= actual_min_q) & (q_values <= max_q)
     valid_idx = np.where(valid_mask)[0]
     if len(valid_idx) < 10:
         return []

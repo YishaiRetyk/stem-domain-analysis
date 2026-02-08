@@ -70,7 +70,8 @@ def extract_tile_peaks(power: np.ndarray,
                        q_ranges: Optional[List[Tuple[float, float]]] = None,
                        dc_mask_radius: int = 3,
                        local_max_size: int = 5,
-                       peak_threshold_frac: float = 0.1) -> List[TilePeak]:
+                       peak_threshold_frac: float = 0.1,
+                       effective_q_min: float = 0.0) -> List[TilePeak]:
     """Extract peaks from a tile power spectrum with optional subpixel refinement.
 
     Parameters
@@ -95,9 +96,13 @@ def extract_tile_peaks(power: np.ndarray,
     tile_size = power.shape[0]
     center = fft_grid.dc_x
 
-    # Mask DC
-    y, x = np.ogrid[:tile_size, :tile_size]
-    dc_mask = ((y - fft_grid.dc_y) ** 2 + (x - fft_grid.dc_x) ** 2) <= dc_mask_radius ** 2
+    # Mask DC: q-based when effective_q_min > 0, pixel-based otherwise
+    if effective_q_min > 0:
+        q_mag = fft_grid.q_mag_grid()
+        dc_mask = q_mag < effective_q_min
+    else:
+        y, x = np.ogrid[:tile_size, :tile_size]
+        dc_mask = ((y - fft_grid.dc_y) ** 2 + (x - fft_grid.dc_x) ** 2) <= dc_mask_radius ** 2
 
     # When q_ranges are provided, many pixels get zeroed — need a full copy.
     # Otherwise, mask DC in-place and restore after detection.
@@ -207,6 +212,7 @@ def process_all_tiles(image_fft: np.ndarray,
                       stride: int,
                       q_ranges: Optional[List[Tuple[float, float]]] = None,
                       ctx: Optional["DeviceContext"] = None,
+                      effective_q_min: float = 0.0,
                       ) -> Tuple[List[TilePeakSet], np.ndarray]:
     """Process all tiles, extracting peaks from each.
 
@@ -247,12 +253,14 @@ def process_all_tiles(image_fft: np.ndarray,
             image_fft, roi_mask_grid, tile_grid, window,
             tile_size, stride, n_rows, n_cols, q_ranges, ctx,
             process, log_interval, initial_mem,
+            effective_q_min=effective_q_min,
         )
     else:
         peak_sets, skipped = _process_tiles_cpu(
             image_fft, roi_mask_grid, tile_grid, window,
             tile_size, stride, n_rows, n_cols, n_total, q_ranges,
             process, log_interval, initial_mem,
+            effective_q_min=effective_q_min,
         )
 
     final_mem = process.memory_info().rss / 1024**3
@@ -264,7 +272,8 @@ def process_all_tiles(image_fft: np.ndarray,
 
 def _process_tiles_cpu(image_fft, roi_mask_grid, tile_grid, window,
                        tile_size, stride, n_rows, n_cols, n_total,
-                       q_ranges, process, log_interval, initial_mem):
+                       q_ranges, process, log_interval, initial_mem,
+                       effective_q_min=0.0):
     """Sequential CPU tile processing (original path)."""
     peak_sets: List[TilePeakSet] = []
     skipped = np.zeros((n_rows, n_cols), dtype=bool)
@@ -281,7 +290,8 @@ def _process_tiles_cpu(image_fft, roi_mask_grid, tile_grid, window,
                 continue
 
         power = compute_tile_fft(tile, window)
-        peaks = extract_tile_peaks(power, tile_grid, q_ranges=q_ranges)
+        peaks = extract_tile_peaks(power, tile_grid, q_ranges=q_ranges,
+                                   effective_q_min=effective_q_min)
 
         peak_sets.append(TilePeakSet(
             peaks=peaks,
@@ -302,7 +312,8 @@ def _process_tiles_cpu(image_fft, roi_mask_grid, tile_grid, window,
 
 def _process_tiles_gpu(image_fft, roi_mask_grid, tile_grid, window,
                        tile_size, stride, n_rows, n_cols, q_ranges, ctx,
-                       process, log_interval, initial_mem):
+                       process, log_interval, initial_mem,
+                       effective_q_min=0.0):
     """Batched GPU tile processing with OOM recovery."""
     n_total = n_rows * n_cols
 
@@ -358,7 +369,8 @@ def _process_tiles_gpu(image_fft, roi_mask_grid, tile_grid, window,
                     row, col, y, x = batch_entries[0]
                     tile_data = image_fft[y:y + tile_size, x:x + tile_size]
                     power = compute_tile_fft(tile_data, window)
-                    peaks = extract_tile_peaks(power, tile_grid, q_ranges=q_ranges)
+                    peaks = extract_tile_peaks(power, tile_grid, q_ranges=q_ranges,
+                                               effective_q_min=effective_q_min)
                     result_map[(row, col)] = TilePeakSet(
                         peaks=peaks, tile_row=row, tile_col=col,
                         power_spectrum=power,
@@ -376,7 +388,8 @@ def _process_tiles_gpu(image_fft, roi_mask_grid, tile_grid, window,
         # Extract peaks on CPU for each tile in the batch
         for j, (row, col, y, x) in enumerate(batch_entries):
             power = power_batch[j]
-            peaks = extract_tile_peaks(power, tile_grid, q_ranges=q_ranges)
+            peaks = extract_tile_peaks(power, tile_grid, q_ranges=q_ranges,
+                                       effective_q_min=effective_q_min)
             result_map[(row, col)] = TilePeakSet(
                 peaks=peaks, tile_row=row, tile_col=col,
                 power_spectrum=power,

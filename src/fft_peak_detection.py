@@ -47,7 +47,8 @@ def compute_peak_snr(power: np.ndarray,
                      target_peak: TilePeak,
                      all_peaks: List[TilePeak],
                      fft_grid: FFTGrid,
-                     _cached: Optional[dict] = None) -> PeakSNR:
+                     _cached: Optional[dict] = None,
+                     effective_q_min: float = 0.0) -> PeakSNR:
     """Compute peak-height SNR with peak-excluding annular background.
 
     Signal = max(power[disk_r3]) around peak centre.
@@ -86,6 +87,8 @@ def compute_peak_snr(power: np.ndarray,
     peak_q = target_peak.q_mag
     annular_width = max(0.15, target_peak.fwhm * 1.5 if target_peak.fwhm > 0 else 0.15)
     annulus_mask = np.abs(q_mag_grid - peak_q) <= annular_width
+    if effective_q_min > 0:
+        annulus_mask &= (q_mag_grid >= effective_q_min)
 
     background_mask = annulus_mask & ~exclusion_mask & ~signal_disk
     n_bg = int(np.sum(background_mask))
@@ -105,6 +108,10 @@ def compute_peak_snr(power: np.ndarray,
     bg_sigma = bg_mad * 1.4826
 
     snr = (signal_peak - bg_median) / (bg_sigma + 1e-10)
+
+    if effective_q_min > 0 and peak_q < 2 * effective_q_min:
+        low_q_note = f"peak q={peak_q:.3f} < 2×q_min={2*effective_q_min:.3f}"
+        note = f"{note}; {low_q_note}" if note else low_q_note
 
     return PeakSNR(
         signal_peak=signal_peak,
@@ -345,7 +352,8 @@ def classify_tile(peak_set: TilePeakSet,
                   fft_grid: FFTGrid,
                   tier_config: TierConfig = None,
                   peak_gate_config: PeakGateConfig = None,
-                  fwhm_config: FWHMConfig = None) -> TileClassification:
+                  fwhm_config: FWHMConfig = None,
+                  effective_q_min: float = 0.0) -> TileClassification:
     """Classify a tile as Tier A, Tier B, or REJECTED.
 
     Uses power_spectrum from peak_set for SNR and FWHM computation.
@@ -382,7 +390,8 @@ def classify_tile(peak_set: TilePeakSet,
     snr_results = []
     for p in peaks:
         snr_results.append(compute_peak_snr(power, p, peaks, fft_grid,
-                                            _cached=_cached))
+                                            _cached=_cached,
+                                            effective_q_min=effective_q_min))
 
     # --- Pass 2: FWHM with policy gating ---
     fwhm_method = fwhm_config.method if fwhm_config.enabled else "proxy_only"

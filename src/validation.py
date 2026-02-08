@@ -34,6 +34,8 @@ def validate_pipeline(
     tile_size: int = 256,
     pixel_size_nm: float = 0.127,
     d_dom_nm: Optional[float] = None,
+    effective_q_min: float = 0.0,
+    tile_effective_q_min: float = 0.0,
 ) -> ValidationReport:
     """Evaluate all gates and produce a unified ValidationReport.
 
@@ -53,6 +55,10 @@ def validate_pipeline(
 
     gates: Dict[str, GateResult] = dict(gate_results)
     diagnostics: Dict[str, Any] = {}
+
+    if effective_q_min > 0 or tile_effective_q_min > 0:
+        diagnostics["effective_q_min_global"] = effective_q_min
+        diagnostics["effective_q_min_tile"] = tile_effective_q_min
 
     # --- G1: Input validation (typically already evaluated at load time) ---
     if "G1" not in gates:

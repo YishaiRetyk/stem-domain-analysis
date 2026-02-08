@@ -721,7 +721,7 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
     """
     import logging
     import psutil
-    from src.fft_coords import FFTGrid
+    from src.fft_coords import FFTGrid, compute_effective_q_min
     from src.pipeline_config import PipelineConfig, GPAConfig, TierConfig
     from src.preprocess_fft_safe import preprocess_fft_safe
     from src.preprocess_segmentation import preprocess_segmentation
@@ -780,6 +780,12 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
     if args.no_viz:
         config.viz.enabled = False
     config.viz.dpi = args.viz_dpi
+    if args.no_low_q_exclusion:
+        config.low_q.enabled = False
+    if args.q_min_override is not None:
+        config.low_q.q_min_cycles_per_nm = args.q_min_override
+        config.low_q.auto_q_min = False
+        config.low_q.enabled = True
 
     # --- GPU / device context ---
     from src.gpu_backend import DeviceContext, get_gpu_info
@@ -815,6 +821,22 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
 
     # Instantiate FFTGrid (canonical coordinate system)
     fft_grid = FFTGrid(H, W, pixel_size)
+
+    # Compute effective q_min for global and tile grids
+    low_q = config.low_q
+    effective_q_min = compute_effective_q_min(
+        fft_grid, enabled=low_q.enabled,
+        q_min_cycles_per_nm=low_q.q_min_cycles_per_nm,
+        dc_bin_count=low_q.dc_bin_count, auto_q_min=low_q.auto_q_min)
+    tile_fft_grid_tmp = FFTGrid(config.tile_size, config.tile_size, pixel_size)
+    tile_effective_q_min = compute_effective_q_min(
+        tile_fft_grid_tmp, enabled=low_q.enabled,
+        q_min_cycles_per_nm=low_q.q_min_cycles_per_nm,
+        dc_bin_count=low_q.dc_bin_count, auto_q_min=low_q.auto_q_min)
+    if low_q.enabled:
+        print(f"  Low-q exclusion: global={effective_q_min:.4f}, tile={tile_effective_q_min:.4f} cycles/nm")
+    else:
+        print("  Low-q exclusion: disabled")
 
     # --- Step 2: Branch A preprocessing (FFT-safe) ---
     log_memory("Before Branch A")
@@ -854,7 +876,8 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
     # --- Step 5: Global FFT ---
     log_memory("Before Global FFT")
     print("\n[5/9] Global FFT analysis...")
-    global_fft_result = compute_global_fft(preproc_record.image_fft, fft_grid, config.global_fft, ctx=ctx)
+    global_fft_result = compute_global_fft(preproc_record.image_fft, fft_grid, config.global_fft, ctx=ctx,
+                                           effective_q_min=effective_q_min)
     d_dom = global_fft_result.d_dom
 
     best_global_snr = max((p.snr for p in global_fft_result.peaks), default=0)
@@ -889,18 +912,23 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
             global_fft_result=global_fft_result,
             gate_results=gate_results, tile_size=config.tile_size,
             pixel_size_nm=pixel_size, d_dom_nm=d_dom,
+            effective_q_min=effective_q_min,
+            tile_effective_q_min=tile_effective_q_min,
         )
         save_pipeline_artifacts(
             output_path, config=config, fft_grid=fft_grid,
             preproc_record=preproc_record, seg_record=seg_record,
             roi_result=roi_result, global_fft_result=global_fft_result,
             validation_report=report,
+            effective_q_min=effective_q_min,
+            tile_effective_q_min=tile_effective_q_min,
         )
         if config.viz.enabled:
             from src.hybrid_viz import save_pipeline_visualizations
             save_pipeline_visualizations(
                 output_path, config=config, fft_grid=fft_grid,
                 raw_image=image, global_fft_result=global_fft_result,
+                effective_q_min=effective_q_min,
             )
         return 1
     print(f"  Periods/tile: {periods:.1f} (G5 PASS)")
@@ -910,12 +938,14 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
         tile_size=config.tile_size, stride=config.stride,
         q_ranges=q_ranges if q_ranges else None,
         ctx=ctx,
+        effective_q_min=tile_effective_q_min,
     )
 
     tile_fft_grid = FFTGrid(config.tile_size, config.tile_size, pixel_size)
     gated_grid = build_gated_tile_grid(
         peak_sets, skipped_mask, tile_fft_grid, config.tile_size,
         tier_config=config.tier, peak_gate_config=config.peak_gates,
+        effective_q_min=tile_effective_q_min,
     )
 
     # Free tile power spectra — no longer needed after classification
@@ -950,6 +980,7 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
             tile_size=config.tile_size,
             stride=config.stride,
             ctx=ctx,
+            effective_q_min=effective_q_min,
         )
         if gpa_result is not None:
             print(f"  Mode used: {gpa_result.mode}")
@@ -997,6 +1028,7 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
         peak_image = build_bandpass_image(
             preproc_record.image_fft, g_dom_mag, fft_grid,
             bandwidth_fraction=config.peak_finding.bandpass_bandwidth,
+            effective_q_min=effective_q_min,
         )
 
         peaks = find_subpixel_peaks(
@@ -1030,6 +1062,8 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
         tile_size=config.tile_size,
         pixel_size_nm=pixel_size,
         d_dom_nm=d_dom,
+        effective_q_min=effective_q_min,
+        tile_effective_q_min=tile_effective_q_min,
     )
 
     saved = save_pipeline_artifacts(
@@ -1045,6 +1079,8 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
         lattice_validation=lattice_validation,
         peaks=peaks,
         validation_report=report,
+        effective_q_min=effective_q_min,
+        tile_effective_q_min=tile_effective_q_min,
     )
 
     # --- PNG visualizations ---
@@ -1056,6 +1092,7 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
             gated_grid=gated_grid, gpa_result=gpa_result,
             peaks=peaks, lattice_validation=lattice_validation,
             bandpass_image=peak_image, validation_report=report,
+            effective_q_min=effective_q_min,
         )
         saved.update(viz_saved)
 
@@ -1173,6 +1210,10 @@ Examples:
                         help='DPI for PNG visualizations (default: 150)')
     parser.add_argument('--no-viz', action='store_true', dest='no_viz',
                         help='Skip PNG visualization generation')
+    parser.add_argument('--q-min', type=float, default=None, dest='q_min_override',
+                        help='Override low-q exclusion threshold (cycles/nm), disables auto')
+    parser.add_argument('--no-low-q-exclusion', action='store_true', dest='no_low_q_exclusion',
+                        help='Disable low-q / DC exclusion entirely')
 
     args = parser.parse_args()
     

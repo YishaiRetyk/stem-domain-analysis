@@ -30,6 +30,7 @@ def build_gated_tile_grid(peak_sets: List[TilePeakSet],
                           peak_gate_config: PeakGateConfig = None,
                           fwhm_config: FWHMConfig = None,
                           log_interval_s: float = 5.0,
+                          effective_q_min: float = 0.0,
                           ) -> GatedTileGrid:
     """Classify all tiles and build the unified GatedTileGrid.
 
@@ -87,7 +88,7 @@ def build_gated_tile_grid(peak_sets: List[TilePeakSet],
             continue
 
         tc = classify_tile(ps, tile_grid, tier_config, peak_gate_config,
-                           fwhm_config)
+                           fwhm_config, effective_q_min=effective_q_min)
         classifications[r, c] = tc
         tier_map[r, c] = tc.tier
         snr_map[r, c] = tc.best_snr

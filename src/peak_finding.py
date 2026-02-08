@@ -28,7 +28,8 @@ logger = logging.getLogger(__name__)
 def build_bandpass_image(image_fft: np.ndarray,
                          g_dom_magnitude: Optional[float],
                          fft_grid: FFTGrid,
-                         bandwidth_fraction: float = 0.3) -> np.ndarray:
+                         bandwidth_fraction: float = 0.3,
+                         effective_q_min: float = 0.0) -> np.ndarray:
     """Build bandpass-filtered image for peak finding (I5).
 
     Ring mask at |g_dom| with cosine-tapered edges.
@@ -69,6 +70,10 @@ def build_bandpass_image(image_fft: np.ndarray,
     if taper_width > 0:
         ring_mask[outer_taper] = 0.5 * (1 + np.cos(
             np.pi * (q_mag_grid[outer_taper] - flat_outer) / taper_width))
+
+    # Zero below q_min to prevent DC leakage through cosine taper
+    if effective_q_min > 0:
+        ring_mask[q_mag_grid < effective_q_min] = 0.0
 
     filtered = FT_shifted * ring_mask
     peak_image = np.real(np.fft.ifft2(np.fft.ifftshift(filtered)))

@@ -435,6 +435,15 @@ class VizConfig:
 
 
 @dataclass
+class LowQExclusionConfig:
+    """Unified low-q / DC exclusion configuration."""
+    enabled: bool = True
+    q_min_cycles_per_nm: float = 0.1   # physical floor (d < 10 nm)
+    dc_bin_count: int = 3              # radial bins always excluded
+    auto_q_min: bool = True            # derive q_min from image geometry
+
+
+@dataclass
 class PipelineConfig:
     """Top-level pipeline configuration."""
     pixel_size_nm: float = 0.127
@@ -451,6 +460,7 @@ class PipelineConfig:
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     device: DeviceConfig = field(default_factory=DeviceConfig)
     viz: VizConfig = field(default_factory=VizConfig)
+    low_q: LowQExclusionConfig = field(default_factory=LowQExclusionConfig)
 
     def to_dict(self) -> dict:
         """Serialise to a JSON-safe dict."""
@@ -477,6 +487,7 @@ class PipelineConfig:
             "validation": (ValidationConfig, "validation"),
             "device": (DeviceConfig, "device"),
             "viz": (VizConfig, "viz"),
+            "low_q": (LowQExclusionConfig, "low_q"),
         }
         for attr, (klass, key) in _mapping.items():
             if key in d and isinstance(d[key], dict):

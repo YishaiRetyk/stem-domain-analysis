@@ -28,6 +28,7 @@ def save_pipeline_visualizations(
     lattice_validation=None,
     bandpass_image=None,
     validation_report=None,
+    effective_q_min: float = 0.0,
 ) -> Dict[str, Path]:
     """Orchestrate generation of all PNG visualization artifacts.
 
@@ -58,9 +59,11 @@ def save_pipeline_visualizations(
     # 2-3. Global FFT radial profile + power spectrum
     if global_fft_result is not None:
         _try("globalfft_radial_profile",
-             _save_radial_profile, global_fft_result, out, dpi)
+             _save_radial_profile, global_fft_result, out, dpi,
+             effective_q_min)
         _try("globalfft_power_spectrum",
-             _save_fft_power_spectrum, global_fft_result, fft_grid, out, dpi)
+             _save_fft_power_spectrum, global_fft_result, fft_grid, out, dpi,
+             effective_q_min)
 
     # 4-6. Tile maps
     if gated_grid is not None:
@@ -121,7 +124,8 @@ def _save_input_original(image, out_dir, pixel_size_nm, dpi):
     return Path(path)
 
 
-def _save_radial_profile(global_fft_result, out_dir, dpi):
+def _save_radial_profile(global_fft_result, out_dir, dpi,
+                         effective_q_min=0.0):
     """Radial profile: q vs log-intensity, background curve, peak markers."""
     path = out_dir / "globalfft_radial_profile.png"
     _ensure_dir(path)
@@ -130,6 +134,11 @@ def _save_radial_profile(global_fft_result, out_dir, dpi):
     fig, ax = plt.subplots(figsize=(10, 5))
     ax.semilogy(r.q_values, r.radial_profile, 'k-', lw=0.8, label="Radial profile")
     ax.semilogy(r.q_values, r.background, 'b--', lw=0.8, label="Background fit")
+
+    # Shade excluded low-q region
+    if effective_q_min > 0:
+        ax.axvspan(0, effective_q_min, alpha=0.15, color='gray',
+                   label=f"Excluded (q < {effective_q_min:.2f})")
 
     for p in r.peaks:
         ax.axvline(p.q_center, color="red", alpha=0.5, lw=0.7)
@@ -150,7 +159,8 @@ def _save_radial_profile(global_fft_result, out_dir, dpi):
     return path
 
 
-def _save_fft_power_spectrum(global_fft_result, fft_grid, out_dir, dpi):
+def _save_fft_power_spectrum(global_fft_result, fft_grid, out_dir, dpi,
+                             effective_q_min=0.0):
     """Log-scale power spectrum with g-vector arrows."""
     path = out_dir / "globalfft_power_spectrum.png"
     _ensure_dir(path)
@@ -161,8 +171,17 @@ def _save_fft_power_spectrum(global_fft_result, fft_grid, out_dir, dpi):
     im = ax.imshow(display, cmap="inferno", origin="upper")
     plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="log(Power + 1)")
 
-    # Annotate g-vectors as arrows from centre
+    # Dashed circle at q_min exclusion boundary
     cy, cx = ps.shape[0] // 2, ps.shape[1] // 2
+    if effective_q_min > 0:
+        # Convert q_min to pixel radius: r_px = q_min / q_scale
+        q_scale = min(fft_grid.qx_scale, fft_grid.qy_scale)
+        r_px = effective_q_min / q_scale
+        circle = plt.Circle((cx, cy), r_px, fill=False, edgecolor='white',
+                             linestyle='--', linewidth=1.0, alpha=0.8)
+        ax.add_patch(circle)
+
+    # Annotate g-vectors as arrows from centre
     for gv in global_fft_result.g_vectors:
         # Convert cycles/nm to pixel coords in the power spectrum
         # gx,gy are in cycles/nm; power spectrum pixel = g / delta_q

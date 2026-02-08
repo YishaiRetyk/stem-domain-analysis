@@ -13,8 +13,11 @@ Convention:
 All modules MUST use FFTGrid for coordinate conversions.
 """
 
+import logging
 import numpy as np
 from typing import Tuple
+
+logger = logging.getLogger(__name__)
 
 
 class FFTGrid:
@@ -166,3 +169,48 @@ class FFTGrid:
     def __repr__(self) -> str:
         return (f"FFTGrid({self.height}x{self.width}, px={self.pixel_size_nm}nm, "
                 f"qx_scale={self.qx_scale:.6f}, qy_scale={self.qy_scale:.6f})")
+
+
+def compute_effective_q_min(fft_grid: FFTGrid, *, enabled: bool = True,
+                            q_min_cycles_per_nm: float = 0.1,
+                            dc_bin_count: int = 3,
+                            auto_q_min: bool = True) -> float:
+    """Compute the effective low-q exclusion threshold for a given FFT grid.
+
+    Parameters
+    ----------
+    fft_grid : FFTGrid
+        The coordinate system (global or tile grid).
+    enabled : bool
+        Master switch. If False, returns 0.0.
+    q_min_cycles_per_nm : float
+        Physical floor in cycles/nm.
+    dc_bin_count : int
+        Number of radial bins to always exclude around DC.
+    auto_q_min : bool
+        If True, derive q_min from image geometry and floor.
+        If False, use q_min_cycles_per_nm directly.
+
+    Returns
+    -------
+    float
+        Effective q_min in cycles/nm.
+    """
+    if not enabled:
+        logger.debug("Low-q exclusion disabled, returning q_min=0.0")
+        return 0.0
+
+    if auto_q_min:
+        q_scale_min = min(fft_grid.qx_scale, fft_grid.qy_scale)
+        q_min_from_bins = dc_bin_count * q_scale_min
+        effective = max(q_min_from_bins, q_min_cycles_per_nm)
+        logger.info("Low-q exclusion (auto): dc_bins=%d × q_scale=%.6f = %.4f, "
+                     "floor=%.4f → effective_q_min=%.4f cycles/nm",
+                     dc_bin_count, q_scale_min, q_min_from_bins,
+                     q_min_cycles_per_nm, effective)
+    else:
+        effective = q_min_cycles_per_nm
+        logger.info("Low-q exclusion (manual): effective_q_min=%.4f cycles/nm",
+                     effective)
+
+    return effective

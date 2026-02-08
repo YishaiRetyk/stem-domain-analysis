@@ -73,6 +73,8 @@ def build_parameters_v3(
     lattice_validation: Optional[LatticeValidation] = None,
     validation_report: Optional[ValidationReport] = None,
     extra: Optional[Dict[str, Any]] = None,
+    effective_q_min: float = 0.0,
+    tile_effective_q_min: float = 0.0,
 ) -> dict:
     """Build the parameters.json v3.0 dict.
 
@@ -84,6 +86,17 @@ def build_parameters_v3(
         "tile_size": config.tile_size,
         "stride": config.stride,
         "fft_convention": fft_grid.to_dict(),
+    }
+
+    # Low-q exclusion
+    low_q_cfg = config.low_q
+    params["low_q_exclusion"] = {
+        "enabled": low_q_cfg.enabled,
+        "q_min_configured": low_q_cfg.q_min_cycles_per_nm,
+        "dc_bin_count": low_q_cfg.dc_bin_count,
+        "auto_q_min": low_q_cfg.auto_q_min,
+        "effective_q_min_global": round(effective_q_min, 4),
+        "effective_q_min_tile": round(tile_effective_q_min, 4),
     }
 
     # Preprocessing
@@ -330,6 +343,8 @@ def save_pipeline_artifacts(
     peaks: Optional[List[SubpixelPeak]] = None,
     validation_report: Optional[ValidationReport] = None,
     extra_params: Optional[Dict[str, Any]] = None,
+    effective_q_min: float = 0.0,
+    tile_effective_q_min: float = 0.0,
 ) -> Dict[str, Path]:
     """Save all pipeline artifacts to output directory.
 
@@ -352,6 +367,8 @@ def save_pipeline_artifacts(
         lattice_validation=lattice_validation,
         validation_report=validation_report,
         extra=extra_params,
+        effective_q_min=effective_q_min,
+        tile_effective_q_min=tile_effective_q_min,
     )
     params_path = output_dir / "parameters.json"
     save_json(params_data, params_path)
