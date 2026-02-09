@@ -106,7 +106,7 @@ def gated_grid():
         classifications=classifications,
         tier_map=tier_map,
         snr_map=snr_map,
-        symmetry_map=np.ones(shape),
+        pair_fraction_map=np.ones(shape),
         fwhm_map=np.ones(shape),
         orientation_map=orient_map,
         grid_shape=shape,

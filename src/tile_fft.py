@@ -17,7 +17,7 @@ from scipy import ndimage
 from typing import List, Optional, Tuple, TYPE_CHECKING
 
 from src.fft_coords import FFTGrid
-from src.pipeline_config import TilePeak, TilePeakSet
+from src.pipeline_config import TilePeak, TilePeakSet, TileFFTConfig
 from src.fft_features import tile_generator, get_tiling_info, create_2d_hann_window
 from src.gates import evaluate_gate
 
@@ -71,7 +71,9 @@ def extract_tile_peaks(power: np.ndarray,
                        dc_mask_radius: int = 3,
                        local_max_size: int = 5,
                        peak_threshold_frac: float = 0.1,
-                       effective_q_min: float = 0.0) -> List[TilePeak]:
+                       effective_q_min: float = 0.0,
+                       tile_fft_config: Optional[TileFFTConfig] = None,
+                       ) -> List[TilePeak]:
     """Extract peaks from a tile power spectrum with optional subpixel refinement.
 
     Parameters
@@ -83,26 +85,47 @@ def extract_tile_peaks(power: np.ndarray,
     q_ranges : list of (q_min, q_max), optional
         Seeded q-ranges from global FFT. If None, search everywhere.
     dc_mask_radius : int
-        Pixels to mask around DC.
+        Pixels to mask around DC (deprecated when tile_fft_config provided).
     local_max_size : int
         Footprint for local maximum detection.
     peak_threshold_frac : float
-        Minimum peak intensity as fraction of max.
+        Minimum peak intensity as fraction of max (secondary floor when
+        tile_fft_config with peak_snr_threshold > 0 is provided).
+    effective_q_min : float
+        Low-q exclusion threshold (cycles/nm).
+    tile_fft_config : TileFFTConfig, optional
+        When provided, uses q_dc_min and peak_snr_threshold for unified
+        DC suppression and SNR-first peak detection.
 
     Returns
     -------
     List of TilePeak.
     """
     tile_size = power.shape[0]
-    center = fft_grid.dc_x
 
-    # Mask DC: q-based when effective_q_min > 0, pixel-based otherwise
-    if effective_q_min > 0:
-        q_mag = fft_grid.q_mag_grid()
-        dc_mask = q_mag < effective_q_min
+    # Deprecation warning: dc_mask_radius with tile_fft_config
+    if tile_fft_config is not None and dc_mask_radius != 3:
+        import warnings
+        warnings.warn(
+            "dc_mask_radius is deprecated when tile_fft_config is provided; "
+            "use TileFFTConfig.q_dc_min instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
+    # Unified DC suppression: single path for q-based and pixel-based masking
+    q_mag = fft_grid.q_mag_grid()
+    q_dc_min = (max(effective_q_min, tile_fft_config.q_dc_min)
+                if tile_fft_config is not None else effective_q_min)
+    if q_dc_min > 0:
+        dc_mask = q_mag < q_dc_min
     else:
         y, x = np.ogrid[:tile_size, :tile_size]
         dc_mask = ((y - fft_grid.dc_y) ** 2 + (x - fft_grid.dc_x) ** 2) <= dc_mask_radius ** 2
+
+    # Use local_max_size from config when available
+    if tile_fft_config is not None:
+        local_max_size = tile_fft_config.local_max_size
 
     # When q_ranges are provided, many pixels get zeroed — need a full copy.
     # Otherwise, mask DC in-place and restore after detection.
@@ -110,7 +133,6 @@ def extract_tile_peaks(power: np.ndarray,
     if needs_copy:
         power_masked = power.copy()
         power_masked[dc_mask] = 0
-        q_mag = fft_grid.q_mag_grid()
         q_mask = np.zeros_like(power_masked, dtype=bool)
         for q_min, q_max in q_ranges:
             q_mask |= (q_mag >= q_min) & (q_mag <= q_max)
@@ -139,7 +161,8 @@ def extract_tile_peaks(power: np.ndarray,
             power[dc_mask] = dc_saved
         return []
 
-    peaks = []
+    # Build candidate peaks
+    candidates = []
     for py, px in zip(peak_y, peak_x):
         # Subpixel refinement (parabolic interpolation)
         sx, sy = _subpixel_refine(power_masked, int(px), int(py))
@@ -149,20 +172,68 @@ def extract_tile_peaks(power: np.ndarray,
         d = 1.0 / q_m if q_m > 1e-10 else 0
         angle = float(np.degrees(np.arctan2(qy, qx))) % 180
 
-        peaks.append(TilePeak(
+        candidates.append((TilePeak(
             qx=qx, qy=qy,
             q_mag=q_m,
             d_spacing=d,
             angle_deg=angle,
             intensity=float(power[int(py), int(px)]),
             fwhm=0.0,  # filled later by fft_peak_detection
-        ))
+        ), int(py), int(px)))
+
+    # SNR-first peak detection: reject weak candidates when tile_fft_config
+    # provides a positive peak_snr_threshold.
+    use_snr_filter = (tile_fft_config is not None
+                      and tile_fft_config.peak_snr_threshold > 0)
+    if use_snr_filter:
+        peaks = []
+        for peak, py, px in candidates:
+            snr = _lightweight_peak_snr(power_masked, q_mag, peak.q_mag,
+                                        py, px, dc_mask)
+            if snr >= tile_fft_config.peak_snr_threshold:
+                peaks.append(peak)
+    else:
+        peaks = [peak for peak, _py, _px in candidates]
 
     # Restore in-place DC modification
     if not needs_copy:
         power[dc_mask] = dc_saved
 
     return peaks
+
+
+def _lightweight_peak_snr(power: np.ndarray, q_mag: np.ndarray,
+                          peak_q: float, py: int, px: int,
+                          dc_mask: np.ndarray) -> float:
+    """Compute a lightweight SNR for a candidate peak.
+
+    signal = peak value at (py, px)
+    noise  = median of annulus at +/-10% of peak q magnitude,
+             excluding a 3-pixel disk around the peak and the DC mask.
+    """
+    signal = float(power[py, px])
+
+    # Annulus: q in [0.9 * peak_q, 1.1 * peak_q]
+    q_lo = 0.9 * peak_q
+    q_hi = 1.1 * peak_q
+    annulus = (q_mag >= q_lo) & (q_mag <= q_hi)
+
+    # Exclude 3-pixel disk around peak
+    H, W = power.shape
+    yy, xx = np.ogrid[:H, :W]
+    disk = ((yy - py) ** 2 + (xx - px) ** 2) <= 9  # r=3
+    bg_mask = annulus & ~disk & ~dc_mask
+
+    n_bg = int(np.sum(bg_mask))
+    if n_bg == 0:
+        return 0.0
+
+    bg_values = power[bg_mask]
+    noise = float(np.median(bg_values))
+    if noise <= 0:
+        return signal  # treat as very high SNR when background is zero
+
+    return signal / noise
 
 
 def _subpixel_refine(power: np.ndarray, px: int, py: int) -> Tuple[float, float]:
@@ -192,12 +263,25 @@ def _subpixel_refine(power: np.ndarray, px: int, py: int) -> Tuple[float, float]
 
 
 def check_tiling_adequacy(tile_size: int, d_dom_nm: float,
-                          pixel_size_nm: float) -> Tuple[float, bool]:
+                          pixel_size_nm: float,
+                          d_max_nm: Optional[float] = None,
+                          ) -> Tuple[float, bool]:
     """Gate G5: check periods per tile.
+
+    Parameters
+    ----------
+    tile_size : int
+    d_dom_nm : float
+        Dominant d-spacing (nm).
+    pixel_size_nm : float
+    d_max_nm : float, optional
+        When provided, use ``max(d_dom_nm, d_max_nm)`` for the period check
+        so that the gate accounts for the largest expected spacing.
 
     Returns (periods, passed).
     """
-    d_px = d_dom_nm / pixel_size_nm
+    d_eff = max(d_dom_nm, d_max_nm) if d_max_nm is not None else d_dom_nm
+    d_px = d_eff / pixel_size_nm
     if d_px < 1e-10:
         return 0, False
     periods = tile_size / d_px
@@ -213,6 +297,7 @@ def process_all_tiles(image_fft: np.ndarray,
                       q_ranges: Optional[List[Tuple[float, float]]] = None,
                       ctx: Optional["DeviceContext"] = None,
                       effective_q_min: float = 0.0,
+                      tile_fft_config: Optional[TileFFTConfig] = None,
                       ) -> Tuple[List[TilePeakSet], np.ndarray]:
     """Process all tiles, extracting peaks from each.
 
@@ -228,6 +313,8 @@ def process_all_tiles(image_fft: np.ndarray,
     q_ranges : optional seeded q-ranges.
     ctx : DeviceContext, optional
         When provided and using GPU, tiles are processed in batches.
+    tile_fft_config : TileFFTConfig, optional
+        Tile FFT peak detection configuration.
 
     Returns
     -------
@@ -254,6 +341,7 @@ def process_all_tiles(image_fft: np.ndarray,
             tile_size, stride, n_rows, n_cols, q_ranges, ctx,
             process, log_interval, initial_mem,
             effective_q_min=effective_q_min,
+            tile_fft_config=tile_fft_config,
         )
     else:
         peak_sets, skipped = _process_tiles_cpu(
@@ -261,6 +349,7 @@ def process_all_tiles(image_fft: np.ndarray,
             tile_size, stride, n_rows, n_cols, n_total, q_ranges,
             process, log_interval, initial_mem,
             effective_q_min=effective_q_min,
+            tile_fft_config=tile_fft_config,
         )
 
     final_mem = process.memory_info().rss / 1024**3
@@ -273,7 +362,7 @@ def process_all_tiles(image_fft: np.ndarray,
 def _process_tiles_cpu(image_fft, roi_mask_grid, tile_grid, window,
                        tile_size, stride, n_rows, n_cols, n_total,
                        q_ranges, process, log_interval, initial_mem,
-                       effective_q_min=0.0):
+                       effective_q_min=0.0, tile_fft_config=None):
     """Sequential CPU tile processing (original path)."""
     peak_sets: List[TilePeakSet] = []
     skipped = np.zeros((n_rows, n_cols), dtype=bool)
@@ -291,7 +380,8 @@ def _process_tiles_cpu(image_fft, roi_mask_grid, tile_grid, window,
 
         power = compute_tile_fft(tile, window)
         peaks = extract_tile_peaks(power, tile_grid, q_ranges=q_ranges,
-                                   effective_q_min=effective_q_min)
+                                   effective_q_min=effective_q_min,
+                                   tile_fft_config=tile_fft_config)
 
         peak_sets.append(TilePeakSet(
             peaks=peaks,
@@ -313,7 +403,7 @@ def _process_tiles_cpu(image_fft, roi_mask_grid, tile_grid, window,
 def _process_tiles_gpu(image_fft, roi_mask_grid, tile_grid, window,
                        tile_size, stride, n_rows, n_cols, q_ranges, ctx,
                        process, log_interval, initial_mem,
-                       effective_q_min=0.0):
+                       effective_q_min=0.0, tile_fft_config=None):
     """Batched GPU tile processing with OOM recovery."""
     n_total = n_rows * n_cols
 
@@ -370,7 +460,8 @@ def _process_tiles_gpu(image_fft, roi_mask_grid, tile_grid, window,
                     tile_data = image_fft[y:y + tile_size, x:x + tile_size]
                     power = compute_tile_fft(tile_data, window)
                     peaks = extract_tile_peaks(power, tile_grid, q_ranges=q_ranges,
-                                               effective_q_min=effective_q_min)
+                                               effective_q_min=effective_q_min,
+                                               tile_fft_config=tile_fft_config)
                     result_map[(row, col)] = TilePeakSet(
                         peaks=peaks, tile_row=row, tile_col=col,
                         power_spectrum=power,
@@ -389,7 +480,8 @@ def _process_tiles_gpu(image_fft, roi_mask_grid, tile_grid, window,
         for j, (row, col, y, x) in enumerate(batch_entries):
             power = power_batch[j]
             peaks = extract_tile_peaks(power, tile_grid, q_ranges=q_ranges,
-                                       effective_q_min=effective_q_min)
+                                       effective_q_min=effective_q_min,
+                                       tile_fft_config=tile_fft_config)
             result_map[(row, col)] = TilePeakSet(
                 peaks=peaks, tile_row=row, tile_col=col,
                 power_spectrum=power,

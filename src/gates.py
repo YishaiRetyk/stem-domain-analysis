@@ -26,6 +26,13 @@ class GateDef:
 
 # Gate registry
 GATE_DEFS: Dict[str, GateDef] = {
+    "G0": GateDef(
+        "G0", "Nyquist guard",
+        "d_min >= 2*pixel_size; auto-clamp q_max to 0.95*q_nyquist if violated; "
+        "FATAL if entire band invalid",
+        "DEGRADE_CONFIDENCE",
+        {"nyquist_safety_margin": 0.95},
+    ),
     "G1": GateDef(
         "G1", "Input validation",
         "2D, float-convertible, no NaN/Inf, >=512x512, pixel_size_nm>0",
@@ -124,7 +131,31 @@ def evaluate_gate(gate_id: str, value: Any,
     passed = True
     reason = ""
 
-    if gate_id == "G1":
+    if gate_id == "G0":
+        # value is dict: {q_max_requested, q_min_requested, q_nyquist, safety_margin}
+        v = value if isinstance(value, dict) else {}
+        q_max_req = v.get("q_max_requested", 0)
+        q_min_req = v.get("q_min_requested", 0)
+        q_nyquist = v.get("q_nyquist", float('inf'))
+        safety = v.get("safety_margin", 0.95)
+        q_safe = safety * q_nyquist
+
+        if q_min_req >= q_nyquist:
+            # Entire band invalid
+            passed = False
+            reason = (f"FATAL: entire q-band invalid — "
+                      f"q_min={q_min_req:.4f} >= q_nyquist={q_nyquist:.4f}")
+        elif q_max_req > q_safe:
+            # Auto-clamp: degrade
+            passed = False
+            reason = (f"DEGRADE: q_max clamped {q_max_req:.4f} → {q_safe:.4f} "
+                      f"(0.95 × q_nyquist={q_nyquist:.4f})")
+        else:
+            passed = True
+            reason = (f"q_max={q_max_req:.4f} within safe limit "
+                      f"{q_safe:.4f}: OK")
+
+    elif gate_id == "G1":
         # value is dict: {is_2d, no_nan, min_dim, has_pixel_size}
         checks = value if isinstance(value, dict) else {}
         for k, v in checks.items():
@@ -150,6 +181,7 @@ def evaluate_gate(gate_id: str, value: Any,
     elif gate_id == "G3":
         cov = value.get("coverage_pct", 0) if isinstance(value, dict) else 0
         ncomp = value.get("n_components", 999) if isinstance(value, dict) else 999
+        lcc_frac = value.get("lcc_fraction", 1.0) if isinstance(value, dict) else 1.0
         t = threshold if isinstance(threshold, dict) else {}
         if cov < t.get("min_coverage", 10):
             passed = False
@@ -160,8 +192,11 @@ def evaluate_gate(gate_id: str, value: Any,
         if ncomp > t.get("max_fragments", 20):
             passed = False
             reason += f"fragments={ncomp} > max; "
+        if lcc_frac < 0.5:
+            passed = False
+            reason += f"lcc_fraction={lcc_frac:.2f} < 0.5; "
         if passed:
-            reason = f"coverage={cov:.1f}%, fragments={ncomp}: OK"
+            reason = f"coverage={cov:.1f}%, fragments={ncomp}, lcc={lcc_frac:.2f}: OK"
 
     elif gate_id == "G4":
         snr_val = value if isinstance(value, (int, float)) else 0

@@ -140,6 +140,31 @@ class FFTGrid:
     # Physics helpers
     # ------------------------------------------------------------------
 
+    def nyquist_q(self) -> float:
+        """Maximum resolvable spatial frequency (Nyquist) in cycles/nm.
+
+        q_nyquist = 1 / (2 * pixel_size_nm), the sampling theorem limit.
+        """
+        return 1.0 / (2.0 * self.pixel_size_nm)
+
+    def nyquist_d(self) -> float:
+        """Minimum resolvable d-spacing (nm) at Nyquist limit.
+
+        d_nyquist = 2 * pixel_size_nm.
+        """
+        return 2.0 * self.pixel_size_nm
+
+    def clamp_q_range(self, q_min: float, q_max: float,
+                      safety: float = 0.95) -> Tuple[float, float, bool]:
+        """Clamp a q-range to [q_min, safety * q_nyquist].
+
+        Returns (clamped_q_min, clamped_q_max, was_clamped).
+        """
+        q_nyquist = self.nyquist_q()
+        q_safe = safety * q_nyquist
+        was_clamped = q_max > q_safe
+        return q_min, min(q_max, q_safe), was_clamped
+
     @staticmethod
     def d_spacing(q_magnitude: float) -> float:
         """Convert |q| in cycles/nm to d-spacing in nm. No 2pi factor (F1)."""
@@ -169,6 +194,29 @@ class FFTGrid:
     def __repr__(self) -> str:
         return (f"FFTGrid({self.height}x{self.width}, px={self.pixel_size_nm}nm, "
                 f"qx_scale={self.qx_scale:.6f}, qy_scale={self.qy_scale:.6f})")
+
+
+def fwhm_to_tolerance_px(fwhm_q: float, q_scale: float,
+                         n_sigma: float = 2.0) -> float:
+    """Convert FWHM in q-space to a tolerance in pixel units.
+
+    Parameters
+    ----------
+    fwhm_q : float
+        FWHM in cycles/nm.
+    q_scale : float
+        q per pixel (cycles/nm per pixel).
+    n_sigma : float
+        Number of sigma to use (default 2.0 = ~95% width).
+
+    Returns
+    -------
+    float
+        Tolerance in pixels.
+    """
+    sigma_q = fwhm_q / 2.355
+    sigma_px = sigma_q / q_scale if q_scale > 0 else 0.0
+    return n_sigma * sigma_px
 
 
 def compute_effective_q_min(fft_grid: FFTGrid, *, enabled: bool = True,

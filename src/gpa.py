@@ -226,6 +226,9 @@ def compute_gpa_phase(image_fft: np.ndarray,
     amp_threshold = amplitude_threshold * xp.max(amplitude)
     amplitude_mask = amplitude > amp_threshold
 
+    # Zero out low-amplitude regions before unwrapping
+    phase_raw[~amplitude_mask] = 0.0
+
     # Phase unwrapping -- full array, NO zero-forcing (F3)
     try:
         from skimage.restoration import unwrap_phase
@@ -233,6 +236,9 @@ def compute_gpa_phase(image_fft: np.ndarray,
     except ImportError:
         logger.warning("skimage.restoration.unwrap_phase not available, using raw phase")
         phase_unwrapped = phase_raw.copy()
+
+    # NaN low-amplitude regions after unwrapping
+    phase_unwrapped[~amplitude_mask] = np.nan
 
     # Post-mask with eroded amplitude mask (F3)
     amplitude_mask_eroded = ndimage.binary_erosion(amplitude_mask, iterations=2)
@@ -314,6 +320,9 @@ def _compute_gpa_phase_gpu(image_fft, g_vector, mask_sigma_q, fft_grid,
     amplitude = ctx.to_host(amplitude)
     amplitude_mask = ctx.to_host(amplitude_mask)
 
+    # Zero out low-amplitude regions before unwrapping
+    phase_raw[~amplitude_mask] = 0.0
+
     # Step 9: Phase unwrapping (CPU only — no CuPy equivalent)
     try:
         from skimage.restoration import unwrap_phase
@@ -321,6 +330,9 @@ def _compute_gpa_phase_gpu(image_fft, g_vector, mask_sigma_q, fft_grid,
     except ImportError:
         logger.warning("skimage.restoration.unwrap_phase not available, using raw phase")
         phase_unwrapped = phase_raw.copy()
+
+    # NaN low-amplitude regions after unwrapping
+    phase_unwrapped[~amplitude_mask] = np.nan
 
     # Step 10: Post-mask with eroded amplitude mask
     amplitude_mask_eroded = ndimage.binary_erosion(amplitude_mask, iterations=2)
@@ -464,9 +476,10 @@ def _determine_mask_sigma(g_vectors: List[GVector], config: GPAConfig,
         # Auto: 0.5 * min(peak FWHM)
         fwhms = [g.fwhm for g in g_vectors if g.fwhm > 0]
         if fwhms:
-            sigma = 0.5 * min(fwhms)
+            sigma = 0.5 * np.median(fwhms)
         else:
-            sigma = 0.06  # safe default
+            g_magnitudes = [g.magnitude for g in g_vectors if g.magnitude > 0]
+            sigma = 0.06 * min(g_magnitudes) if g_magnitudes else 0.06
 
     # DC-safety clamp: sigma <= 0.18 * min(|g|)
     if effective_q_min > 0 and g_vectors:
@@ -525,9 +538,23 @@ def run_gpa_full(image_fft: np.ndarray,
             ref_mean = np.mean(ref_phase_vals)
             phase_result.phase_unwrapped = phase_result.phase_unwrapped - ref_mean
 
+        # Compute unwrap success within reference region
+        ref_pixel_mask = np.zeros((H, W), dtype=bool)
+        for (r, c) in ref_region.tiles:
+            y0, x0 = r * stride, c * stride
+            y1, x1 = min(y0 + tile_size, H), min(x0 + tile_size, W)
+            ref_pixel_mask[y0:y1, x0:x1] = True
+
+        ref_amp_valid = ref_pixel_mask & phase_result.amplitude_mask
+        ref_unwrapped_valid = ref_amp_valid & ~np.isnan(phase_result.phase_unwrapped)
+        n_ref_amp = int(np.sum(ref_amp_valid))
+        n_ref_unwrapped = int(np.sum(ref_unwrapped_valid))
+        phase_result.unwrap_success_ref_fraction = n_ref_unwrapped / max(n_ref_amp, 1)
+
         phases[key] = phase_result
         qc[f"phase_noise_{key}"] = sigma_phi
         qc[f"unwrap_success_{key}"] = phase_result.unwrap_success_fraction
+        qc[f"unwrap_success_ref_{key}"] = phase_result.unwrap_success_ref_fraction
         gc.collect()
 
     # Displacement and strain if 2 non-collinear g-vectors
@@ -543,7 +570,7 @@ def run_gpa_full(image_fft: np.ndarray,
     # Gate G10
     g10_value = {
         "phase_noise": {k: v.phase_noise_sigma for k, v in phases.items()},
-        "unwrap_success": {k: v.unwrap_success_fraction for k, v in phases.items()},
+        "unwrap_success": {k: v.unwrap_success_ref_fraction for k, v in phases.items()},
     }
     g10 = evaluate_gate("G10", g10_value)
     qc["g10_passed"] = g10.passed
@@ -778,6 +805,17 @@ def run_gpa(image_fft: np.ndarray,
 
     if not g_vectors:
         logger.warning("No g-vectors available, skipping GPA")
+        return None
+
+    # Skip GPA if FFT guidance is too weak
+    if global_fft_result.fft_guidance_strength == "none":
+        logger.info("GPA skipped: FFT guidance strength is 'none'")
+        return None
+
+    # Skip GPA if tile evidence is insufficient
+    if gated_grid.tier_summary.tier_a_fraction < 0.1:
+        logger.info("GPA skipped: tier_a_fraction=%.3f < 0.1",
+                     gated_grid.tier_summary.tier_a_fraction)
         return None
 
     mode_decision = select_gpa_mode(gated_grid, global_fft_result, config)

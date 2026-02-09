@@ -88,6 +88,14 @@ def build_parameters_v3(
         "fft_convention": fft_grid.to_dict(),
     }
 
+    # Physics config
+    params["physics"] = {
+        "imaging_mode": config.physics.imaging_mode,
+        "d_min_nm": config.physics.d_min_nm,
+        "d_max_nm": config.physics.d_max_nm,
+        "nyquist_safety_margin": config.physics.nyquist_safety_margin,
+    }
+
     # Low-q exclusion
     low_q_cfg = config.low_q
     params["low_q_exclusion"] = {
@@ -120,11 +128,16 @@ def build_parameters_v3(
 
     # ROI
     if roi_result is not None:
-        params["roi"] = {
+        roi_section = {
             "coverage_pct": roi_result.coverage_pct,
             "n_components": roi_result.n_components,
+            "lcc_fraction": roi_result.lcc_fraction,
             "method": "intensity+variance",
         }
+        if roi_result.diagnostics:
+            roi_section["gradient_used"] = roi_result.diagnostics.get("gradient_used", False)
+            roi_section["roi_confidence"] = roi_result.diagnostics.get("roi_confidence", "normal")
+        params["roi"] = roi_section
 
     # Global FFT
     if global_fft_result is not None:
@@ -146,7 +159,18 @@ def build_parameters_v3(
             "n_peaks_found": len(gf.peaks),
             "peaks": peaks_list,
             "g_vectors": gvecs_list,
+            "fft_guidance_strength": gf.fft_guidance_strength,
         }
+
+        # Background diagnostics
+        if gf.diagnostics:
+            bg_diag = {}
+            if "baseline_model" in gf.diagnostics:
+                bg_diag["baseline_model"] = _make_serialisable(gf.diagnostics["baseline_model"])
+            if "background_diagnostics" in gf.diagnostics:
+                bg_diag.update(_make_serialisable(gf.diagnostics["background_diagnostics"]))
+            if bg_diag:
+                params["background_diagnostics"] = bg_diag
 
     # Tile FFT
     if gated_grid is not None:
@@ -181,7 +205,9 @@ def build_parameters_v3(
 
         params["peak_gates"] = {
             "max_fwhm_ratio": config.peak_gates.max_fwhm_ratio,
-            "min_symmetry": config.peak_gates.min_symmetry,
+            "min_pair_fraction": config.peak_gates.min_pair_fraction,
+            "symmetry_score": config.peak_gates.min_pair_fraction,
+            "symmetry_score_deprecated": True,
             "min_non_collinear": config.peak_gates.min_non_collinear,
         }
 
@@ -243,6 +269,7 @@ def build_parameters_v3(
             "n_peaks_found": len(lattice_validation.nn_distances),
             "fraction_lattice_valid": lattice_validation.fraction_valid,
             "mean_nn_distance_nm": lattice_validation.mean_nn_distance_nm,
+            "tolerance_used": lattice_validation.tolerance_used,
         }
 
     # Gates
@@ -260,6 +287,50 @@ def build_parameters_v3(
         # Diagnostics
         if validation_report.diagnostics:
             params["diagnostics"] = _make_serialisable(validation_report.diagnostics)
+
+    # Derived cutoffs
+    derived = {
+        "effective_q_min_global": round(effective_q_min, 4),
+        "effective_q_min_tile": round(tile_effective_q_min, 4),
+    }
+    if global_fft_result is not None and global_fft_result.diagnostics:
+        bm = global_fft_result.diagnostics.get("baseline_model", {})
+        if bm:
+            derived["q_fit_min_used"] = bm.get("q_fit_min", 0)
+    if gpa_result is not None and gpa_result.diagnostics:
+        derived["mask_sigma_q_used"] = gpa_result.diagnostics.get("mask_sigma_q")
+    if lattice_validation is not None:
+        derived["nn_tolerance_used"] = lattice_validation.tolerance_used
+    params["derived_cutoffs"] = derived
+
+    # Pipeline flow
+    flow: Dict[str, Any] = {"stages_completed": [], "stages_skipped": [],
+                             "stages_degraded": [], "skip_reasons": {}}
+    # Reconstruct flow from available data
+    flow["stages_completed"].append("preprocessing")
+    flow["stages_completed"].append("roi_masking")
+    if global_fft_result is not None:
+        flow["stages_completed"].append("global_fft")
+    if gated_grid is not None:
+        flow["stages_completed"].append("tile_fft")
+    if gpa_result is not None:
+        flow["stages_completed"].append("gpa")
+    elif config.gpa.enabled:
+        flow["stages_skipped"].append("gpa")
+        if global_fft_result is not None and global_fft_result.fft_guidance_strength == "none":
+            flow["skip_reasons"]["gpa"] = "fft_guidance_strength=none"
+    if lattice_validation is not None:
+        flow["stages_completed"].append("peak_finding")
+    elif config.peak_finding.enabled:
+        flow["stages_skipped"].append("peak_finding")
+    # Check for degraded stages
+    if roi_result is not None and roi_result.diagnostics.get("roi_confidence") == "low":
+        flow["stages_degraded"].append("roi")
+    if validation_report is not None:
+        for gid, gr in validation_report.gates.items():
+            if not gr.passed and gr.failure_behavior == "DEGRADE_CONFIDENCE":
+                flow["stages_degraded"].append(f"gate_{gid}")
+    params["pipeline_flow"] = flow
 
     # Extra user-supplied data
     if extra:
@@ -307,6 +378,11 @@ def build_report(validation_report: ValidationReport) -> dict:
 
     if validation_report.diagnostics:
         report["diagnostics"] = _make_serialisable(validation_report.diagnostics)
+        # Include pipeline_flow if present in diagnostics
+        if "pipeline_flow" in validation_report.diagnostics:
+            report["pipeline_flow"] = _make_serialisable(
+                validation_report.diagnostics["pipeline_flow"]
+            )
 
     return report
 
@@ -428,15 +504,15 @@ def save_pipeline_artifacts(
         save_npy(encoded, tier_path)
         saved["tier_map.npy"] = tier_path
 
-    # --- atom_peaks.npy ---
+    # --- lattice_peaks.npy ---
     if peaks is not None and len(peaks) > 0:
         peak_arr = np.array(
             [(p.x, p.y, p.intensity, p.sigma_x, p.sigma_y) for p in peaks],
             dtype=np.float64,
         )
-        peaks_path = output_dir / "atom_peaks.npy"
+        peaks_path = output_dir / "lattice_peaks.npy"
         save_npy(peak_arr, peaks_path)
-        saved["atom_peaks.npy"] = peaks_path
+        saved["lattice_peaks.npy"] = peaks_path
 
     # --- peak_stats.json ---
     if lattice_validation is not None:

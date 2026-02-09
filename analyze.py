@@ -786,6 +786,13 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
         config.low_q.q_min_cycles_per_nm = args.q_min_override
         config.low_q.auto_q_min = False
         config.low_q.enabled = True
+    # Physics config CLI overrides
+    if args.physics_d_min is not None:
+        config.physics.d_min_nm = args.physics_d_min
+    if args.physics_d_max is not None:
+        config.physics.d_max_nm = args.physics_d_max
+    if args.imaging_mode is not None:
+        config.physics.imaging_mode = args.imaging_mode
 
     # --- GPU / device context ---
     from src.gpu_backend import DeviceContext, get_gpu_info
@@ -837,6 +844,34 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
         print(f"  Low-q exclusion: global={effective_q_min:.4f}, tile={tile_effective_q_min:.4f} cycles/nm")
     else:
         print("  Low-q exclusion: disabled")
+
+    # --- Gate G0: Nyquist guard ---
+    physics = config.physics
+    effective_d_min = physics.d_min_nm
+    effective_d_max = physics.d_max_nm
+    if physics.d_min_nm > 0 or physics.d_max_nm > 0:
+        q_nyquist = fft_grid.nyquist_q()
+        q_max_req = 1.0 / physics.d_min_nm if physics.d_min_nm > 0 else 0
+        q_min_req = 1.0 / physics.d_max_nm if physics.d_max_nm > 0 else 0
+        g0 = evaluate_gate("G0", {
+            "q_max_requested": q_max_req,
+            "q_min_requested": q_min_req,
+            "q_nyquist": q_nyquist,
+            "safety_margin": physics.nyquist_safety_margin,
+        })
+        gate_results["G0"] = g0
+        if not g0.passed and "FATAL" in g0.reason:
+            print(f"  FATAL: {g0.reason}")
+            return 1
+        elif not g0.passed:
+            # DEGRADE: clamp d_min to Nyquist-safe value
+            q_safe = physics.nyquist_safety_margin * q_nyquist
+            effective_d_min = 1.0 / q_safe
+            print(f"  G0 DEGRADE: d_min clamped {physics.d_min_nm:.4f} → {effective_d_min:.4f} nm")
+        else:
+            print("  G0 PASS")
+    else:
+        print("  G0 skipped (unconstrained d-range)")
 
     # --- Step 2: Branch A preprocessing (FFT-safe) ---
     log_memory("Before Branch A")
@@ -1093,6 +1128,7 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
             peaks=peaks, lattice_validation=lattice_validation,
             bandpass_image=peak_image, validation_report=report,
             effective_q_min=effective_q_min,
+            roi_result=roi_result, seg_record=seg_record,
         )
         saved.update(viz_saved)
 
@@ -1214,6 +1250,12 @@ Examples:
                         help='Override low-q exclusion threshold (cycles/nm), disables auto')
     parser.add_argument('--no-low-q-exclusion', action='store_true', dest='no_low_q_exclusion',
                         help='Disable low-q / DC exclusion entirely')
+    parser.add_argument('--physics-d-min', type=float, default=None, dest='physics_d_min',
+                        help='Expected minimum d-spacing in nm (for Nyquist guard)')
+    parser.add_argument('--physics-d-max', type=float, default=None, dest='physics_d_max',
+                        help='Expected maximum d-spacing in nm')
+    parser.add_argument('--imaging-mode', type=str, default=None, dest='imaging_mode',
+                        help='Imaging mode label (e.g., EFTEM-BF, STEM-HAADF)')
 
     args = parser.parse_args()
     

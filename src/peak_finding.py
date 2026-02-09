@@ -29,10 +29,16 @@ def build_bandpass_image(image_fft: np.ndarray,
                          g_dom_magnitude: Optional[float],
                          fft_grid: FFTGrid,
                          bandwidth_fraction: float = 0.3,
-                         effective_q_min: float = 0.0) -> np.ndarray:
+                         effective_q_min: float = 0.0,
+                         g_vectors=None,
+                         angular_width_deg: float = 30.0,
+                         use_directional_mask: bool = True) -> np.ndarray:
     """Build bandpass-filtered image for peak finding (I5).
 
     Ring mask at |g_dom| with cosine-tapered edges.
+    When g_vectors are provided and use_directional_mask is True,
+    restricts the ring to angular wedges around each g-vector direction
+    (and its antipodal direction).
     Falls back to raw image if no g_dom available.
     """
     if g_dom_magnitude is None or g_dom_magnitude <= 0:
@@ -74,6 +80,23 @@ def build_bandpass_image(image_fft: np.ndarray,
     # Zero below q_min to prevent DC leakage through cosine taper
     if effective_q_min > 0:
         ring_mask[q_mag_grid < effective_q_min] = 0.0
+
+    # Directional angular wedge mask
+    if g_vectors is not None and use_directional_mask and len(g_vectors) > 0:
+        angle_grid = fft_grid.angle_grid_deg()  # (-180, 180]
+        angular_mask = np.zeros((H, W), dtype=bool)
+        half_width = angular_width_deg
+
+        for gv in g_vectors:
+            for sign in [1, -1]:
+                g_angle = np.degrees(np.arctan2(sign * gv.gy, sign * gv.gx))
+                # Angular distance (handle wraparound)
+                delta = np.abs(angle_grid - g_angle)
+                delta = np.minimum(delta, 360 - delta)
+                angular_mask |= (delta <= half_width)
+
+        # Combine: ring AND angular
+        ring_mask = ring_mask * angular_mask.astype(float)
 
     filtered = FT_shifted * ring_mask
     peak_image = np.real(np.fft.ifft2(np.fft.ifftshift(filtered)))
@@ -160,11 +183,15 @@ def find_subpixel_peaks(peak_image: np.ndarray,
 def validate_peak_lattice(peaks: List[SubpixelPeak],
                            expected_d_nm: float,
                            pixel_size_nm: float,
-                           tolerance: float = 0.2) -> LatticeValidation:
+                           tolerance: float = 0.2,
+                           adaptive: bool = True) -> LatticeValidation:
     """Validate detected peaks against expected lattice spacing.
 
     Checks NN distances against expected d-spacing.
     Gate G12: >= 50% of peaks with NN distance within tolerance of expected d.
+
+    When adaptive=True and >= 10 peaks, tolerance is tightened based on the IQR
+    of NN distances (floored at 0.1).
     """
     if len(peaks) < 2:
         result = LatticeValidation(
@@ -174,6 +201,7 @@ def validate_peak_lattice(peaks: List[SubpixelPeak],
             std_nn_distance_nm=0.0,
             expected_d_nm=expected_d_nm,
             min_separation_px_used=0,
+            tolerance_used=tolerance,
         )
         evaluate_gate("G12", 0.0)
         return result
@@ -186,8 +214,19 @@ def validate_peak_lattice(peaks: List[SubpixelPeak],
     nn_dists, _ = tree.query(positions, k=2)  # k=2: self + nearest
     nn_distances = nn_dists[:, 1]  # skip self
 
+    # Adaptive tolerance from IQR
+    tolerance_actual = tolerance
+    if adaptive and len(peaks) >= 10:
+        q75, q25 = np.percentile(nn_distances, [75, 25])
+        iqr = q75 - q25
+        tolerance_actual = min(tolerance, iqr / expected_d_nm)
+        tolerance_actual = max(tolerance_actual, 0.1)
+        if tolerance_actual < tolerance:
+            logger.info("Adaptive tolerance: %.3f (IQR=%.3f nm, nominal=%.3f)",
+                        tolerance_actual, iqr, tolerance)
+
     # Validate
-    valid = np.abs(nn_distances - expected_d_nm) / expected_d_nm <= tolerance
+    valid = np.abs(nn_distances - expected_d_nm) / expected_d_nm <= tolerance_actual
     fraction_valid = float(np.mean(valid))
 
     result = LatticeValidation(
@@ -197,11 +236,12 @@ def validate_peak_lattice(peaks: List[SubpixelPeak],
         std_nn_distance_nm=float(np.std(nn_distances)),
         expected_d_nm=expected_d_nm,
         min_separation_px_used=max(2, 0.6 * expected_d_nm / pixel_size_nm),
+        tolerance_used=tolerance_actual,
     )
 
     evaluate_gate("G12", fraction_valid)
 
-    logger.info("Lattice validation: %.1f%% valid (mean_nn=%.3f nm, expected=%.3f nm)",
-                fraction_valid * 100, result.mean_nn_distance_nm, expected_d_nm)
+    logger.info("Lattice validation: %.1f%% valid (mean_nn=%.3f nm, expected=%.3f nm, tol=%.3f)",
+                fraction_valid * 100, result.mean_nn_distance_nm, expected_d_nm, tolerance_actual)
 
     return result

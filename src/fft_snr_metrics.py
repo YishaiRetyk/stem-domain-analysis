@@ -60,9 +60,10 @@ def build_gated_tile_grid(peak_sets: List[TilePeakSet],
     classifications = np.empty((n_rows, n_cols), dtype=object)
     tier_map = np.full((n_rows, n_cols), "", dtype=object)
     snr_map = np.zeros((n_rows, n_cols))
-    symmetry_map = np.zeros((n_rows, n_cols))
+    pair_fraction_map = np.zeros((n_rows, n_cols))
     fwhm_map = np.zeros((n_rows, n_cols))
     orientation_map = np.full((n_rows, n_cols), np.nan)
+    orientation_confidence_map = np.zeros((n_rows, n_cols))
 
     # --- Progress tracking ---
     process = psutil.Process()
@@ -92,7 +93,8 @@ def build_gated_tile_grid(peak_sets: List[TilePeakSet],
         classifications[r, c] = tc
         tier_map[r, c] = tc.tier
         snr_map[r, c] = tc.best_snr
-        symmetry_map[r, c] = tc.symmetry_score
+        pair_fraction_map[r, c] = tc.pair_fraction
+        orientation_confidence_map[r, c] = tc.orientation_confidence
         orientation_map[r, c] = tc.best_orientation_deg
 
         # Best FWHM from peak metrics
@@ -158,8 +160,8 @@ def build_gated_tile_grid(peak_sets: List[TilePeakSet],
     g6 = evaluate_gate("G6", tier_a_fraction)
     g7 = evaluate_gate("G7", median_snr_a)
 
-    # Mean symmetry of Tier A
-    tier_a_sym = symmetry_map[tier_a_mask]
+    # Mean symmetry (pair_fraction) of Tier A
+    tier_a_sym = pair_fraction_map[tier_a_mask]
     mean_sym = float(np.mean(tier_a_sym)) if len(tier_a_sym) > 0 else 0.0
     g8 = evaluate_gate("G8", mean_sym)
 
@@ -170,10 +172,11 @@ def build_gated_tile_grid(peak_sets: List[TilePeakSet],
         classifications=classifications,
         tier_map=tier_map,
         snr_map=snr_map,
-        symmetry_map=symmetry_map,
+        pair_fraction_map=pair_fraction_map,
         fwhm_map=fwhm_map,
         orientation_map=orientation_map,
         grid_shape=(n_rows, n_cols),
         skipped_mask=skipped_mask,
         tier_summary=tier_summary,
+        orientation_confidence_map=orientation_confidence_map,
     )

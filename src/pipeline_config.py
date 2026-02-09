@@ -73,6 +73,7 @@ class ROIMaskResult:
     coverage_pct: float
     n_components: int
     diagnostics: dict
+    lcc_fraction: float = 1.0       # largest connected component / total mask area
 
 
 # ======================================================================
@@ -122,16 +123,36 @@ class TilePeakSet:
     power_spectrum: Optional[np.ndarray] = None
 
 
+import warnings as _warnings
+
+_warned_symmetry_score = False
+
+
 @dataclass
 class TileClassification:
     """Two-tier classification result for a tile."""
     tier: str                       # 'A', 'B', 'REJECTED'
     peaks: list                     # list of dicts with per-peak metrics
-    symmetry_score: float
+    pair_fraction: float            # was symmetry_score; fraction of peaks that are ±g paired
     n_non_collinear: int
     best_snr: float
     best_orientation_deg: float = 0.0
     gate_details: dict = field(default_factory=dict)
+    orientation_confidence: float = 0.0     # circular concentration R (diagnostic-only)
+
+    @property
+    def symmetry_score(self) -> float:
+        """Deprecated alias for pair_fraction. Use pair_fraction instead."""
+        global _warned_symmetry_score
+        if not _warned_symmetry_score:
+            _warnings.warn(
+                "TileClassification.symmetry_score is deprecated, "
+                "use pair_fraction instead",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            _warned_symmetry_score = True
+        return self.pair_fraction
 
 
 @dataclass
@@ -145,18 +166,36 @@ class TierSummary:
     median_snr_tier_a: float
 
 
+_warned_symmetry_map = False
+
+
 @dataclass
 class GatedTileGrid:
     """Unified output for all downstream consumers (C12)."""
     classifications: np.ndarray     # (n_rows, n_cols) object array of TileClassification
     tier_map: np.ndarray            # (n_rows, n_cols) str: 'A'/'B'/'REJECTED'/''
     snr_map: np.ndarray
-    symmetry_map: np.ndarray
+    pair_fraction_map: np.ndarray   # was symmetry_map
     fwhm_map: np.ndarray
     orientation_map: np.ndarray
     grid_shape: tuple
     skipped_mask: np.ndarray        # (n_rows, n_cols) bool
     tier_summary: TierSummary
+    orientation_confidence_map: Optional[np.ndarray] = None  # (n_rows, n_cols) float
+
+    @property
+    def symmetry_map(self) -> np.ndarray:
+        """Deprecated alias for pair_fraction_map. Use pair_fraction_map instead."""
+        global _warned_symmetry_map
+        if not _warned_symmetry_map:
+            _warnings.warn(
+                "GatedTileGrid.symmetry_map is deprecated, "
+                "use pair_fraction_map instead",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            _warned_symmetry_map = True
+        return self.pair_fraction_map
 
 
 # ======================================================================
@@ -205,6 +244,7 @@ class GPAPhaseResult:
     g_vector: GVector
     phase_noise_sigma: Optional[float] = None
     unwrap_success_fraction: float = 0.0
+    unwrap_success_ref_fraction: float = 0.0  # computed within reference region only
 
 
 @dataclass
@@ -260,6 +300,7 @@ class LatticeValidation:
     std_nn_distance_nm: float
     expected_d_nm: float
     min_separation_px_used: float
+    tolerance_used: float = 0.2             # actual tolerance used (may be adaptive)
 
 
 # ======================================================================
@@ -307,6 +348,7 @@ class GlobalFFTResult:
     d_dom: Optional[float]          # dominant d-spacing (nm)
     information_limit_q: Optional[float]
     diagnostics: dict = field(default_factory=dict)
+    fft_guidance_strength: str = "none"     # "strong", "weak", or "none"
 
 
 # ======================================================================
@@ -338,6 +380,8 @@ class ROIConfig:
     min_tile_coverage: float = 0.5
     intensity_threshold_pct: float = 10.0
     variance_threshold_pct: float = 20.0
+    min_lcc_fraction: float = 0.5           # largest connected component / total mask area
+    gradient_threshold_pct: float = 30.0    # percentile for gradient-magnitude fallback
 
 
 @dataclass
@@ -361,8 +405,18 @@ class FWHMConfig:
 class PeakGateConfig:
     """Peak quality gate thresholds."""
     max_fwhm_ratio: float = 0.15
-    min_symmetry: float = 0.3
+    min_pair_fraction: float = 0.3          # was min_symmetry
     min_non_collinear: int = 2
+
+    @property
+    def min_symmetry(self) -> float:
+        """Deprecated alias for min_pair_fraction."""
+        return self.min_pair_fraction
+
+    @min_symmetry.setter
+    def min_symmetry(self, value: float):
+        """Deprecated setter for min_pair_fraction."""
+        self.min_pair_fraction = value
 
 
 @dataclass
@@ -372,6 +426,9 @@ class GlobalFFTConfig:
     background_poly_degree: int = 6
     min_peak_snr: float = 3.0
     max_g_vectors: int = 6
+    q_fit_min: float = 0.30                 # cycles/nm; 0 = derive from PhysicsConfig.d_max_nm
+    background_max_degree: int = 4          # hard cap on polynomial degree
+    background_default_degree: int = 3      # used unless overridden
 
 
 @dataclass
@@ -403,6 +460,9 @@ class PeakFindingConfig:
     min_prominence: float = 0.1
     lattice_tolerance: float = 0.2
     bandpass_bandwidth: float = 0.3
+    use_directional_mask: bool = True       # g-oriented wedge masks instead of full ring
+    angular_width_deg: float = 30.0         # half-width of angular wedge per g-vector
+    adaptive_tolerance: bool = True         # adaptive NN tolerance from IQR
 
 
 @dataclass
@@ -435,6 +495,23 @@ class VizConfig:
 
 
 @dataclass
+class PhysicsConfig:
+    """Physical constraints and imaging mode configuration."""
+    imaging_mode: str = "EFTEM-BF"          # informational, logged in report
+    d_min_nm: float = 0.0                   # expected minimum d-spacing (nm); 0 = unconstrained
+    d_max_nm: float = 0.0                   # expected maximum d-spacing (nm); 0 = unconstrained
+    nyquist_safety_margin: float = 0.95     # clamp q_max to this fraction of q_nyquist
+
+
+@dataclass
+class TileFFTConfig:
+    """Tile FFT peak detection configuration."""
+    q_dc_min: float = 0.25                  # cycles/nm, replaces pixel-based DC mask
+    peak_snr_threshold: float = 2.5         # replaces peak_threshold_frac for primary detection
+    local_max_size: int = 5                 # footprint for local max detection (pixels)
+
+
+@dataclass
 class LowQExclusionConfig:
     """Unified low-q / DC exclusion configuration."""
     enabled: bool = True
@@ -446,7 +523,7 @@ class LowQExclusionConfig:
 @dataclass
 class PipelineConfig:
     """Top-level pipeline configuration."""
-    pixel_size_nm: float = 0.127
+    pixel_size_nm: float = 0.1297
     tile_size: int = 256
     stride: int = 128
     preprocessing: PreprocConfig = field(default_factory=PreprocConfig)
@@ -461,6 +538,8 @@ class PipelineConfig:
     device: DeviceConfig = field(default_factory=DeviceConfig)
     viz: VizConfig = field(default_factory=VizConfig)
     low_q: LowQExclusionConfig = field(default_factory=LowQExclusionConfig)
+    physics: PhysicsConfig = field(default_factory=PhysicsConfig)
+    tile_fft: TileFFTConfig = field(default_factory=TileFFTConfig)
 
     def to_dict(self) -> dict:
         """Serialise to a JSON-safe dict."""
@@ -488,6 +567,8 @@ class PipelineConfig:
             "device": (DeviceConfig, "device"),
             "viz": (VizConfig, "viz"),
             "low_q": (LowQExclusionConfig, "low_q"),
+            "physics": (PhysicsConfig, "physics"),
+            "tile_fft": (TileFFTConfig, "tile_fft"),
         }
         for attr, (klass, key) in _mapping.items():
             if key in d and isinstance(d[key], dict):

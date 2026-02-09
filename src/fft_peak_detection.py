@@ -296,8 +296,19 @@ def measure_peak_fwhm(power: np.ndarray,
 
 def check_symmetry(peaks: List[TilePeak],
                    fft_grid: FFTGrid,
-                   tolerance_px: float = 2.0) -> Tuple[float, int]:
+                   tolerance_px: float = 2.0,
+                   median_fwhm_q: float = 0.0) -> Tuple[float, int]:
     """Check ±g symmetry among peaks.
+
+    Parameters
+    ----------
+    peaks : list of TilePeak
+    fft_grid : FFTGrid
+    tolerance_px : float
+        Pixel tolerance (used when median_fwhm_q <= 0).
+    median_fwhm_q : float
+        When > 0, use FWHM-scaled tolerance instead of pixel-based:
+        ``tol_q = median_fwhm_q / 2.355 * 2.0`` (2 sigma).
 
     Returns (symmetry_score, n_paired).
     symmetry_score = n_paired / n_peaks.
@@ -306,7 +317,10 @@ def check_symmetry(peaks: List[TilePeak],
     if n == 0:
         return 0.0, 0
 
-    tol_q = tolerance_px * fft_grid.qx_scale
+    if median_fwhm_q > 0:
+        tol_q = median_fwhm_q / 2.355 * 2.0
+    else:
+        tol_q = tolerance_px * fft_grid.qx_scale
     paired = [False] * n
 
     for i in range(n):
@@ -375,7 +389,7 @@ def classify_tile(peak_set: TilePeakSet,
 
     if not peaks or power is None:
         return TileClassification(
-            tier="REJECTED", peaks=[], symmetry_score=0,
+            tier="REJECTED", peaks=[], pair_fraction=0,
             n_non_collinear=0, best_snr=0, best_orientation_deg=0,
         )
 
@@ -461,12 +475,19 @@ def classify_tile(peak_set: TilePeakSet,
     # Non-collinearity
     n_non_collinear = count_non_collinear(peaks)
 
+    # Orientation confidence (circular concentration R from doubled angles)
+    if peaks:
+        angles_rad = np.array([p.angle_deg for p in peaks]) * np.pi / 90  # doubled for 180 deg periodicity
+        R = np.sqrt(np.mean(np.cos(angles_rad))**2 + np.mean(np.sin(angles_rad))**2)
+    else:
+        R = 0.0
+
     # Classification
     tier = "REJECTED"
 
     if best_snr >= tier_config.tier_a_snr:
         if (n_non_collinear >= peak_gate_config.min_non_collinear and
-                symmetry_score >= peak_gate_config.min_symmetry):
+                symmetry_score >= peak_gate_config.min_pair_fraction):
             tier = "A"
         elif best_snr >= tier_config.tier_b_snr:
             tier = "B"
@@ -476,10 +497,11 @@ def classify_tile(peak_set: TilePeakSet,
     return TileClassification(
         tier=tier,
         peaks=peak_metrics,
-        symmetry_score=symmetry_score,
+        pair_fraction=symmetry_score,
         n_non_collinear=n_non_collinear,
         best_snr=best_snr,
         best_orientation_deg=best_orientation,
+        orientation_confidence=float(R),
         gate_details={
             "n_paired": n_paired,
             "tier_a_snr_threshold": tier_config.tier_a_snr,

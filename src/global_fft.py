@@ -121,10 +121,15 @@ def compute_global_fft(image_fft: np.ndarray,
     q_values = np.arange(max_r + 1) * q_scale
 
     # Background fit (reuse logic from peak_discovery)
-    background = _fit_background(q_values, radial_profile,
-                                 degree=config.background_poly_degree,
-                                 effective_q_min=effective_q_min)
+    bg_degree = min(config.background_default_degree, config.background_max_degree)
+    background, baseline_model = _fit_background(
+        q_values, radial_profile,
+        degree=bg_degree,
+        effective_q_min=effective_q_min,
+        q_fit_min=config.q_fit_min,
+    )
     corrected = radial_profile - background
+    diagnostics["baseline_model"] = baseline_model
 
     # Noise floor
     neg_vals = corrected[corrected < 0]
@@ -139,6 +144,14 @@ def compute_global_fft(image_fft: np.ndarray,
                                        effective_q_min=effective_q_min)
     diagnostics["n_radial_peaks"] = len(radial_peaks)
     diagnostics["effective_q_min"] = effective_q_min
+
+    # Background residual diagnostics
+    peak_indices = [rp["index"] for rp in radial_peaks]
+    bg_diag = _compute_background_diagnostics(
+        q_values, radial_profile, background, corrected,
+        config.q_fit_min, peak_indices,
+    )
+    diagnostics["background_diagnostics"] = bg_diag
 
     # Convert to GlobalPeak list
     peaks = []
@@ -176,6 +189,15 @@ def compute_global_fft(image_fft: np.ndarray,
     diagnostics["g4_passed"] = g4_result.passed
     diagnostics["g4_reason"] = g4_result.reason
 
+    # FFT guidance strength classification
+    n_peaks = len(peaks)
+    if best_peak_snr >= 8 and n_peaks >= 2:
+        fft_guidance = "strong"
+    elif best_peak_snr >= config.min_peak_snr:
+        fft_guidance = "weak"
+    else:
+        fft_guidance = "none"
+
     return GlobalFFTResult(
         power_spectrum=power,
         radial_profile=radial_profile,
@@ -188,6 +210,7 @@ def compute_global_fft(image_fft: np.ndarray,
         d_dom=d_dom,
         information_limit_q=info_limit_q,
         diagnostics=diagnostics,
+        fft_guidance_strength=fft_guidance,
     )
 
 
@@ -197,21 +220,39 @@ def compute_global_fft(image_fft: np.ndarray,
 
 def _fit_background(q_values: np.ndarray, profile: np.ndarray,
                     degree: int = 6, exclude_dc: int = 5,
-                    effective_q_min: float = 0.0) -> np.ndarray:
-    """Iterative reweighted polynomial background fit in log space."""
-    if effective_q_min > 0:
-        valid = (profile > 0) & (q_values >= effective_q_min)
+                    effective_q_min: float = 0.0,
+                    q_fit_min: float = 0.0) -> tuple:
+    """Iterative reweighted polynomial background fit in log space.
+
+    Returns
+    -------
+    background : np.ndarray
+        Background estimate, same length as *profile*.
+    baseline_model : dict
+        Serialisable description of the fitted model.
+    """
+    # Cap polynomial degree at 4
+    degree = min(degree, 4)
+
+    # Build validity mask: positive values, above effective_q_min, above q_fit_min
+    if effective_q_min > 0 or q_fit_min > 0:
+        actual_min = max(effective_q_min, q_fit_min)
+        valid = (profile > 0) & (q_values >= actual_min)
     else:
         valid = (profile > 0) & (np.arange(len(profile)) >= exclude_dc)
     if np.sum(valid) < degree + 1:
-        return np.zeros_like(profile)
+        baseline_model = {
+            "type": "poly", "degree": degree,
+            "q_fit_min": float(q_fit_min), "coeffs": [],
+        }
+        return np.zeros_like(profile), baseline_model
 
     q_fit = q_values[valid]
     log_profile = np.log10(profile[valid] + 1e-10)
     weights = np.ones_like(log_profile)
 
     coeffs = None
-    for _ in range(3):
+    for _ in range(4):
         coeffs = np.polyfit(q_fit, log_profile, degree, w=weights)
         fit = np.polyval(coeffs, q_fit)
         residual = log_profile - fit
@@ -223,12 +264,73 @@ def _fit_background(q_values: np.ndarray, profile: np.ndarray,
     if coeffs is not None:
         background[valid] = 10 ** np.polyval(coeffs, q_values[valid])
     # Fill excluded region with raw profile values
-    if effective_q_min > 0:
-        excluded = q_values < effective_q_min
+    actual_excl = max(effective_q_min, q_fit_min)
+    if actual_excl > 0:
+        excluded = q_values < actual_excl
         background[excluded] = profile[excluded]
     else:
         background[:exclude_dc] = profile[:exclude_dc]
-    return background
+
+    baseline_model = {
+        "type": "poly",
+        "degree": int(degree),
+        "q_fit_min": float(q_fit_min),
+        "coeffs": coeffs.tolist() if coeffs is not None else [],
+    }
+    return background, baseline_model
+
+
+def _compute_background_diagnostics(q_values, profile, background, corrected,
+                                     q_fit_min, peak_positions):
+    """Compute residual diagnostics for the background fit.
+
+    Parameters
+    ----------
+    q_values : np.ndarray
+    profile, background, corrected : np.ndarray
+    q_fit_min : float
+        Lower bound of the fit region (cycles/nm).
+    peak_positions : list of int
+        Indices into *q_values* of detected radial peaks.
+
+    Returns
+    -------
+    dict with keys: median_abs_residual, mad_residual,
+    neg_excursion_fraction_near_peaks.
+    """
+    # Residual in the fit region (linear space)
+    fit_mask = q_values >= q_fit_min if q_fit_min > 0 else np.ones(len(q_values), dtype=bool)
+    residual = (profile - background)[fit_mask]
+
+    if len(residual) == 0:
+        return {
+            "median_abs_residual": 0.0,
+            "mad_residual": 0.0,
+            "neg_excursion_fraction_near_peaks": 0.0,
+        }
+
+    abs_res = np.abs(residual)
+    median_abs = float(np.median(abs_res))
+    mad_res = float(np.median(np.abs(abs_res - np.median(abs_res))) * 1.4826)
+
+    # Negative excursion fraction near peaks (within +/-2 bins)
+    near_peak_mask = np.zeros(len(q_values), dtype=bool)
+    for idx in peak_positions:
+        lo = max(0, idx - 2)
+        hi = min(len(q_values), idx + 3)
+        near_peak_mask[lo:hi] = True
+
+    near_peak_residual = corrected[near_peak_mask]
+    if len(near_peak_residual) > 0:
+        neg_frac = float(np.sum(near_peak_residual < 0) / len(near_peak_residual))
+    else:
+        neg_frac = 0.0
+
+    return {
+        "median_abs_residual": median_abs,
+        "mad_residual": mad_res,
+        "neg_excursion_fraction_near_peaks": neg_frac,
+    }
 
 
 # ======================================================================
@@ -385,7 +487,7 @@ def _extract_g_vectors_single_ring(power_spectrum, q_center, q_width,
     # Cartesian antipodal pairing (B4)
     paired_vectors: List[GVector] = []
     used = set()
-    tolerance_q = q_center * 0.05
+    tolerance_q = max(ring_fwhm * 2.0 / 2.355, q_center * 0.03)
 
     for i_idx in peaks_idx:
         if i_idx in used:

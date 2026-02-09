@@ -18,6 +18,31 @@ from src.gates import evaluate_gate
 logger = logging.getLogger(__name__)
 
 
+def _compute_gradient_magnitude(image, sigma=1.0):
+    """Compute gradient magnitude using Sobel operators on smoothed image."""
+    from scipy.ndimage import sobel, gaussian_filter
+    smoothed = gaussian_filter(image.astype(np.float64), sigma=sigma)
+    gx = sobel(smoothed, axis=1)
+    gy = sobel(smoothed, axis=0)
+    return np.sqrt(gx**2 + gy**2)
+
+
+def _compute_lcc_fraction(mask):
+    """Compute fraction of mask area occupied by largest connected component.
+
+    Returns 1.0 if mask is all zero (no components).
+    """
+    total_area = int(np.sum(mask > 0))
+    if total_area == 0:
+        return 1.0
+    labeled, n = ndimage.label(mask)
+    if n == 0:
+        return 1.0
+    component_sizes = ndimage.sum(mask > 0, labeled, range(1, n + 1))
+    largest = float(np.max(component_sizes))
+    return largest / total_area
+
+
 def _compute_local_variance(image: np.ndarray, window_size: int = 32) -> np.ndarray:
     """Compute local variance as texture indicator."""
     kernel = np.ones((window_size, window_size)) / (window_size ** 2)
@@ -73,15 +98,68 @@ def compute_roi_mask(image_seg: np.ndarray,
     # Compute metrics
     coverage_pct = float(np.sum(mask) / mask.size * 100)
     labeled, n_components = ndimage.label(mask)
+    lcc_fraction = _compute_lcc_fraction(mask_uint8)
+
     diagnostics["coverage_pct"] = coverage_pct
     diagnostics["n_components"] = int(n_components)
     diagnostics["intensity_threshold"] = float(intensity_thresh)
     diagnostics["variance_threshold"] = float(var_thresh)
+    diagnostics["lcc_fraction"] = lcc_fraction
+    diagnostics["coverage_before_gradient"] = coverage_pct
+    diagnostics["gradient_used"] = False
+    diagnostics["roi_confidence"] = "normal"
+
+    # Check whether primary mask is acceptable
+    coverage_ok = (config.min_coverage_pct <= coverage_pct <= config.max_coverage_pct)
+    lcc_ok = (lcc_fraction >= config.min_lcc_fraction)
+
+    if not coverage_ok or not lcc_ok:
+        # Gradient-magnitude fallback
+        logger.info("Primary mask coverage=%.1f%%, lcc_fraction=%.2f -- "
+                     "applying gradient-magnitude fallback.",
+                     coverage_pct, lcc_fraction)
+        grad_mag = _compute_gradient_magnitude(image_seg)
+        grad_thresh = np.percentile(grad_mag, config.gradient_threshold_pct)
+        grad_mask = grad_mag > grad_thresh
+
+        # Union gradient mask with primary mask
+        combined = (mask_uint8 > 0) | grad_mask
+
+        # Morphological cleanup on combined mask
+        combined = ndimage.binary_fill_holes(combined)
+        combined = ndimage.binary_opening(combined, structure=np.ones((5, 5)))
+        combined_f = ndimage.gaussian_filter(combined.astype(np.float64), sigma=2.0)
+        combined = combined_f > 0.5
+
+        mask_uint8 = combined.astype(np.uint8)
+        coverage_pct = float(np.sum(mask_uint8) / mask_uint8.size * 100)
+        labeled, n_components = ndimage.label(mask_uint8)
+        lcc_fraction = _compute_lcc_fraction(mask_uint8)
+
+        diagnostics["gradient_used"] = True
+        diagnostics["coverage_pct"] = coverage_pct
+        diagnostics["n_components"] = int(n_components)
+        diagnostics["lcc_fraction"] = lcc_fraction
+
+    # If lcc_fraction is STILL too low after gradient fallback, force full-image ROI
+    if lcc_fraction < config.min_lcc_fraction:
+        logger.warning("lcc_fraction=%.2f still below %.2f after gradient fallback. "
+                       "Forcing full-image ROI with low confidence.",
+                       lcc_fraction, config.min_lcc_fraction)
+        mask_uint8 = np.ones((h, w), dtype=np.uint8)
+        coverage_pct = 100.0
+        n_components = 1
+        lcc_fraction = 1.0
+        diagnostics["roi_confidence"] = "low"
+        diagnostics["coverage_pct"] = 100.0
+        diagnostics["n_components"] = 1
+        diagnostics["lcc_fraction"] = 1.0
 
     # Gate G3 evaluation
     g3_result = evaluate_gate("G3", {
         "coverage_pct": coverage_pct,
         "n_components": n_components,
+        "lcc_fraction": lcc_fraction,
     })
 
     if not g3_result.passed:
@@ -91,9 +169,12 @@ def compute_roi_mask(image_seg: np.ndarray,
         mask_uint8 = np.ones((h, w), dtype=np.uint8)
         coverage_pct = 100.0
         n_components = 1
+        lcc_fraction = 1.0
         diagnostics["fallback"] = True
         diagnostics["coverage_pct"] = 100.0
         diagnostics["n_components"] = 1
+        diagnostics["lcc_fraction"] = 1.0
+        diagnostics["roi_confidence"] = "low"
     else:
         diagnostics["fallback"] = False
 
@@ -106,6 +187,7 @@ def compute_roi_mask(image_seg: np.ndarray,
         coverage_pct=coverage_pct,
         n_components=int(n_components),
         diagnostics=diagnostics,
+        lcc_fraction=lcc_fraction,
     )
 
 
