@@ -5,9 +5,10 @@ flowchart TB
     %% STEM DOMAIN ANALYSIS - HYBRID PIPELINE WORKFLOW (--hybrid)
     %% ============================================================
     %% 9-stage pipeline with two-branch preprocessing,
-    %% two-tier SNR classification, quality gates G1-G12,
+    %% two-tier SNR classification, quality gates G0-G12,
     %% unified low-q / DC exclusion (effective_q_min),
-    %% and 25 output artifacts (8 data + 17 PNG).
+    %% PhysicsConfig (d-range, Nyquist guard),
+    %% and 32 output artifacts (8 data + 24 PNG).
     %% ============================================================
 
     subgraph INPUT["1/9 INPUT VALIDATION"]
@@ -16,8 +17,10 @@ flowchart TB
         IN_META["Metadata Extraction<br/>(pixel_size_nm)"]
         IN_GRID["FFTGrid Construction<br/>(canonical cycles/nm coords)"]
         IN_QMIN["Compute effective_q_min<br/>(global + tile grids)<br/><i>--q-min override, --no-low-q-exclusion</i>"]
+        IN_PHYSICS["PhysicsConfig<br/>(d_min, d_max, imaging_mode)<br/><i>--physics-d-min, --physics-d-max</i>"]
+        IN_G0{{"Gate G0: Nyquist Guard<br/>q_max < 0.95 × q_nyquist<br/><b>DEGRADE: auto-clamp q-range</b><br/><b>FATAL: entire band invalid</b>"}}
         IN_G1{{"Gate G1: Input Validation<br/>2D, no NaN/Inf, >=512x512<br/><b>FATAL on failure</b>"}}
-        IN_FILE --> IN_META --> IN_GRID --> IN_QMIN --> IN_G1
+        IN_FILE --> IN_META --> IN_GRID --> IN_QMIN --> IN_PHYSICS --> IN_G0 --> IN_G1
     end
 
     subgraph PREPROCESS["2-3/9 TWO-BRANCH PREPROCESSING"]
@@ -61,8 +64,9 @@ flowchart TB
         ROI_COMBINE --> ROI_FILL --> ROI_OPEN --> ROI_SMOOTH
 
         ROI_TILE["Downsample to Tile Grid<br/>(tile coverage >= 50%)"]
-        ROI_G3{{"Gate G3: ROI Geometry<br/>coverage in [10%, 95%]<br/>fragments <= 20<br/><b>FALLBACK: full-image ROI</b>"}}
-        ROI_SMOOTH --> ROI_TILE --> ROI_G3
+        ROI_GRAD["<b>Gradient Fallback</b><br/>Sobel magnitude if coverage<br/>or LCC fraction fails"]
+        ROI_G3{{"Gate G3: ROI Geometry<br/>coverage in [10%, 95%]<br/>lcc_fraction >= 0.5<br/>fragments <= 20<br/><b>FALLBACK: full-image ROI</b>"}}
+        ROI_SMOOTH --> ROI_TILE --> ROI_GRAD --> ROI_G3
     end
 
     subgraph GLOBAL_FFT["5/9 GLOBAL FFT ANALYSIS"]
@@ -79,7 +83,7 @@ flowchart TB
 
         subgraph GFFT_RADIAL["Radial Profile Analysis"]
             GF_RADIAL["<b>Radial Binning</b><br/>Azimuthal averaging"]
-            GF_POLY["<b>Polynomial Background</b><br/>Degree 6, log-space<br/>Iterative MAD reweighting<br/><i>Fit excludes q < q_min</i>"]
+            GF_POLY["<b>Polynomial Background</b><br/>Degree 3 (cap 4), log-space<br/>q_fit_min constraint<br/>4× MAD reweighting<br/><i>Fit excludes q < max(q_min, q_fit_min)</i>"]
             GF_NOISE["<b>Noise Floor</b><br/>MAD x 1.4826 of residuals"]
             GF_SAVGOL["<b>Savitzky-Golay Smooth</b><br/>window=11, polyorder=2"]
         end
@@ -87,11 +91,15 @@ flowchart TB
         GF_POWER --> GF_RADIAL --> GF_POLY --> GF_NOISE --> GF_SAVGOL
 
         GF_PEAKS["Radial Peak Detection<br/>(prominence + SNR)"]
+        GF_GUIDANCE["FFT Guidance Strength<br/>(strong / weak / none)<br/><i>Controls GPA eligibility</i>"]
+        GF_DIAG["Background Diagnostics<br/>(median|res|, MAD, neg-excursion)"]
         GF_SAVGOL --> GF_PEAKS
+        GF_PEAKS --> GF_GUIDANCE
+        GF_PEAKS --> GF_DIAG
 
         subgraph GFFT_GVEC["G-Vector Extraction"]
             GF_RING["Multi-Ring Polar Resampling<br/>(up to 8 radial peaks)"]
-            GF_ANGULAR["Angular Peak Detection<br/>+ Antipodal Pairing"]
+            GF_ANGULAR["Angular Peak Detection<br/>+ FWHM-Scaled Antipodal Pairing"]
             GF_DEDUP["Harmonic De-duplication"]
             GF_TOPK["Top-K Non-Collinear Selection<br/>(max 6, >15 deg separation)"]
         end
@@ -111,9 +119,9 @@ flowchart TB
             TF_EXTRACT["Tile Extraction<br/>(256x256, stride 128)"]
             TF_HANN["<b>Hann Window</b><br/>2D outer product"]
             TF_FFT["2D FFT + Shift<br/>(batched GPU or sequential CPU)"]
-            TF_DC["<b>DC Masking</b><br/>q-based: q_mag < q_min<br/><i>Fallback: radius 3px when q_min=0</i>"]
+            TF_DC["<b>Unified DC Masking</b><br/>q_dc_min = max(q_min, config.q_dc_min)<br/><i>Single q-based code path</i>"]
             TF_QMASK["Q-range Filtering<br/>(seeded from global FFT)"]
-            TF_LOCALMAX["<b>Local Max Detection</b><br/>5x5 footprint, threshold 10%"]
+            TF_LOCALMAX["<b>Local Max Detection</b><br/>5x5 footprint<br/><b>SNR-first filtering</b><br/>(annular SNR >= 2.5)"]
             TF_SUBPX["Subpixel Refinement<br/>(parabolic interpolation)"]
         end
 
@@ -122,18 +130,19 @@ flowchart TB
         subgraph TF_CLASS["Two-Tier Classification"]
             TF_SNR["<b>Peak SNR Computation</b><br/>Signal disk r=3px<br/>Background annulus at |q|<br/>Annulus guarded: q >= q_min<br/>MAD-based noise: sigma = MAD x 1.4826<br/>SNR = (peak - median) / sigma"]
             TF_FWHM["<b>Two-Stage FWHM</b><br/>All peaks: moment proxy (fast)<br/>Top-K high-SNR: curve_fit (accurate)<br/><i>FWHMConfig: auto mode, K=2</i>"]
-            TF_SYM["Symmetry Check<br/>(+/-g pairing, tol 2px)"]
+            TF_SYM["Pair Fraction Check<br/>(+/-g pairing, FWHM-scaled tol)"]
             TF_NONCOL["Non-Collinear Count<br/>(>15 deg separation)"]
-            TF_TIER["Tier Assignment<br/>A: SNR>=5.0 + sym>=0.3 + noncol>=2<br/>B: SNR>=3.0<br/>REJECTED: SNR<3.0"]
+            TF_ORIENT["Orientation Confidence<br/>(circular concentration R)"]
+            TF_TIER["Tier Assignment<br/>A: SNR>=5.0 + pair_frac>=0.3 + noncol>=2<br/>B: SNR>=3.0<br/>REJECTED: SNR<3.0"]
         end
 
-        TF_SUBPX --> TF_SNR --> TF_FWHM --> TF_SYM --> TF_NONCOL --> TF_TIER
+        TF_SUBPX --> TF_SNR --> TF_FWHM --> TF_SYM --> TF_NONCOL --> TF_ORIENT --> TF_TIER
 
         subgraph TF_AGGREGATE["Grid Aggregation"]
-            TF_MAPS["Build Maps<br/>(tier, SNR, symmetry, FWHM, orientation)"]
+            TF_MAPS["Build Maps<br/>(tier, SNR, pair_fraction, FWHM,<br/>orientation, orientation_confidence)"]
             TF_G6{{"Gate G6: Detection Rate<br/>tier_a_fraction >= 5%<br/><b>DEGRADE on failure</b>"}}
             TF_G7{{"Gate G7: SNR Quality<br/>median_snr_tier_a >= 5.0<br/><b>DEGRADE on failure</b>"}}
-            TF_G8{{"Gate G8: Symmetry<br/>mean_symmetry_tier_a >= 0.3<br/><b>DEGRADE on failure</b>"}}
+            TF_G8{{"Gate G8: Pair Fraction<br/>mean_pair_fraction_tier_a >= 0.3<br/><b>DEGRADE on failure</b>"}}
         end
 
         TF_TIER --> TF_MAPS --> TF_G6 --> TF_G7 --> TF_G8
@@ -142,7 +151,10 @@ flowchart TB
     subgraph GPA["7/9 GPA (optional, --no-gpa to skip)"]
         direction TB
 
+        GPA_ENTRY{{"Entry Gate<br/>Skip if guidance='none'<br/>or tier_a_fraction < 10%"}}
         GPA_MODE["Mode Selection<br/>(auto / full / region)"]
+
+        GPA_ENTRY --> GPA_MODE
 
         subgraph GPA_REF["Reference Region Selection"]
             GPA_CC["Connected Components<br/>of Tier A tiles"]
@@ -153,16 +165,16 @@ flowchart TB
         GPA_MODE --> GPA_CC --> GPA_SCORE --> GPA_G9
 
         subgraph GPA_PHASE["Phase Extraction (per g-vector)"]
-            GPA_GMASK["<b>Gaussian Mask</b><br/>Centered on g-peak<br/>in frequency space<br/><i>DC clamp: sigma <= 0.18 x min|g|</i>"]
+            GPA_GMASK["<b>Gaussian Mask</b><br/>Centered on g-peak<br/>sigma = median(FWHM)<br/><i>DC clamp: sigma <= 0.18 x min|g|</i>"]
             GPA_FILTER["Filtered FFT Component<br/>FT_shifted x mask"]
             GPA_DEMOD["<b>Subpixel Demodulation</b><br/>Phase ramp removal<br/>exp(-2j*pi*(gx*x + gy*y))"]
-            GPA_UNWRAP["<b>Phase Unwrapping</b><br/>skimage.restoration"]
+            GPA_UNWRAP["<b>Phase Unwrapping</b><br/>skimage.restoration<br/><i>Zeroed outside amp mask<br/>NaN after unwrap</i>"]
             GPA_AMPMASK["<b>Amplitude Masking</b><br/>Threshold + 2x erosion"]
         end
 
         GPA_G9 --> GPA_GMASK --> GPA_FILTER --> GPA_DEMOD --> GPA_UNWRAP --> GPA_AMPMASK
 
-        GPA_G10{{"Gate G10: Phase Noise<br/>sigma_phi<=0.3 rad, unwrap>=70%<br/><b>SKIP_STAGE on failure</b>"}}
+        GPA_G10{{"Gate G10: Phase Noise<br/>sigma_phi<=0.3 rad<br/>ref-region unwrap>=70%<br/><b>SKIP_STAGE on failure</b>"}}
         GPA_AMPMASK --> GPA_G10
 
         subgraph GPA_STRAIN["Displacement & Strain"]
@@ -181,7 +193,7 @@ flowchart TB
         direction TB
 
         subgraph PF_BANDPASS["Bandpass Filtering"]
-            PF_RING["<b>Ring Mask in FFT Space</b><br/>Centered on |g_dom|<br/>bandwidth +/-30%<br/>Cosine taper at edges<br/><i>Zeroed below q_min</i>"]
+            PF_RING["<b>Directional Mask in FFT Space</b><br/>±g angular wedges (±30° half-width)<br/>bandwidth +/-30%<br/>Cosine taper at edges<br/><i>Zeroed below q_min<br/>Fallback: full ring if no g-vectors</i>"]
             PF_IFFT["Inverse FFT<br/>(filtered real-space image)"]
         end
 
@@ -197,7 +209,7 @@ flowchart TB
 
         subgraph PF_LATTICE["Lattice Validation"]
             PF_KDTREE["KDTree Nearest-Neighbor<br/>Distance Computation"]
-            PF_VALID["Fraction Valid<br/>|NN_dist - expected_d| / expected_d <= 20%"]
+            PF_VALID["Fraction Valid<br/>|NN_dist - expected_d| / expected_d <= tol<br/><i>Adaptive tolerance from IQR<br/>when >= 10 peaks</i>"]
             PF_G12{{"Gate G12: Lattice Consistency<br/>fraction_valid >= 50%<br/><b>DEGRADE on failure</b>"}}
         end
 
@@ -231,11 +243,11 @@ flowchart TB
             subgraph OUT_NPY["NumPy Binary"]
                 direction LR
                 ART_TIER[("tier_map.npy<br/><i>uint8 (n_rows, n_cols)<br/>0=skip, 1=reject, 2=B, 3=A</i>")]
-                ART_PEAKS[("atom_peaks.npy<br/><i>float64 (N, 5)<br/>x, y, intensity, sigma_x, sigma_y</i>")]
+                ART_PEAKS[("lattice_peaks.npy<br/><i>float64 (N, 5)<br/>x, y, intensity, sigma_x, sigma_y</i>")]
             end
         end
 
-        subgraph OUT_VIZ["PNG Visualizations (17 files, --no-viz to skip, --viz-dpi to set resolution)"]
+        subgraph OUT_VIZ["PNG Visualizations (24 files, --no-viz to skip, --viz-dpi to set resolution)"]
             direction TB
 
             subgraph VIZ_ROW1["Input + Global FFT (3 files)"]
@@ -277,6 +289,17 @@ flowchart TB
             subgraph VIZ_ROW6["Peak Finding (1 file)"]
                 direction LR
                 VIZ_LATTICE[("peaks_lattice_overlay.png<br/><i>Bandpass image + cyan peaks<br/>NN connections:<br/>lime=valid, red=invalid</i>")]
+            end
+
+            subgraph VIZ_ROW7["Diagnostics (7 files)"]
+                direction LR
+                VIZ_ROI[("roi_mask_overlay.png<br/><i>Raw image + ROI contour<br/>LCC highlighted</i>")]
+                VIZ_BGRESID[("globalfft_background_residual.png<br/><i>q vs residual<br/>q_fit_min marked</i>")]
+                VIZ_REFBND[("tiles_reference_boundary.png<br/><i>Tier map + reference<br/>region contour</i>")]
+                VIZ_EXEMPLAR[("tiles_exemplar_ffts.png<br/><i>3×2 grid of representative<br/>tile power spectra</i>")]
+                VIZ_PHASENOISE[("gpa_phase_noise_histogram.png<br/><i>Phase distribution<br/>in reference region</i>")]
+                VIZ_STRAINOUT[("gpa_strain_outlier_map.png<br/><i>Binary overlay of<br/>strain outlier pixels</i>")]
+                VIZ_NNHIST[("peaks_nn_distance_histogram.png<br/><i>NN distance distribution<br/>expected-d line + tol band</i>")]
             end
         end
     end
@@ -337,6 +360,14 @@ flowchart TB
     PEAKFIND -->|"lattice_validation"| ART_PEAKSTATS
     PEAKFIND -->|"peaks + bandpass_image<br/>+ lattice_validation"| VIZ_LATTICE
 
+    ROI -->|"mask + diagnostics"| VIZ_ROI
+    GLOBAL_FFT -->|"background residual"| VIZ_BGRESID
+    TILE_FFT -->|"tier_map + ref region"| VIZ_REFBND
+    TILE_FFT -->|"tile power spectra"| VIZ_EXEMPLAR
+    GPA -->|"phase in ref region"| VIZ_PHASENOISE
+    GPA -->|"strain outliers"| VIZ_STRAINOUT
+    PEAKFIND -->|"NN distances"| VIZ_NNHIST
+
     VALIDATION -->|"config + all results"| ART_PARAMS
     VALIDATION -->|"gates, summary"| ART_REPORT
 
@@ -346,17 +377,17 @@ flowchart TB
 
     %% Noise filter / signal processing nodes (orange)
     classDef filterNode fill:#fff3e0,stroke:#e65100,stroke-width:2px,color:#e65100
-    class IN_QMIN,PA_HOT,PA_CLIP,PA_NORM,PB_CLIP,PB_NORM,PB_GAUSS filterNode
-    class ROI_INT,ROI_VAR,ROI_FILL,ROI_OPEN,ROI_SMOOTH filterNode
+    class IN_QMIN,IN_PHYSICS,PA_HOT,PA_CLIP,PA_NORM,PB_CLIP,PB_NORM,PB_GAUSS filterNode
+    class ROI_INT,ROI_VAR,ROI_FILL,ROI_OPEN,ROI_SMOOTH,ROI_GRAD filterNode
     class GF_HANN,GF_RADIAL,GF_POLY,GF_NOISE,GF_SAVGOL filterNode
-    class TF_HANN,TF_DC,TF_LOCALMAX,TF_SNR,TF_FWHM filterNode
-    class GPA_GMASK,GPA_DEMOD,GPA_UNWRAP,GPA_AMPMASK,GPA_SMOOTH filterNode
+    class TF_HANN,TF_DC,TF_LOCALMAX,TF_SNR,TF_FWHM,TF_ORIENT filterNode
+    class GPA_GMASK,GPA_DEMOD,GPA_UNWRAP,GPA_AMPMASK,GPA_SMOOTH,GF_GUIDANCE,GF_DIAG filterNode
     class PF_RING,PF_LOCALMAX,PF_THRESH filterNode
 
     %% Gate nodes (purple/red)
     classDef gateNode fill:#fce4ec,stroke:#c62828,stroke-width:2px,color:#b71c1c
-    class IN_G1,PA_G2,ROI_G3,GF_G4,TF_G5,TF_G6,TF_G7,TF_G8 gateNode
-    class GPA_G9,GPA_G10,GPA_G11,PF_G12 gateNode
+    class IN_G0,IN_G1,PA_G2,ROI_G3,GF_G4,TF_G5,TF_G6,TF_G7,TF_G8 gateNode
+    class GPA_ENTRY,GPA_G9,GPA_G10,GPA_G11,PF_G12 gateNode
 
     %% Data artifact nodes (green)
     classDef artifactNode fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#1b5e20
@@ -371,6 +402,8 @@ flowchart TB
     class VIZ_UX,VIZ_UY vizNode
     class VIZ_EXX,VIZ_EYY,VIZ_EXY,VIZ_ROT vizNode
     class VIZ_LATTICE vizNode
+    class VIZ_ROI,VIZ_BGRESID,VIZ_REFBND,VIZ_EXEMPLAR vizNode
+    class VIZ_PHASENOISE,VIZ_STRAINOUT,VIZ_NNHIST vizNode
 
     %% Stage subgraph styling
     classDef stageSubgraph fill:#e3f2fd,stroke:#1565c0,stroke-width:2px

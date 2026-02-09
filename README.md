@@ -1,6 +1,6 @@
 # STEM Domain Analysis
 
-Automated crystal domain segmentation and orientation mapping for STEM-HAADF (Scanning Transmission Electron Microscopy - High-Angle Annular Dark-Field) images.
+Automated crystal domain segmentation and orientation mapping for STEM-HAADF and EFTEM bright-field (zero-loss filtered) images.
 
 ## Overview
 
@@ -9,7 +9,7 @@ This toolkit processes large-scale STEM images to:
 - **Automatically discover diffraction peaks** without prior material knowledge
 - **Map crystal orientations** using diffraction peak localization
 - **Extract strain fields** via Geometric Phase Analysis (GPA)
-- **Validate results** with a 12-gate quality control system
+- **Validate results** with a 13-gate quality control system (G0-G12)
 - **Generate quantitative metrics** for domain size, shape, and orientation distributions
 
 ## Pipeline Architecture
@@ -82,7 +82,7 @@ flowchart TD
 ```mermaid
 flowchart TD
     subgraph Input["Input"]
-        A[DM4/TIFF/NPY Image<br/>Gate G1: Input Validation]
+        A[DM4/TIFF/NPY Image<br/>Gate G0: Nyquist Guard<br/>Gate G1: Input Validation]
     end
 
     subgraph Preprocess["Two-Branch Preprocessing"]
@@ -91,28 +91,28 @@ flowchart TD
     end
 
     subgraph ROI["Early ROI"]
-        C["Intensity + Variance Mask<br/>Gate G3"]
+        C["Intensity + Variance Mask<br/>Gradient fallback + LCC fraction<br/>Gate G3"]
     end
 
     subgraph GlobalFFT["Global FFT"]
-        D["Radial Profile + Background Fit<br/>G-vector Extraction<br/>Gate G4"]
+        D["Constrained Background Fit<br/>G-vector Extraction<br/>FFT Guidance Strength<br/>Gate G4"]
     end
 
     subgraph TileFFT["Tile FFT + Two-Tier SNR"]
-        E["Per-tile FFT + Peak Detection<br/>Gate G5: Tiling Adequacy"]
-        F["Two-Tier Classification<br/>Tier A: SNR >= 5.0<br/>Tier B: SNR 3.0-5.0<br/>Gates G6, G7, G8"]
+        E["SNR-first Peak Detection<br/>Unified q-based DC suppression<br/>Gate G5: Tiling Adequacy"]
+        F["Two-Tier Classification<br/>Tier A: SNR >= 5.0<br/>Tier B: SNR 3.0-5.0<br/>FWHM-scaled tolerances<br/>Gates G6, G7, G8"]
     end
 
-    subgraph GPA["GPA (optional)"]
-        G["Mode Selection: auto/full/region<br/>Phase Extraction + Unwrapping<br/>Strain Field Computation<br/>Gates G9, G10, G11"]
+    subgraph GPA["GPA (optional, skips on weak evidence)"]
+        G["Entry gate: guidance + tier check<br/>Restricted phase unwrapping<br/>Ref-region unwrap success<br/>Gates G9, G10, G11"]
     end
 
     subgraph PeakFinding["Peak Finding (optional)"]
-        H["Bandpass-Filtered Image<br/>Subpixel Peak Detection<br/>NN-Distance Lattice Validation<br/>Gate G12"]
+        H["Directional ±g Bandpass Mask<br/>Subpixel Peak Detection<br/>Adaptive NN-Distance Validation<br/>Gate G12"]
     end
 
     subgraph Reporting["Validation + Reporting"]
-        I["12-Gate Evaluation<br/>parameters.json v3.0<br/>report.json"]
+        I["13-Gate Evaluation (G0-G12)<br/>parameters.json v3.0<br/>report.json + pipeline_flow"]
     end
 
     A --> B1 & B2
@@ -130,6 +130,49 @@ flowchart TD
     style GPA fill:#f3e5f5
     style Reporting fill:#fff3e0
 ```
+
+---
+
+## What's New (v3.1) -- EFTEM Bright-Field Upgrade
+
+### Physics-Aware Configuration
+- **`PhysicsConfig`** with d-range bounds (`d_min_nm`, `d_max_nm`), imaging mode, and Nyquist safety margin
+- **Gate G0 (Nyquist Guard)**: Auto-clamps analysis q-range to 0.95 x q_nyquist when d_min violates sampling theorem; FATAL if entire band is invalid
+- New CLI flags: `--physics-d-min`, `--physics-d-max`, `--imaging-mode`
+
+### Robust Background Fitting
+- Constrained polynomial background: degree 3 (cap 4) with `q_fit_min` to exclude low-q oscillations
+- **FFT guidance strength** classification ("strong"/"weak"/"none") controls downstream GPA eligibility
+- Background residual diagnostics: median|res|, MAD, neg-excursion fraction near peaks
+- FWHM-scaled antipodal pairing tolerance (was fixed 5% of q)
+
+### Improved Tile Classification
+- **SNR-first peak detection** replaces amplitude-percentage thresholds
+- Unified q-based DC suppression via `TileFFTConfig.q_dc_min` (single code path)
+- `symmetry_score` renamed to `pair_fraction` (with one-cycle deprecation alias)
+- FWHM-scaled symmetry tolerance (scales with measured peak width)
+- **Orientation confidence** (circular concentration R) per tile -- diagnostic-only
+
+### ROI Robustness
+- **Gradient-magnitude fallback** when primary mask fails coverage or LCC check
+- **LCC fraction** (largest connected component / total mask) as primary G3 metric
+- Full-image ROI forced with `roi_confidence = "low"` when all fallbacks exhausted
+
+### GPA Safety Gates
+- GPA skips when FFT guidance is "none" or Tier A fraction < 10%
+- Phase unwrapping restricted to amplitude-valid regions (zero before, NaN after)
+- **Reference-region unwrap success** metric for G10 (was global metric)
+- Mask sigma uses median(FWHM) instead of min (robust to outliers)
+
+### Lattice-Feature Validation
+- **Directional ±g angular wedge masks** replace full-ring bandpass (suppresses non-lattice noise)
+- **Adaptive NN tolerance** from IQR when >= 10 peaks (tighter for regular lattices)
+- `atom_peaks.npy` renamed to `lattice_peaks.npy`
+
+### Expanded Diagnostics
+- 7 new diagnostic visualizations: ROI overlay, background residual, reference boundary, tile exemplar FFTs, phase noise histogram, strain outlier map, NN distance histogram
+- `parameters.json` includes `derived_cutoffs`, `physics`, `background_diagnostics`, and `pipeline_flow` sections
+- Pipeline flow tracking: stages completed, skipped, degraded, with reasons
 
 ---
 
@@ -155,8 +198,8 @@ flowchart TD
 - Subpixel-correct demodulation via real-space phase ramp
 - Phase unwrapping without zero-forcing, with eroded amplitude post-mask
 
-### 12-Gate Quality Control
-- Gates G1-G12 covering input validation, preprocessing, ROI geometry, FFT viability, tiling adequacy, SNR quality, symmetry, reference region, phase noise, strain sanity, and lattice consistency
+### 13-Gate Quality Control
+- Gates G0-G12 covering Nyquist guard, input validation, preprocessing, ROI geometry, FFT viability, tiling adequacy, SNR quality, pair fraction, reference region, phase noise, strain sanity, and lattice consistency
 - Four failure behaviors: FATAL, SKIP_STAGE, DEGRADE_CONFIDENCE, FALLBACK
 
 ### Peak Finding with Lattice Validation
@@ -200,7 +243,7 @@ flowchart TD
 - **Adaptive Threshold Calibration** -- Sets threshold based on actual peak intensity
 - **Two-Tier SNR Gating** -- Separates high-confidence from weak-evidence tiles
 - **GPA Strain Mapping** -- Full-image or region-wise strain field extraction
-- **12-Gate Validation** -- Comprehensive quality control from input to output
+- **13-Gate Validation** -- Comprehensive quality control from Nyquist guard to output
 - **Spatial Coherence Validation** -- Detects when results are noise vs. real domains
 - **Orientation Mapping** -- Color-coded visualization of crystal orientations
 - **Domain Metrics** -- Area, perimeter, circularity, orientation statistics
@@ -252,6 +295,9 @@ python analyze.py sample.dm4 --hybrid --auto-discover --no-gpa
 
 # Custom SNR thresholds
 python analyze.py sample.dm4 --hybrid --auto-discover --snr-tier-a 4.0 --snr-tier-b 2.5
+
+# EFTEM bright-field with physics constraints
+python analyze.py sample.dm4 --hybrid --auto-discover --physics-d-min 0.4 --physics-d-max 1.5 --imaging-mode EFTEM-BF
 ```
 
 ### Classic Auto-Discovery Mode
@@ -324,6 +370,11 @@ Hybrid Pipeline:
   --no-peak-finding       Skip peak-finding stage
   --report-format {json,html,both}
                           Report output format (default: json)
+
+Physics & EFTEM:
+  --physics-d-min FLOAT   Expected minimum d-spacing in nm (default: 0.4)
+  --physics-d-max FLOAT   Expected maximum d-spacing in nm (default: 1.5)
+  --imaging-mode STR      Imaging mode label (default: EFTEM-BF)
 
 Peak Detection (E3):
   --peak-method {max,percentile95}
@@ -405,7 +456,7 @@ Output is saved to `outputs/<input_filename>/` by default.
 | `tier_map.npy` | Tile classification map (0=skip, 1=rejected, 2=Tier B, 3=Tier A) |
 | `gpa_mode_decision.json` | GPA mode selection metrics and confidence *(when GPA enabled)* |
 | `gpa_reference.json` | Reference region details *(when GPA enabled)* |
-| `atom_peaks.npy` | Subpixel peak positions (N x 5: x, y, intensity, sigma_x, sigma_y) *(when peak-finding enabled)* |
+| `lattice_peaks.npy` | Subpixel lattice-feature positions (N x 5: x, y, intensity, sigma_x, sigma_y) *(when peak-finding enabled)* |
 | `peak_stats.json` | NN-distance statistics and lattice validation *(when peak-finding enabled)* |
 
 ## How Auto-Discovery Works
@@ -446,20 +497,21 @@ Raw FFT profiles show a strong power-law decay that masks diffraction peaks:
 
 ## Quality Gates (Hybrid Pipeline)
 
-The hybrid pipeline evaluates 12 quality gates at each stage:
+The hybrid pipeline evaluates 13 quality gates (G0-G12) at each stage:
 
 | Gate | Metric | Default Threshold | On Failure |
 |------|--------|-------------------|------------|
+| **G0** | Nyquist guard (d_min vs sampling) | q_max < 0.95 × q_nyquist | DEGRADE (auto-clamp) / FATAL |
 | **G1** | Input validity (2D, no NaN, >=512x512) | pass/fail | FATAL |
 | **G2** | Preprocessing quality (clipped fraction, range ratio) | <0.5%, >10 | DEGRADE_CONFIDENCE |
-| **G3** | ROI geometry (coverage, fragmentation) | 10-95%, <=20 components | FALLBACK |
+| **G3** | ROI geometry (coverage, LCC fraction, fragments) | 10-95%, LCC>=0.5, <=20 | FALLBACK |
 | **G4** | Global FFT viability (best peak SNR) | >=3.0 | FALLBACK |
-| **G5** | Tiling adequacy (periods per tile) | >=20 | FATAL |
+| **G5** | Tiling adequacy (periods per tile, d-aware) | >=20 | FATAL |
 | **G6** | Tier A detection rate | >=5% of ROI tiles | DEGRADE_CONFIDENCE |
 | **G7** | Tier A SNR quality (median) | >=5.0 | DEGRADE_CONFIDENCE |
-| **G8** | Symmetry quality (mean score) | >=0.3 | DEGRADE_CONFIDENCE |
+| **G8** | Pair fraction quality (mean score) | >=0.3 | DEGRADE_CONFIDENCE |
 | **G9** | Reference region quality | area>=9, entropy<=0.3, SNR>=5.0 | SKIP_STAGE |
-| **G10** | GPA phase noise + unwrap quality | sigma<=0.3 rad, unwrap>=70% | SKIP_STAGE |
+| **G10** | GPA phase noise + ref-region unwrap | sigma<=0.3 rad, ref unwrap>=70% | SKIP_STAGE |
 | **G11** | GPA strain sanity | ref strain<=0.005, outliers<=20% | SKIP_STAGE |
 | **G12** | Peak lattice consistency | >=50% valid NN distances | DEGRADE_CONFIDENCE |
 
@@ -521,14 +573,24 @@ q_scale = 1 / (N * pixel_size_nm)    cycles/nm per FFT pixel
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
+| `physics.d_min_nm` | 0.4 | Expected minimum d-spacing (nm) |
+| `physics.d_max_nm` | 1.5 | Expected maximum d-spacing (nm) |
+| `physics.imaging_mode` | EFTEM-BF | Imaging mode label |
+| `physics.nyquist_safety_margin` | 0.95 | Clamp q_max to this fraction of q_nyquist |
 | `tier_a_snr` | 5.0 | High-confidence SNR threshold |
 | `tier_b_snr` | 3.0 | Weak-evidence SNR threshold |
+| `tile_fft.q_dc_min` | 0.25 | DC suppression cutoff (cycles/nm) |
+| `tile_fft.peak_snr_threshold` | 2.5 | SNR-first tile peak detection threshold |
+| `global_fft.q_fit_min` | 0.30 | Background fit low-q exclusion (cycles/nm) |
+| `global_fft.background_default_degree` | 3 | Polynomial degree (max 4) |
 | `gpa.mode` | auto | GPA mode: auto, full, or region |
 | `gpa.displacement_smooth_sigma` | 2.0 px | Gaussian smoothing before strain gradients |
 | `gpa.amplitude_threshold` | 0.1 | Fraction of max amplitude for phase mask |
 | `gpa.max_phase_noise` | 0.3 rad | G10 phase noise threshold |
 | `peak_finding.min_separation_factor` | 0.6 | min_sep = factor * d_expected_px |
 | `peak_finding.bandpass_bandwidth` | 0.3 | Bandwidth as fraction of \|g_dom\| |
+| `peak_finding.angular_width_deg` | 30.0 | Half-width of directional wedge mask |
+| `roi.min_lcc_fraction` | 0.5 | LCC fraction threshold for G3 |
 
 ## Python API
 
@@ -588,7 +650,7 @@ from src.validation import validate_pipeline
 from src.reporting import save_pipeline_artifacts
 
 # Configure
-config = PipelineConfig(pixel_size_nm=0.127)
+config = PipelineConfig(pixel_size_nm=0.1297)
 fft_grid = FFTGrid(height, width, config.pixel_size_nm)
 
 # Branch A: FFT-safe preprocessing (no blur)
@@ -642,8 +704,9 @@ save_pipeline_artifacts(output_dir, config=config, fft_grid=fft_grid,
 | `src/reference_selection.py` | GPA reference region selection (Tier A tiles only) |
 | `src/gpa.py` | GPA engine: full-image and region-wise modes, strain fields |
 | `src/peak_finding.py` | Subpixel peak detection with lattice validation |
-| `src/validation.py` | Unified 12-gate evaluation and `ValidationReport` |
+| `src/validation.py` | Unified 13-gate evaluation (G0-G12) and `ValidationReport` |
 | `src/reporting.py` | JSON/artifact output, parameters.json v3.0 |
+| `src/hybrid_viz.py` | PNG visualization orchestrator (24 artifacts) |
 
 ### Legacy Modules
 
