@@ -182,6 +182,7 @@ class GatedTileGrid:
     skipped_mask: np.ndarray        # (n_rows, n_cols) bool
     tier_summary: TierSummary
     orientation_confidence_map: Optional[np.ndarray] = None  # (n_rows, n_cols) float
+    detection_confidence_map: Optional[np.ndarray] = None  # (n_rows, n_cols) float [0,1], diagnostic only
 
     @property
     def symmetry_map(self) -> np.ndarray:
@@ -402,6 +403,22 @@ class FWHMConfig:
 
 
 @dataclass
+class ConfidenceConfig:
+    """Detection confidence heatmap weights.
+
+    Produces an ordinal score for visualization only — not consumed by
+    gates, tier assignment, or any classification logic (DC-1, DC-2).
+    Weights are normalized at runtime so they need not sum to 1.0.
+    """
+    enabled: bool = True
+    w_snr: float = 0.40
+    w_pair_fraction: float = 0.20
+    w_orientation_confidence: float = 0.15
+    w_non_collinearity: float = 0.10
+    w_fwhm_quality: float = 0.15
+
+
+@dataclass
 class PeakGateConfig:
     """Peak quality gate thresholds."""
     max_fwhm_ratio: float = 0.15
@@ -540,6 +557,7 @@ class PipelineConfig:
     low_q: LowQExclusionConfig = field(default_factory=LowQExclusionConfig)
     physics: PhysicsConfig = field(default_factory=PhysicsConfig)
     tile_fft: TileFFTConfig = field(default_factory=TileFFTConfig)
+    confidence: ConfidenceConfig = field(default_factory=ConfidenceConfig)
 
     def to_dict(self) -> dict:
         """Serialise to a JSON-safe dict."""
@@ -569,6 +587,7 @@ class PipelineConfig:
             "low_q": (LowQExclusionConfig, "low_q"),
             "physics": (PhysicsConfig, "physics"),
             "tile_fft": (TileFFTConfig, "tile_fft"),
+            "confidence": (ConfidenceConfig, "confidence"),
         }
         for attr, (klass, key) in _mapping.items():
             if key in d and isinstance(d[key], dict):

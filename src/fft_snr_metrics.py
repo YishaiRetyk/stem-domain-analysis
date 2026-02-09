@@ -13,13 +13,56 @@ from typing import List, Optional
 
 from src.pipeline_config import (
     TilePeakSet, TileClassification, TierSummary, GatedTileGrid,
-    TierConfig, PeakGateConfig, FWHMConfig,
+    TierConfig, PeakGateConfig, FWHMConfig, ConfidenceConfig,
 )
 from src.fft_coords import FFTGrid
 from src.fft_peak_detection import classify_tile
 from src.gates import evaluate_gate
 
 logger = logging.getLogger(__name__)
+
+
+def compute_tile_confidence(tc, tier_config, peak_gate_config, conf_config):
+    """Per-tile detection confidence — ordinal score in [0, 1].
+
+    Diagnostic only: not consumed by gates or tier assignment (DC-1).
+    Score is comparative/ordinal, not probabilistic (DC-2).
+    """
+    if tc is None or tc.tier == "REJECTED":
+        return 0.0
+
+    # SNR: piecewise linear, 0 at tier_b_snr, 1 at 2×tier_a_snr
+    snr_floor = tier_config.tier_b_snr
+    snr_ceil = 2.0 * tier_config.tier_a_snr
+    snr_norm = np.clip((tc.best_snr - snr_floor) / (snr_ceil - snr_floor + 1e-10), 0, 1)
+
+    pf = np.clip(tc.pair_fraction, 0, 1)
+    oc = np.clip(tc.orientation_confidence, 0, 1)
+
+    # Binary: encodes lattice dimensionality (1D vs 2D), not strength (DC-3)
+    nc = 1.0 if tc.n_non_collinear >= peak_gate_config.min_non_collinear else 0.0
+
+    # FWHM quality: best peak's fwhm/q_mag ratio vs max_fwhm_ratio (DC-4)
+    fwhm_q = 0.0
+    if tc.peaks:
+        valid = [p for p in tc.peaks if p.get("fwhm_valid") and p.get("q_mag", 0) > 0]
+        if valid:
+            best = min(valid, key=lambda p: p["fwhm"] / p["q_mag"])
+            fwhm_q = np.clip(
+                1.0 - (best["fwhm"] / best["q_mag"]) / peak_gate_config.max_fwhm_ratio,
+                0, 1
+            )
+
+    w = conf_config
+    w_total = (w.w_snr + w.w_pair_fraction + w.w_orientation_confidence
+               + w.w_non_collinearity + w.w_fwhm_quality)
+    score = (w.w_snr * snr_norm
+             + w.w_pair_fraction * pf
+             + w.w_orientation_confidence * oc
+             + w.w_non_collinearity * nc
+             + w.w_fwhm_quality * fwhm_q) / (w_total + 1e-10)
+
+    return float(np.clip(score, 0, 1))
 
 
 def build_gated_tile_grid(peak_sets: List[TilePeakSet],
@@ -31,6 +74,7 @@ def build_gated_tile_grid(peak_sets: List[TilePeakSet],
                           fwhm_config: FWHMConfig = None,
                           log_interval_s: float = 5.0,
                           effective_q_min: float = 0.0,
+                          confidence_config: ConfidenceConfig = None,
                           ) -> GatedTileGrid:
     """Classify all tiles and build the unified GatedTileGrid.
 
@@ -131,6 +175,18 @@ def build_gated_tile_grid(peak_sets: List[TilePeakSet],
     logger.info(msg)
     print(msg, flush=True)
 
+    # --- Detection confidence (diagnostic only, computed post-classification) ---
+    detection_confidence_map = None
+    if confidence_config is None:
+        confidence_config = ConfidenceConfig()
+    if confidence_config.enabled:
+        detection_confidence_map = np.zeros((n_rows, n_cols), dtype=np.float64)
+        for r in range(n_rows):
+            for c in range(n_cols):
+                tc = classifications[r, c]
+                detection_confidence_map[r, c] = compute_tile_confidence(
+                    tc, tier_config, peak_gate_config, confidence_config)
+
     # Tier summary
     tier_a_mask = tier_map == "A"
     tier_b_mask = tier_map == "B"
@@ -179,4 +235,5 @@ def build_gated_tile_grid(peak_sets: List[TilePeakSet],
         skipped_mask=skipped_mask,
         tier_summary=tier_summary,
         orientation_confidence_map=orientation_confidence_map,
+        detection_confidence_map=detection_confidence_map,
     )

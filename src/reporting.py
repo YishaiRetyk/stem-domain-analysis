@@ -211,6 +211,35 @@ def build_parameters_v3(
             "min_non_collinear": config.peak_gates.min_non_collinear,
         }
 
+    # Detection confidence (diagnostic only)
+    if gated_grid is not None and gated_grid.detection_confidence_map is not None:
+        conf_map = gated_grid.detection_confidence_map
+        valid = conf_map[~gated_grid.skipped_mask]
+        cc = config.confidence
+        params["detection_confidence"] = {
+            "note": "Ordinal diagnostic score for visualization. Not calibrated as probability.",
+            "weights": {
+                "snr": cc.w_snr,
+                "pair_fraction": cc.w_pair_fraction,
+                "orientation_confidence": cc.w_orientation_confidence,
+                "non_collinearity": cc.w_non_collinearity,
+                "fwhm_quality": cc.w_fwhm_quality,
+            },
+            "normalization": {
+                "snr_floor": config.tier.tier_b_snr,
+                "snr_ceil": 2.0 * config.tier.tier_a_snr,
+                "fwhm_reference": config.peak_gates.max_fwhm_ratio,
+                "non_collinear_threshold": config.peak_gates.min_non_collinear,
+            },
+            "statistics": {
+                "mean": float(np.mean(valid)) if len(valid) > 0 else 0.0,
+                "median": float(np.median(valid)) if len(valid) > 0 else 0.0,
+                "std": float(np.std(valid)) if len(valid) > 0 else 0.0,
+                "min": float(np.min(valid)) if len(valid) > 0 else 0.0,
+                "max": float(np.max(valid)) if len(valid) > 0 else 0.0,
+            },
+        }
+
     # GPA
     if gpa_result is not None:
         gpa_section: Dict[str, Any] = {
@@ -503,6 +532,12 @@ def save_pipeline_artifacts(
         tier_path = output_dir / "tier_map.npy"
         save_npy(encoded, tier_path)
         saved["tier_map.npy"] = tier_path
+
+        # --- detection_confidence_map.npy ---
+        if gated_grid.detection_confidence_map is not None:
+            conf_path = output_dir / "detection_confidence_map.npy"
+            save_npy(gated_grid.detection_confidence_map.astype(np.float32), conf_path)
+            saved["detection_confidence_map.npy"] = conf_path
 
     # --- lattice_peaks.npy ---
     if peaks is not None and len(peaks) > 0:

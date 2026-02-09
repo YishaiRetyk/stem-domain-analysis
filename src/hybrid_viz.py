@@ -76,6 +76,10 @@ def save_pipeline_visualizations(
         _try("tiles_orientation_map",
              _save_orientation_map, gated_grid, out, dpi)
 
+        if gated_grid.detection_confidence_map is not None:
+            _try("detection_confidence_heatmap",
+                 _save_detection_confidence_heatmap, gated_grid, out, dpi)
+
     # 7-10. GPA phase + amplitude
     if gpa_result is not None and gpa_result.phases:
         for i, (key, phase_result) in enumerate(gpa_result.phases.items()):
@@ -313,6 +317,32 @@ def _save_orientation_map(gated_grid, out_dir, dpi):
                    origin="upper", interpolation="nearest")
     plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Orientation (deg)")
     ax.set_title("Tile Orientation Map")
+    ax.set_xlabel("Column")
+    ax.set_ylabel("Row")
+
+    plt.savefig(str(path), dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Saved: %s", path)
+    return path
+
+
+def _save_detection_confidence_heatmap(gated_grid, out_dir, dpi):
+    """Detection confidence heatmap (ordinal, diagnostic only)."""
+    path = out_dir / "detection_confidence_heatmap.png"
+    _ensure_dir(path)
+
+    conf = gated_grid.detection_confidence_map.astype(float)
+    conf_masked = np.ma.masked_where(gated_grid.skipped_mask, conf)
+
+    cmap = plt.cm.magma.copy()
+    cmap.set_bad("gray")
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    im = ax.imshow(conf_masked, cmap=cmap, vmin=0, vmax=1,
+                   origin="upper", interpolation="nearest")
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04,
+                 label="Detection Confidence (ordinal)")
+    ax.set_title("Detection Confidence Heatmap")
     ax.set_xlabel("Column")
     ax.set_ylabel("Row")
 

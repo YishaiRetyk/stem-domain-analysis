@@ -981,6 +981,7 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
         peak_sets, skipped_mask, tile_fft_grid, config.tile_size,
         tier_config=config.tier, peak_gate_config=config.peak_gates,
         effective_q_min=tile_effective_q_min,
+        confidence_config=config.confidence,
     )
 
     # Free tile power spectra — no longer needed after classification
@@ -1117,6 +1118,17 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
         effective_q_min=effective_q_min,
         tile_effective_q_min=tile_effective_q_min,
     )
+
+    # --- ilastik comparison (exploratory, optional) ---
+    if args.ilastik_map and gated_grid is not None:
+        try:
+            from src.ilastik_compare import run_ilastik_comparison
+            ilastik_result = run_ilastik_comparison(
+                gated_grid, args.ilastik_map, output_path, config.viz.dpi)
+            print(f"  ilastik comparison saved ({len(ilastik_result)} artifacts)")
+        except Exception as e:
+            logger.warning("ilastik comparison failed: %s", e, exc_info=True)
+            print(f"  Warning: ilastik comparison failed: {e}")
 
     # --- PNG visualizations ---
     if config.viz.enabled:
@@ -1256,6 +1268,8 @@ Examples:
                         help='Expected maximum d-spacing in nm')
     parser.add_argument('--imaging-mode', type=str, default=None, dest='imaging_mode',
                         help='Imaging mode label (e.g., EFTEM-BF, STEM-HAADF)')
+    parser.add_argument('--ilastik-map', type=str, default=None, dest='ilastik_map',
+                        help='Path to ilastik probability map (.npy or .h5) for comparison')
 
     args = parser.parse_args()
     
