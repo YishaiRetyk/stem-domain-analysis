@@ -6,6 +6,7 @@ flowchart TB
     %% ============================================================
     %% 9-stage pipeline with two-branch preprocessing,
     %% two-tier SNR classification, quality gates G1-G12,
+    %% unified low-q / DC exclusion (effective_q_min),
     %% and 25 output artifacts (8 data + 17 PNG).
     %% ============================================================
 
@@ -14,8 +15,9 @@ flowchart TB
         IN_FILE["Input File<br/>.dm4 / .dm3 / .tiff / .npy"]
         IN_META["Metadata Extraction<br/>(pixel_size_nm)"]
         IN_GRID["FFTGrid Construction<br/>(canonical cycles/nm coords)"]
+        IN_QMIN["Compute effective_q_min<br/>(global + tile grids)<br/><i>--q-min override, --no-low-q-exclusion</i>"]
         IN_G1{{"Gate G1: Input Validation<br/>2D, no NaN/Inf, >=512x512<br/><b>FATAL on failure</b>"}}
-        IN_FILE --> IN_META --> IN_GRID --> IN_G1
+        IN_FILE --> IN_META --> IN_GRID --> IN_QMIN --> IN_G1
     end
 
     subgraph PREPROCESS["2-3/9 TWO-BRANCH PREPROCESSING"]
@@ -77,7 +79,7 @@ flowchart TB
 
         subgraph GFFT_RADIAL["Radial Profile Analysis"]
             GF_RADIAL["<b>Radial Binning</b><br/>Azimuthal averaging"]
-            GF_POLY["<b>Polynomial Background</b><br/>Degree 6, log-space<br/>Iterative MAD reweighting"]
+            GF_POLY["<b>Polynomial Background</b><br/>Degree 6, log-space<br/>Iterative MAD reweighting<br/><i>Fit excludes q < q_min</i>"]
             GF_NOISE["<b>Noise Floor</b><br/>MAD x 1.4826 of residuals"]
             GF_SAVGOL["<b>Savitzky-Golay Smooth</b><br/>window=11, polyorder=2"]
         end
@@ -109,7 +111,7 @@ flowchart TB
             TF_EXTRACT["Tile Extraction<br/>(256x256, stride 128)"]
             TF_HANN["<b>Hann Window</b><br/>2D outer product"]
             TF_FFT["2D FFT + Shift<br/>(batched GPU or sequential CPU)"]
-            TF_DC["<b>DC Masking</b><br/>radius 3px"]
+            TF_DC["<b>DC Masking</b><br/>q-based: q_mag < q_min<br/><i>Fallback: radius 3px when q_min=0</i>"]
             TF_QMASK["Q-range Filtering<br/>(seeded from global FFT)"]
             TF_LOCALMAX["<b>Local Max Detection</b><br/>5x5 footprint, threshold 10%"]
             TF_SUBPX["Subpixel Refinement<br/>(parabolic interpolation)"]
@@ -118,7 +120,7 @@ flowchart TB
         TF_G5 --> TF_EXTRACT --> TF_HANN --> TF_FFT --> TF_DC --> TF_QMASK --> TF_LOCALMAX --> TF_SUBPX
 
         subgraph TF_CLASS["Two-Tier Classification"]
-            TF_SNR["<b>Peak SNR Computation</b><br/>Signal disk r=3px<br/>Background annulus at |q|<br/>MAD-based noise: sigma = MAD x 1.4826<br/>SNR = (peak - median) / sigma"]
+            TF_SNR["<b>Peak SNR Computation</b><br/>Signal disk r=3px<br/>Background annulus at |q|<br/>Annulus guarded: q >= q_min<br/>MAD-based noise: sigma = MAD x 1.4826<br/>SNR = (peak - median) / sigma"]
             TF_FWHM["<b>Two-Stage FWHM</b><br/>All peaks: moment proxy (fast)<br/>Top-K high-SNR: curve_fit (accurate)<br/><i>FWHMConfig: auto mode, K=2</i>"]
             TF_SYM["Symmetry Check<br/>(+/-g pairing, tol 2px)"]
             TF_NONCOL["Non-Collinear Count<br/>(>15 deg separation)"]
@@ -151,7 +153,7 @@ flowchart TB
         GPA_MODE --> GPA_CC --> GPA_SCORE --> GPA_G9
 
         subgraph GPA_PHASE["Phase Extraction (per g-vector)"]
-            GPA_GMASK["<b>Gaussian Mask</b><br/>Centered on g-peak<br/>in frequency space"]
+            GPA_GMASK["<b>Gaussian Mask</b><br/>Centered on g-peak<br/>in frequency space<br/><i>DC clamp: sigma <= 0.18 x min|g|</i>"]
             GPA_FILTER["Filtered FFT Component<br/>FT_shifted x mask"]
             GPA_DEMOD["<b>Subpixel Demodulation</b><br/>Phase ramp removal<br/>exp(-2j*pi*(gx*x + gy*y))"]
             GPA_UNWRAP["<b>Phase Unwrapping</b><br/>skimage.restoration"]
@@ -179,7 +181,7 @@ flowchart TB
         direction TB
 
         subgraph PF_BANDPASS["Bandpass Filtering"]
-            PF_RING["<b>Ring Mask in FFT Space</b><br/>Centered on |g_dom|<br/>bandwidth +/-30%<br/>Cosine taper at edges"]
+            PF_RING["<b>Ring Mask in FFT Space</b><br/>Centered on |g_dom|<br/>bandwidth +/-30%<br/>Cosine taper at edges<br/><i>Zeroed below q_min</i>"]
             PF_IFFT["Inverse FFT<br/>(filtered real-space image)"]
         end
 
@@ -218,7 +220,7 @@ flowchart TB
 
             subgraph OUT_JSON["JSON"]
                 direction LR
-                ART_PARAMS[("parameters.json<br/><i>v3.0: all config, preproc,<br/>ROI, FFT, tier, GPA,<br/>peak, gate results</i>")]
+                ART_PARAMS[("parameters.json<br/><i>v3.0: all config, preproc,<br/>ROI, FFT, tier, GPA,<br/>peak, gate results,<br/>low_q_exclusion</i>")]
                 ART_REPORT[("report.json<br/><i>gates, pass/fail, summary,<br/>timestamp, diagnostics</i>")]
                 ART_GVEC[("global_g_vectors.json<br/><i>frequency_unit + gx,gy<br/>per g-vector</i>")]
                 ART_PEAKSTATS[("peak_stats.json<br/><i>fraction_valid, mean/std<br/>NN distance, n_peaks</i>")]
@@ -239,8 +241,8 @@ flowchart TB
             subgraph VIZ_ROW1["Input + Global FFT (3 files)"]
                 direction LR
                 VIZ_ORIG[("input_original.png<br/><i>Grayscale image<br/>with calibrated scale bar</i>")]
-                VIZ_RADIAL[("globalfft_radial_profile.png<br/><i>q vs log-intensity<br/>background fit curve<br/>peak markers + d-spacing labels</i>")]
-                VIZ_POWER[("globalfft_power_spectrum.png<br/><i>Log |FFT|^2, inferno cmap<br/>cyan arrows for g-vectors<br/>d-spacing annotations</i>")]
+                VIZ_RADIAL[("globalfft_radial_profile.png<br/><i>q vs log-intensity<br/>background fit curve<br/>peak markers + d-spacing labels<br/>gray shaded q < q_min region</i>")]
+                VIZ_POWER[("globalfft_power_spectrum.png<br/><i>Log |FFT|^2, inferno cmap<br/>cyan arrows for g-vectors<br/>d-spacing annotations<br/>dashed circle at q_min</i>")]
             end
 
             subgraph VIZ_ROW2["Tile Classification Maps (3 files)"]
@@ -344,7 +346,7 @@ flowchart TB
 
     %% Noise filter / signal processing nodes (orange)
     classDef filterNode fill:#fff3e0,stroke:#e65100,stroke-width:2px,color:#e65100
-    class PA_HOT,PA_CLIP,PA_NORM,PB_CLIP,PB_NORM,PB_GAUSS filterNode
+    class IN_QMIN,PA_HOT,PA_CLIP,PA_NORM,PB_CLIP,PB_NORM,PB_GAUSS filterNode
     class ROI_INT,ROI_VAR,ROI_FILL,ROI_OPEN,ROI_SMOOTH filterNode
     class GF_HANN,GF_RADIAL,GF_POLY,GF_NOISE,GF_SAVGOL filterNode
     class TF_HANN,TF_DC,TF_LOCALMAX,TF_SNR,TF_FWHM filterNode
