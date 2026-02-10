@@ -793,6 +793,12 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
         config.physics.d_max_nm = args.physics_d_max
     if args.imaging_mode is not None:
         config.physics.imaging_mode = args.imaging_mode
+    # Clustering config CLI overrides
+    if args.cluster:
+        config.clustering.enabled = True
+    config.clustering.method = args.cluster_method
+    config.clustering.n_clusters = args.cluster_n
+    config.clustering.dimred_method = args.cluster_dimred
 
     # --- GPU / device context ---
     from src.gpu_backend import DeviceContext, get_gpu_info
@@ -921,12 +927,12 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
     print(f"  Peaks found: {len(global_fft_result.peaks)}, g-vectors: {len(global_fft_result.g_vectors)}")
     print(f"  G4 {'PASS' if gate_results['G4'].passed else 'FAIL (FALLBACK)'}")
 
-    # Determine q_ranges for tile FFT from global peaks
+    # Determine q_ranges for tile FFT from global peaks (3-tuple: q_lo, q_hi, ring_idx)
     q_ranges = []
     if global_fft_result.peaks:
-        for p in global_fft_result.peaks:
+        for ring_idx, p in enumerate(global_fft_result.peaks):
             q_width = max(p.q_fwhm * 2, p.q_center * 0.03) if p.q_fwhm > 0 else p.q_center * 0.1
-            q_ranges.append((p.q_center - q_width, p.q_center + q_width))
+            q_ranges.append((p.q_center - q_width, p.q_center + q_width, ring_idx))
     elif args.d_min is not None and args.d_max is not None:
         q_ranges.append((1.0 / args.d_max, 1.0 / args.d_min))
 
@@ -1002,10 +1008,64 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
     for gid in ("G6", "G7", "G8"):
         print(f"  {gid} {'PASS' if gate_results[gid].passed else 'FAIL'}")
 
-    # --- Step 7: GPA ---
+    # --- Step 7: Ring Analysis ---
+    ring_maps = None
+    ring_features = None
+    tile_avg_fft = None
+    clustering_result = None
+    if global_fft_result.peaks:
+        print("\n[7/11] Ring analysis...")
+        from src.ring_analysis import (
+            build_ring_maps, build_ring_feature_vectors,
+            compute_tile_averaged_fft, compute_cluster_summaries,
+        )
+
+        ring_maps = build_ring_maps(gated_grid, global_fft_result.peaks)
+        ring_features = build_ring_feature_vectors(gated_grid, ring_maps)
+        print(f"  Rings: {ring_maps.n_rings}, features: {ring_features.feature_matrix.shape[1]}")
+        print(f"  Valid tiles: {int(np.sum(ring_features.valid_mask))}")
+
+        tile_avg_fft = compute_tile_averaged_fft(
+            preproc_record.image_fft, config.tile_size, config.stride,
+            pixel_size, gated_grid.skipped_mask)
+        print(f"  Tile-averaged FFT: {tile_avg_fft['n_tiles']} tiles")
+
+        # --- Step 8: Domain Clustering ---
+        if config.clustering.enabled and ring_features is not None:
+            print("\n[8/11] Domain clustering...")
+            from src.domain_clustering import run_domain_clustering
+
+            clustering_result = run_domain_clustering(
+                ring_features, config.clustering,
+                image_fft=preproc_record.image_fft,
+                tile_size=config.tile_size,
+                stride=config.stride,
+                pixel_size_nm=pixel_size,
+                skipped_mask=gated_grid.skipped_mask,
+            )
+            print(f"  Method: {clustering_result.method_used}")
+            print(f"  Clusters: {clustering_result.n_clusters}")
+            if clustering_result.silhouette_score is not None:
+                print(f"  Silhouette: {clustering_result.silhouette_score:.3f}")
+
+            # Compute per-cluster physics summaries
+            if clustering_result.n_clusters > 0:
+                clustering_result.cluster_summaries = compute_cluster_summaries(
+                    clustering_result.tile_labels_regularized, ring_maps, gated_grid)
+                print(f"  Cluster summaries: {len(clustering_result.cluster_summaries)} clusters")
+        else:
+            if not config.clustering.enabled:
+                print("\n[8/11] Domain clustering skipped (not enabled)")
+            else:
+                print("\n[8/11] Domain clustering skipped (no ring features)")
+    else:
+        print("\n[7/11] Ring analysis skipped (no global peaks)")
+        print("[8/11] Domain clustering skipped")
+
+    # --- Step 9: GPA ---
     gpa_result = None
     if config.gpa.enabled and global_fft_result.g_vectors:
-        print(f"\n[7/9] GPA (mode={config.gpa.mode})...")
+        print(f"\n[9/11] GPA (mode={config.gpa.mode})...")
         from src.gpa import run_gpa
 
         gpa_result = run_gpa(
@@ -1044,18 +1104,18 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
         else:
             print("  GPA skipped")
     else:
-        print("\n[7/9] GPA skipped")
+        print("\n[9/11] GPA skipped")
         if not config.gpa.enabled:
             print("  (disabled by config)")
         elif not global_fft_result.g_vectors:
             print("  (no g-vectors available)")
 
-    # --- Step 8: Peak finding ---
+    # --- Step 10: Peak finding ---
     lattice_validation = None
     peaks = None
     peak_image = None
     if config.peak_finding.enabled and d_dom is not None:
-        print("\n[8/9] Peak finding...")
+        print("\n[10/11] Peak finding...")
         from src.peak_finding import (
             build_bandpass_image, find_subpixel_peaks, validate_peak_lattice,
         )
@@ -1083,10 +1143,10 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
             print(f"  Lattice valid: {lattice_validation.fraction_valid:.1%}")
             print(f"  G12 {'PASS' if gate_results['G12'].passed else 'FAIL'}")
     else:
-        print("\n[8/9] Peak finding skipped")
+        print("\n[10/11] Peak finding skipped")
 
-    # --- Step 9: Validation + Reporting ---
-    print("\n[9/9] Validation and reporting...")
+    # --- Step 11: Validation + Reporting ---
+    print("\n[11/11] Validation and reporting...")
     report = validate_pipeline(
         preproc_record=preproc_record,
         roi_result=roi_result,
@@ -1117,6 +1177,10 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
         validation_report=report,
         effective_q_min=effective_q_min,
         tile_effective_q_min=tile_effective_q_min,
+        ring_maps=ring_maps,
+        ring_features=ring_features,
+        tile_avg_fft=tile_avg_fft,
+        clustering_result=clustering_result,
     )
 
     # --- ilastik comparison (exploratory, optional) ---
@@ -1141,6 +1205,8 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
             bandpass_image=peak_image, validation_report=report,
             effective_q_min=effective_q_min,
             roi_result=roi_result, seg_record=seg_record,
+            ring_maps=ring_maps, clustering_result=clustering_result,
+            tile_avg_fft=tile_avg_fft,
         )
         saved.update(viz_saved)
 
@@ -1270,6 +1336,18 @@ Examples:
                         help='Imaging mode label (e.g., EFTEM-BF, STEM-HAADF)')
     parser.add_argument('--ilastik-map', type=str, default=None, dest='ilastik_map',
                         help='Path to ilastik probability map (.npy or .h5) for comparison')
+
+    # --- Domain clustering flags ---
+    parser.add_argument('--cluster', action='store_true',
+                        help='Enable domain clustering')
+    parser.add_argument('--cluster-method', type=str, default='kmeans',
+                        choices=['kmeans', 'gmm', 'hdbscan'], dest='cluster_method',
+                        help='Clustering method (default: kmeans)')
+    parser.add_argument('--cluster-n', type=int, default=0, dest='cluster_n',
+                        help='Number of clusters, 0=auto (default: 0)')
+    parser.add_argument('--cluster-dimred', type=str, default='pca',
+                        choices=['pca', 'umap', 'none'], dest='cluster_dimred',
+                        help='Dimensionality reduction for clustering (default: pca)')
 
     args = parser.parse_args()
     

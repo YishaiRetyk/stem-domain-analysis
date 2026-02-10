@@ -463,6 +463,7 @@ def classify_tile(peak_set: TilePeakSet,
             "fwhm_valid": fwhm_result.fwhm_valid,
             "fwhm_method": fwhm_result.method,
             "fwhm_ok": fwhm_ok,
+            "ring_index": p.ring_index,
         })
 
         if snr_result.snr > best_snr:

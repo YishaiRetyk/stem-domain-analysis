@@ -130,12 +130,18 @@ def extract_tile_peaks(power: np.ndarray,
     # When q_ranges are provided, many pixels get zeroed — need a full copy.
     # Otherwise, mask DC in-place and restore after detection.
     needs_copy = q_ranges is not None
+    ring_id_map = None
     if needs_copy:
         power_masked = power.copy()
         power_masked[dc_mask] = 0
         q_mask = np.zeros_like(power_masked, dtype=bool)
-        for q_min, q_max in q_ranges:
-            q_mask |= (q_mag >= q_min) & (q_mag <= q_max)
+        ring_id_map = np.full(power.shape, -1, dtype=np.int32)
+        for idx, qr in enumerate(q_ranges):
+            q_lo, q_hi = qr[0], qr[1]
+            ring_id = qr[2] if len(qr) >= 3 else idx
+            in_range = (q_mag >= q_lo) & (q_mag <= q_hi)
+            ring_id_map[in_range & (ring_id_map == -1)] = ring_id
+            q_mask |= in_range
         power_masked[~q_mask] = 0
     else:
         dc_saved = power[dc_mask].copy()  # small (~28 pixels)
@@ -172,6 +178,7 @@ def extract_tile_peaks(power: np.ndarray,
         d = 1.0 / q_m if q_m > 1e-10 else 0
         angle = float(np.degrees(np.arctan2(qy, qx))) % 180
 
+        assigned_ring = int(ring_id_map[int(py), int(px)]) if ring_id_map is not None else -1
         candidates.append((TilePeak(
             qx=qx, qy=qy,
             q_mag=q_m,
@@ -179,6 +186,7 @@ def extract_tile_peaks(power: np.ndarray,
             angle_deg=angle,
             intensity=float(power[int(py), int(px)]),
             fwhm=0.0,  # filled later by fft_peak_detection
+            ring_index=assigned_ring,
         ), int(py), int(px)))
 
     # SNR-first peak detection: reject weak candidates when tile_fft_config

@@ -90,6 +90,7 @@ class TilePeak:
     angle_deg: float
     intensity: float
     fwhm: float              # measured FWHM in cycles/nm
+    ring_index: int = -1     # -1 = unassigned, >=0 = matched to global ring
 
 
 @dataclass
@@ -538,6 +539,22 @@ class LowQExclusionConfig:
 
 
 @dataclass
+class ClusteringConfig:
+    """Domain clustering configuration (opt-in via --cluster)."""
+    enabled: bool = False
+    method: str = "kmeans"          # kmeans | gmm | hdbscan
+    n_clusters: int = 0             # 0 = auto (silhouette scan / hdbscan auto)
+    n_clusters_max: int = 10
+    hdbscan_min_cluster_size: int = 5
+    hdbscan_min_samples: int = 3
+    regularize: bool = True
+    min_domain_size: int = 5
+    dimred_method: str = "pca"      # pca | umap | none
+    pca_variance_threshold: float = 0.95
+    random_state: int = 42
+
+
+@dataclass
 class PipelineConfig:
     """Top-level pipeline configuration."""
     pixel_size_nm: float = 0.1297
@@ -558,6 +575,7 @@ class PipelineConfig:
     physics: PhysicsConfig = field(default_factory=PhysicsConfig)
     tile_fft: TileFFTConfig = field(default_factory=TileFFTConfig)
     confidence: ConfidenceConfig = field(default_factory=ConfidenceConfig)
+    clustering: ClusteringConfig = field(default_factory=ClusteringConfig)
 
     def to_dict(self) -> dict:
         """Serialise to a JSON-safe dict."""
@@ -588,6 +606,7 @@ class PipelineConfig:
             "physics": (PhysicsConfig, "physics"),
             "tile_fft": (TileFFTConfig, "tile_fft"),
             "confidence": (ConfidenceConfig, "confidence"),
+            "clustering": (ClusteringConfig, "clustering"),
         }
         for attr, (klass, key) in _mapping.items():
             if key in d and isinstance(d[key], dict):

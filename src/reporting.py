@@ -75,6 +75,8 @@ def build_parameters_v3(
     extra: Optional[Dict[str, Any]] = None,
     effective_q_min: float = 0.0,
     tile_effective_q_min: float = 0.0,
+    ring_maps=None,
+    clustering_result=None,
 ) -> dict:
     """Build the parameters.json v3.0 dict.
 
@@ -332,6 +334,38 @@ def build_parameters_v3(
         derived["nn_tolerance_used"] = lattice_validation.tolerance_used
     params["derived_cutoffs"] = derived
 
+    # Ring analysis
+    if ring_maps is not None:
+        params["ring_analysis"] = {
+            "n_rings": ring_maps.n_rings,
+            "rings": [
+                {"ring_index": ri.ring_index, "q_center": ri.q_center,
+                 "d_spacing": ri.d_spacing, "q_width": ri.q_width}
+                for ri in ring_maps.rings
+            ],
+        }
+
+    # Domain clustering
+    if clustering_result is not None:
+        clust_section = {
+            "method": clustering_result.method_used,
+            "n_clusters": clustering_result.n_clusters,
+            "silhouette_score": clustering_result.silhouette_score,
+            "embedding_method": clustering_result.embedding_method,
+        }
+        if clustering_result.adjacency_pre:
+            clust_section["adjacency_pre"] = clustering_result.adjacency_pre
+        if clustering_result.adjacency_post:
+            clust_section["adjacency_post"] = clustering_result.adjacency_post
+        if clustering_result.silhouette_curve:
+            clust_section["silhouette_curve"] = [
+                {"k": k, "score": s} for k, s in clustering_result.silhouette_curve
+            ]
+        if clustering_result.cluster_summaries:
+            clust_section["cluster_summaries"] = _make_serialisable(
+                clustering_result.cluster_summaries)
+        params["domain_clustering"] = clust_section
+
     # Pipeline flow
     flow: Dict[str, Any] = {"stages_completed": [], "stages_skipped": [],
                              "stages_degraded": [], "skip_reasons": {}}
@@ -342,6 +376,14 @@ def build_parameters_v3(
         flow["stages_completed"].append("global_fft")
     if gated_grid is not None:
         flow["stages_completed"].append("tile_fft")
+    if ring_maps is not None:
+        flow["stages_completed"].append("ring_analysis")
+    else:
+        flow["stages_skipped"].append("ring_analysis")
+    if clustering_result is not None and clustering_result.n_clusters > 0:
+        flow["stages_completed"].append("domain_clustering")
+    else:
+        flow["stages_skipped"].append("domain_clustering")
     if gpa_result is not None:
         flow["stages_completed"].append("gpa")
     elif config.gpa.enabled:
@@ -450,6 +492,10 @@ def save_pipeline_artifacts(
     extra_params: Optional[Dict[str, Any]] = None,
     effective_q_min: float = 0.0,
     tile_effective_q_min: float = 0.0,
+    ring_maps=None,
+    ring_features=None,
+    tile_avg_fft=None,
+    clustering_result=None,
 ) -> Dict[str, Path]:
     """Save all pipeline artifacts to output directory.
 
@@ -474,6 +520,8 @@ def save_pipeline_artifacts(
         extra=extra_params,
         effective_q_min=effective_q_min,
         tile_effective_q_min=tile_effective_q_min,
+        ring_maps=ring_maps,
+        clustering_result=clustering_result,
     )
     params_path = output_dir / "parameters.json"
     save_json(params_data, params_path)
@@ -562,6 +610,85 @@ def save_pipeline_artifacts(
         stats_path = output_dir / "peak_stats.json"
         save_json(peak_stats, stats_path)
         saved["peak_stats.json"] = stats_path
+
+    # --- ring_maps.npz ---
+    if ring_maps is not None:
+        ring_data = {}
+        for ri in range(ring_maps.n_rings):
+            ring_data[f"presence_{ri}"] = ring_maps.presence[ri]
+            ring_data[f"peak_count_{ri}"] = ring_maps.peak_count[ri]
+            ring_data[f"orientation_{ri}"] = ring_maps.orientation[ri]
+            ring_data[f"snr_{ri}"] = ring_maps.snr[ri]
+        ring_path = output_dir / "ring_maps.npz"
+        np.savez_compressed(ring_path, **ring_data)
+        saved["ring_maps.npz"] = ring_path
+        logger.info("Saved %s", ring_path)
+
+    # --- ring_feature_vectors.npy + ring_feature_names.json ---
+    if ring_features is not None:
+        fv_path = output_dir / "ring_feature_vectors.npy"
+        save_npy(ring_features.feature_matrix, fv_path)
+        saved["ring_feature_vectors.npy"] = fv_path
+        fn_path = output_dir / "ring_feature_names.json"
+        save_json(ring_features.feature_names, fn_path)
+        saved["ring_feature_names.json"] = fn_path
+
+    # --- average_tile_fft.npy + average_tile_radial_profile.json ---
+    if tile_avg_fft is not None:
+        avg_fft_path = output_dir / "average_tile_fft.npy"
+        save_npy(tile_avg_fft["mean_power"], avg_fft_path)
+        saved["average_tile_fft.npy"] = avg_fft_path
+        avg_rp_path = output_dir / "average_tile_radial_profile.json"
+        save_json({
+            "q_values": tile_avg_fft["q_values"].tolist(),
+            "profile": tile_avg_fft["radial_profile"].tolist(),
+            "n_tiles": tile_avg_fft["n_tiles"],
+        }, avg_rp_path)
+        saved["average_tile_radial_profile.json"] = avg_rp_path
+
+    # --- clustering artifacts ---
+    if clustering_result is not None and clustering_result.n_clusters > 0:
+        cl_path = output_dir / "cluster_labels.npy"
+        save_npy(clustering_result.tile_labels, cl_path)
+        saved["cluster_labels.npy"] = cl_path
+
+        clr_path = output_dir / "cluster_labels_regularized.npy"
+        save_npy(clustering_result.tile_labels_regularized, clr_path)
+        saved["cluster_labels_regularized.npy"] = clr_path
+
+        if clustering_result.cluster_averaged_ffts:
+            fft_data = {}
+            for lid, fft_info in clustering_result.cluster_averaged_ffts.items():
+                fft_data[f"cluster_{lid}_power"] = fft_info["mean_power"]
+                fft_data[f"cluster_{lid}_radial"] = fft_info["radial_profile"]
+            fft_data["q_values"] = next(iter(
+                clustering_result.cluster_averaged_ffts.values()))["q_values"]
+            cafft_path = output_dir / "cluster_averaged_ffts.npz"
+            np.savez_compressed(cafft_path, **fft_data)
+            saved["cluster_averaged_ffts.npz"] = cafft_path
+            logger.info("Saved %s", cafft_path)
+
+        # clustering_results.json
+        cr_data = {
+            "method": clustering_result.method_used,
+            "n_clusters": clustering_result.n_clusters,
+            "silhouette_score": clustering_result.silhouette_score,
+            "embedding_method": clustering_result.embedding_method,
+        }
+        if clustering_result.adjacency_pre:
+            cr_data["adjacency_pre"] = clustering_result.adjacency_pre
+        if clustering_result.adjacency_post:
+            cr_data["adjacency_post"] = clustering_result.adjacency_post
+        if clustering_result.silhouette_curve:
+            cr_data["silhouette_curve"] = [
+                {"k": k, "score": s} for k, s in clustering_result.silhouette_curve
+            ]
+        if clustering_result.cluster_summaries:
+            cr_data["cluster_summaries"] = _make_serialisable(
+                clustering_result.cluster_summaries)
+        cr_path = output_dir / "clustering_results.json"
+        save_json(cr_data, cr_path)
+        saved["clustering_results.json"] = cr_path
 
     logger.info("Saved %d artifacts to %s", len(saved), output_dir)
     return saved

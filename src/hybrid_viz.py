@@ -31,6 +31,9 @@ def save_pipeline_visualizations(
     effective_q_min: float = 0.0,
     roi_result=None,
     seg_record=None,
+    ring_maps=None,
+    clustering_result=None,
+    tile_avg_fft=None,
 ) -> Dict[str, Path]:
     """Orchestrate generation of all PNG visualization artifacts.
 
@@ -145,6 +148,48 @@ def save_pipeline_visualizations(
     if gated_grid is not None and raw_image is not None:
         _try("tiles_exemplar_ffts",
              _save_tile_exemplar_ffts, gated_grid, raw_image, config, fft_grid, out, dpi)
+
+    # --- Ring analysis visualizations ---
+    if ring_maps is not None and global_fft_result is not None:
+        _try("ring_presence_maps",
+             _save_ring_presence_maps, ring_maps, out, dpi)
+        _try("ring_peak_count_maps",
+             _save_ring_peak_count_maps, ring_maps, out, dpi)
+        _try("ring_orientation_maps",
+             _save_ring_orientation_maps, ring_maps, out, dpi)
+        if raw_image is not None:
+            _try("ring_peak_locations_overlay",
+                 _save_ring_peak_locations_overlay, ring_maps, raw_image, config, out, dpi)
+            _try("ring_orientation_overlay",
+                 _save_ring_orientation_overlay, ring_maps, raw_image, config, out, dpi)
+
+    if tile_avg_fft is not None:
+        _try("average_tile_fft",
+             _save_average_tile_fft, tile_avg_fft, global_fft_result, out, dpi)
+        _try("average_tile_radial_profile",
+             _save_average_tile_radial_profile, tile_avg_fft, global_fft_result, out, dpi)
+
+    # --- Clustering visualizations ---
+    if clustering_result is not None and clustering_result.n_clusters > 0:
+        _try("cluster_label_map",
+             _save_cluster_label_map, clustering_result, out, dpi)
+        if raw_image is not None:
+            _try("cluster_overlay",
+                 _save_cluster_overlay, clustering_result, raw_image, config, out, dpi)
+        if clustering_result.embedding_2d is not None:
+            _try("feature_embedding",
+                 _save_feature_embedding_viz, clustering_result, out, dpi)
+        if clustering_result.cluster_averaged_ffts:
+            _try("cluster_averaged_ffts",
+                 _save_cluster_averaged_ffts_viz, clustering_result, out, dpi)
+            _try("cluster_radial_profiles",
+                 _save_cluster_radial_profiles, clustering_result, out, dpi)
+        if clustering_result.silhouette_curve:
+            _try("silhouette_curve",
+                 _save_silhouette_curve, clustering_result, out, dpi)
+        if ring_maps is not None:
+            _try("ring_vs_cluster_comparison",
+                 _save_ring_vs_cluster_comparison, ring_maps, clustering_result, out, dpi)
 
     return saved
 
@@ -714,6 +759,494 @@ def _save_tile_exemplar_ffts(gated_grid, raw_image, config, fft_grid, out_dir, d
         axes[ax_r, ax_c].set_visible(False)
 
     fig.suptitle("Tile Exemplar FFTs", fontsize=12)
+    plt.tight_layout()
+    plt.savefig(str(path), dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Saved: %s", path)
+    return path
+
+
+# ======================================================================
+# Ring analysis visualizations
+# ======================================================================
+
+def _save_ring_presence_maps(ring_maps, out_dir, dpi):
+    """Grid of subplots: one per ring, viridis [0,1]."""
+    path = out_dir / "ring_presence_maps.png"
+    _ensure_dir(path)
+    n_rings = ring_maps.n_rings
+    if n_rings == 0:
+        return None
+
+    n_cols = min(n_rings, 3)
+    n_rows = (n_rings + n_cols - 1) // n_cols
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows),
+                             squeeze=False)
+    for i in range(n_rings):
+        ax = axes[i // n_cols, i % n_cols]
+        im = ax.imshow(ring_maps.presence[i], cmap="viridis", vmin=0, vmax=1,
+                       origin="upper", interpolation="nearest")
+        ri = ring_maps.rings[i]
+        ax.set_title(f"Ring {i} (d={ri.d_spacing:.3f} nm)", fontsize=9)
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    for i in range(n_rings, n_rows * n_cols):
+        axes[i // n_cols, i % n_cols].set_visible(False)
+
+    fig.suptitle("Ring Presence Maps", fontsize=12)
+    plt.tight_layout()
+    plt.savefig(str(path), dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Saved: %s", path)
+    return path
+
+
+def _save_ring_peak_count_maps(ring_maps, out_dir, dpi):
+    """Grid of subplots: peak counts per ring, integer colorbar."""
+    path = out_dir / "ring_peak_count_maps.png"
+    _ensure_dir(path)
+    n_rings = ring_maps.n_rings
+    if n_rings == 0:
+        return None
+
+    n_cols = min(n_rings, 3)
+    n_rows = (n_rings + n_cols - 1) // n_cols
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows),
+                             squeeze=False)
+    for i in range(n_rings):
+        ax = axes[i // n_cols, i % n_cols]
+        data = ring_maps.peak_count[i]
+        im = ax.imshow(data, cmap="YlOrRd", vmin=0,
+                       origin="upper", interpolation="nearest")
+        ri = ring_maps.rings[i]
+        ax.set_title(f"Ring {i} peaks (d={ri.d_spacing:.3f} nm)", fontsize=9)
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    for i in range(n_rings, n_rows * n_cols):
+        axes[i // n_cols, i % n_cols].set_visible(False)
+
+    fig.suptitle("Ring Peak Count Maps", fontsize=12)
+    plt.tight_layout()
+    plt.savefig(str(path), dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Saved: %s", path)
+    return path
+
+
+def _save_ring_orientation_maps(ring_maps, out_dir, dpi):
+    """Grid of subplots: HSV cyclic orientation per ring."""
+    path = out_dir / "ring_orientation_maps.png"
+    _ensure_dir(path)
+    n_rings = ring_maps.n_rings
+    if n_rings == 0:
+        return None
+
+    n_cols = min(n_rings, 3)
+    n_rows = (n_rings + n_cols - 1) // n_cols
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows),
+                             squeeze=False)
+    for i in range(n_rings):
+        ax = axes[i // n_cols, i % n_cols]
+        orient = ring_maps.orientation[i].copy()
+        masked = np.ma.masked_where(np.isnan(orient), orient)
+        im = ax.imshow(masked, cmap="hsv", vmin=0, vmax=180,
+                       origin="upper", interpolation="nearest")
+        ri = ring_maps.rings[i]
+        ax.set_title(f"Ring {i} orient (d={ri.d_spacing:.3f} nm)", fontsize=9)
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="deg")
+
+    for i in range(n_rings, n_rows * n_cols):
+        axes[i // n_cols, i % n_cols].set_visible(False)
+
+    fig.suptitle("Ring Orientation Maps", fontsize=12)
+    plt.tight_layout()
+    plt.savefig(str(path), dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Saved: %s", path)
+    return path
+
+
+def _save_ring_peak_locations_overlay(ring_maps, raw_image, config, out_dir, dpi):
+    """Per-ring tile markers overlaid on original image."""
+    path = out_dir / "ring_peak_locations_overlay.png"
+    _ensure_dir(path)
+    n_rings = ring_maps.n_rings
+    if n_rings == 0:
+        return None
+
+    n_cols = min(n_rings, 3)
+    n_rows = (n_rings + n_cols - 1) // n_cols
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows),
+                             squeeze=False)
+    colors = plt.cm.tab10(np.linspace(0, 1, max(n_rings, 1)))
+
+    for i in range(n_rings):
+        ax = axes[i // n_cols, i % n_cols]
+        ax.imshow(raw_image, cmap="gray", origin="upper")
+        pres = ring_maps.presence[i]
+        snr_m = ring_maps.snr[i]
+        rows, cols = np.where(pres > 0)
+        if len(rows) > 0:
+            # Convert tile coords to pixel coords (center of tile)
+            py = rows * config.stride + config.tile_size // 2
+            px = cols * config.stride + config.tile_size // 2
+            sizes = np.clip(snr_m[rows, cols] * 3, 5, 100)
+            ax.scatter(px, py, s=sizes, c=[colors[i]], alpha=0.6,
+                       edgecolors="none")
+        ri = ring_maps.rings[i]
+        ax.set_title(f"Ring {i} (d={ri.d_spacing:.3f} nm)", fontsize=9)
+
+    for i in range(n_rings, n_rows * n_cols):
+        axes[i // n_cols, i % n_cols].set_visible(False)
+
+    fig.suptitle("Ring Peak Locations", fontsize=12)
+    plt.tight_layout()
+    plt.savefig(str(path), dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Saved: %s", path)
+    return path
+
+
+def _save_ring_orientation_overlay(ring_maps, raw_image, config, out_dir, dpi):
+    """Per-ring orientation coloring overlaid on original image."""
+    path = out_dir / "ring_orientation_overlay.png"
+    _ensure_dir(path)
+    n_rings = ring_maps.n_rings
+    if n_rings == 0:
+        return None
+
+    n_cols = min(n_rings, 3)
+    n_rows = (n_rings + n_cols - 1) // n_cols
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows),
+                             squeeze=False)
+
+    for i in range(n_rings):
+        ax = axes[i // n_cols, i % n_cols]
+        ax.imshow(raw_image, cmap="gray", origin="upper")
+        orient = ring_maps.orientation[i]
+        pres = ring_maps.presence[i]
+        rows, cols = np.where((pres > 0) & ~np.isnan(orient))
+        if len(rows) > 0:
+            py = rows * config.stride + config.tile_size // 2
+            px = cols * config.stride + config.tile_size // 2
+            angles = orient[rows, cols]
+            ax.scatter(px, py, c=angles, cmap="hsv", vmin=0, vmax=180,
+                       s=20, alpha=0.6, edgecolors="none")
+        ri = ring_maps.rings[i]
+        ax.set_title(f"Ring {i} orient overlay (d={ri.d_spacing:.3f} nm)", fontsize=9)
+
+    for i in range(n_rings, n_rows * n_cols):
+        axes[i // n_cols, i % n_cols].set_visible(False)
+
+    fig.suptitle("Ring Orientation Overlay", fontsize=12)
+    plt.tight_layout()
+    plt.savefig(str(path), dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Saved: %s", path)
+    return path
+
+
+def _save_average_tile_fft(tile_avg_fft, global_fft_result, out_dir, dpi):
+    """Annotated all-tiles average power spectrum (log scale)."""
+    path = out_dir / "average_tile_fft.png"
+    _ensure_dir(path)
+
+    ps = tile_avg_fft["mean_power"]
+    fig, ax = plt.subplots(figsize=(8, 8))
+    display = np.log1p(ps)
+    im = ax.imshow(display, cmap="inferno", origin="upper")
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="log(Power + 1)")
+    ax.set_title(f"Tile-Averaged Power Spectrum ({tile_avg_fft['n_tiles']} tiles)")
+
+    plt.savefig(str(path), dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Saved: %s", path)
+    return path
+
+
+def _save_average_tile_radial_profile(tile_avg_fft, global_fft_result, out_dir, dpi):
+    """Radial profile from tile-averaged FFT with peak markers."""
+    path = out_dir / "average_tile_radial_profile.png"
+    _ensure_dir(path)
+
+    q = tile_avg_fft["q_values"]
+    profile = tile_avg_fft["radial_profile"]
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.semilogy(q, profile, 'k-', lw=0.8, label="Tile-averaged radial profile")
+
+    if global_fft_result is not None:
+        for p in global_fft_result.peaks:
+            ax.axvline(p.q_center, color="red", alpha=0.5, lw=0.7)
+            ax.annotate(f"d={p.d_spacing:.3f} nm",
+                        xy=(p.q_center, profile[np.argmin(np.abs(q - p.q_center))]
+                            if len(q) > 0 else 1),
+                        xytext=(5, 10), textcoords="offset points",
+                        fontsize=7, color="red")
+
+    ax.set_xlabel("q (cycles/nm)")
+    ax.set_ylabel("Intensity (log)")
+    ax.set_title(f"Tile-Averaged Radial Profile ({tile_avg_fft['n_tiles']} tiles)")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    plt.savefig(str(path), dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Saved: %s", path)
+    return path
+
+
+# ======================================================================
+# Clustering visualizations
+# ======================================================================
+
+def _save_cluster_label_map(clustering_result, out_dir, dpi):
+    """Discrete colormap cluster label map."""
+    path = out_dir / "cluster_label_map.png"
+    _ensure_dir(path)
+
+    labels = clustering_result.tile_labels_regularized
+    n_clusters = clustering_result.n_clusters
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    unique = sorted(set(int(x) for x in np.unique(labels)))
+    if -1 in unique:
+        # Map -1 to gray
+        colors_list = ["#95a5a6"]
+        offset = 1
+    else:
+        colors_list = []
+        offset = 0
+    tab_colors = plt.cm.tab10(np.linspace(0, 1, max(n_clusters, 1)))
+    for i in range(n_clusters):
+        colors_list.append(tab_colors[i % 10])
+
+    if len(colors_list) > 0:
+        cmap = ListedColormap(colors_list)
+        # Remap labels for display
+        display = np.full_like(labels, 0, dtype=int)
+        for i, u in enumerate(unique):
+            display[labels == u] = i
+        im = ax.imshow(display, cmap=cmap, origin="upper", interpolation="nearest")
+
+        from matplotlib.patches import Patch
+        legend_elements = []
+        for i, u in enumerate(unique):
+            name = "Noise" if u == -1 else f"Cluster {u}"
+            count = int(np.sum(labels == u))
+            legend_elements.append(Patch(facecolor=colors_list[i], label=f"{name} ({count})"))
+        ax.legend(handles=legend_elements, loc="upper right", fontsize=8, framealpha=0.9)
+
+    ax.set_title(f"Cluster Label Map ({n_clusters} clusters)")
+    ax.set_xlabel("Column")
+    ax.set_ylabel("Row")
+
+    plt.savefig(str(path), dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Saved: %s", path)
+    return path
+
+
+def _save_cluster_overlay(clustering_result, raw_image, config, out_dir, dpi):
+    """Domain boundaries on raw image."""
+    path = out_dir / "cluster_overlay.png"
+    _ensure_dir(path)
+
+    from src.cluster_domains import upsample_labels
+    labels = clustering_result.tile_labels_regularized
+    label_image = upsample_labels(labels, raw_image.shape[:2],
+                                  config.tile_size, config.stride)
+
+    # Find boundaries
+    from scipy import ndimage
+    boundaries = np.zeros_like(label_image, dtype=bool)
+    for shift in [(0, 1), (1, 0)]:
+        shifted = np.roll(label_image, shift, axis=(0, 1))
+        boundaries |= (label_image != shifted)
+
+    img_display = raw_image.copy().astype(float)
+    p1, p99 = np.percentile(img_display, [1, 99])
+    img_display = np.clip((img_display - p1) / (p99 - p1 + 1e-8), 0, 1)
+    rgb = np.stack([img_display] * 3, axis=-1)
+    rgb[boundaries] = [1, 0, 0]
+
+    fig, ax = plt.subplots(figsize=(10, 10))
+    ax.imshow(rgb, origin="upper")
+    ax.set_title("Cluster Overlay")
+    ax.axis("off")
+
+    plt.savefig(str(path), dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Saved: %s", path)
+    return path
+
+
+def _save_feature_embedding_viz(clustering_result, out_dir, dpi):
+    """2D PCA/UMAP scatter, colored by cluster."""
+    path = out_dir / "feature_embedding.png"
+    _ensure_dir(path)
+
+    emb = clustering_result.embedding_2d
+    labels = clustering_result.tile_labels.flatten()
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    unique = sorted(set(int(x) for x in np.unique(labels)))
+    colors = plt.cm.tab10(np.linspace(0, 1, max(len(unique), 1)))
+
+    for i, u in enumerate(unique):
+        mask = labels == u
+        if not np.any(mask):
+            continue
+        name = "Noise" if u == -1 else f"Cluster {u}"
+        c = "gray" if u == -1 else colors[i % 10]
+        alpha = 0.3 if u == -1 else 0.7
+        ax.scatter(emb[mask, 0], emb[mask, 1], c=[c], s=15,
+                   alpha=alpha, label=name, edgecolors="none")
+
+    ax.set_xlabel(f"{clustering_result.embedding_method.upper()} 1")
+    ax.set_ylabel(f"{clustering_result.embedding_method.upper()} 2")
+    ax.set_title(f"Feature Embedding ({clustering_result.embedding_method.upper()})")
+    ax.legend(fontsize=8, loc="best")
+
+    plt.savefig(str(path), dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Saved: %s", path)
+    return path
+
+
+def _save_cluster_averaged_ffts_viz(clustering_result, out_dir, dpi):
+    """Grid of mean power spectra per cluster (log scale)."""
+    path = out_dir / "cluster_averaged_ffts.png"
+    _ensure_dir(path)
+
+    ffts = clustering_result.cluster_averaged_ffts
+    n = len(ffts)
+    if n == 0:
+        return None
+
+    n_cols = min(n, 3)
+    n_rows_plot = (n + n_cols - 1) // n_cols
+    fig, axes = plt.subplots(n_rows_plot, n_cols, figsize=(5 * n_cols, 4 * n_rows_plot),
+                             squeeze=False)
+
+    for idx, (lid, fft_info) in enumerate(sorted(ffts.items())):
+        ax = axes[idx // n_cols, idx % n_cols]
+        ps = np.log1p(fft_info["mean_power"])
+        ax.imshow(ps, cmap="inferno", origin="upper")
+        ax.set_title(f"Cluster {lid} ({fft_info['n_tiles']} tiles)", fontsize=9)
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    for idx in range(n, n_rows_plot * n_cols):
+        axes[idx // n_cols, idx % n_cols].set_visible(False)
+
+    fig.suptitle("Cluster-Averaged Power Spectra", fontsize=12)
+    plt.tight_layout()
+    plt.savefig(str(path), dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Saved: %s", path)
+    return path
+
+
+def _save_cluster_radial_profiles(clustering_result, out_dir, dpi):
+    """Overlaid radial profiles colored by cluster."""
+    path = out_dir / "cluster_radial_profiles.png"
+    _ensure_dir(path)
+
+    ffts = clustering_result.cluster_averaged_ffts
+    if not ffts:
+        return None
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    colors = plt.cm.tab10(np.linspace(0, 1, max(len(ffts), 1)))
+
+    for idx, (lid, fft_info) in enumerate(sorted(ffts.items())):
+        ax.semilogy(fft_info["q_values"], fft_info["radial_profile"],
+                    color=colors[idx % 10], lw=1.0,
+                    label=f"Cluster {lid} ({fft_info['n_tiles']} tiles)")
+
+    ax.set_xlabel("q (cycles/nm)")
+    ax.set_ylabel("Intensity (log)")
+    ax.set_title("Cluster Radial Profiles")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    plt.savefig(str(path), dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Saved: %s", path)
+    return path
+
+
+def _save_silhouette_curve(clustering_result, out_dir, dpi):
+    """Silhouette score vs K plot."""
+    path = out_dir / "silhouette_curve.png"
+    _ensure_dir(path)
+
+    curve = clustering_result.silhouette_curve
+    if not curve:
+        return None
+
+    ks = [k for k, _ in curve]
+    scores = [s for _, s in curve]
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(ks, scores, 'o-', color="steelblue", lw=1.5)
+    ax.axvline(clustering_result.n_clusters, color="red", ls="--", lw=1.0,
+               label=f"Selected K={clustering_result.n_clusters}")
+    ax.set_xlabel("Number of Clusters (K)")
+    ax.set_ylabel("Silhouette Score")
+    ax.set_title("Silhouette Score vs K")
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    plt.savefig(str(path), dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Saved: %s", path)
+    return path
+
+
+def _save_ring_vs_cluster_comparison(ring_maps, clustering_result, out_dir, dpi):
+    """Side-by-side: ring presence maps (left) vs cluster map (right)."""
+    path = out_dir / "ring_vs_cluster_comparison.png"
+    _ensure_dir(path)
+
+    n_rings = ring_maps.n_rings
+    n_rows_plot = max(n_rings, 1)
+    fig, axes = plt.subplots(n_rows_plot, 2, figsize=(10, 4 * n_rows_plot),
+                             squeeze=False)
+
+    for i in range(n_rings):
+        ax = axes[i, 0]
+        im = ax.imshow(ring_maps.presence[i], cmap="viridis", vmin=0, vmax=1,
+                       origin="upper", interpolation="nearest")
+        ri = ring_maps.rings[i]
+        ax.set_title(f"Ring {i} (d={ri.d_spacing:.3f} nm)", fontsize=9)
+        ax.set_ylabel("Row")
+
+    # Right column: cluster map (repeated)
+    labels = clustering_result.tile_labels_regularized
+    n_clusters = clustering_result.n_clusters
+    unique = sorted(set(int(x) for x in np.unique(labels)))
+    tab_colors = plt.cm.tab10(np.linspace(0, 1, max(n_clusters, 1)))
+    colors_list = []
+    for u in unique:
+        if u == -1:
+            colors_list.append([0.6, 0.6, 0.6])
+        else:
+            colors_list.append(tab_colors[u % 10][:3])
+    if colors_list:
+        cmap_c = ListedColormap(colors_list)
+        display = np.full_like(labels, 0, dtype=int)
+        for i_u, u in enumerate(unique):
+            display[labels == u] = i_u
+
+    for i in range(n_rows_plot):
+        ax = axes[i, 1]
+        if colors_list:
+            ax.imshow(display, cmap=cmap_c, origin="upper", interpolation="nearest")
+        ax.set_title(f"Cluster Map ({n_clusters} clusters)", fontsize=9)
+
+    fig.suptitle("Ring Presence vs Cluster Comparison", fontsize=12)
     plt.tight_layout()
     plt.savefig(str(path), dpi=dpi, bbox_inches="tight")
     plt.close(fig)
