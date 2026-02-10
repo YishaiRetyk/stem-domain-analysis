@@ -8,6 +8,8 @@ This toolkit processes large-scale STEM images to:
 - **Detect crystalline domains** via FFT-based radial profile analysis
 - **Automatically discover diffraction peaks** without prior material knowledge
 - **Map crystal orientations** using diffraction peak localization
+- **Analyze per-ring spatial distributions** with presence, peak count, orientation, and SNR maps
+- **Cluster crystal domains** via K-means, GMM, or HDBSCAN with automatic K selection
 - **Extract strain fields** via Geometric Phase Analysis (GPA)
 - **Validate results** with a 13-gate quality control system (G0-G12)
 - **Generate quantitative metrics** for domain size, shape, and orientation distributions
@@ -103,6 +105,14 @@ flowchart TD
         F["Two-Tier Classification<br/>Tier A: SNR >= 5.0<br/>Tier B: SNR 3.0-5.0<br/>FWHM-scaled tolerances<br/>Gates G6, G7, G8"]
     end
 
+    subgraph RingAnalysis["Ring Analysis (always-on)"]
+        RA["Per-ring spatial maps<br/>Ring feature vectors<br/>Tile-averaged FFT"]
+    end
+
+    subgraph Clustering["Domain Clustering (--cluster)"]
+        CL["K-means / GMM / HDBSCAN<br/>PCA / UMAP dimensionality reduction<br/>Auto-K via silhouette scan<br/>Spatial regularization"]
+    end
+
     subgraph GPA["GPA (optional, skips on weak evidence)"]
         G["Entry gate: guidance + tier check<br/>Restricted phase unwrapping<br/>Ref-region unwrap success<br/>Gates G9, G10, G11"]
     end
@@ -121,15 +131,54 @@ flowchart TD
     C --> E
     D --> E
     E --> F
-    F --> G & H
+    F --> RA
+    RA --> CL
+    CL --> G & H
     G --> I
     H --> I
+    RA --> I
+    CL --> I
 
     style Preprocess fill:#e8f5e9
     style TileFFT fill:#e1f5fe
+    style RingAnalysis fill:#e8eaf6
+    style Clustering fill:#fce4ec
     style GPA fill:#f3e5f5
     style Reporting fill:#fff3e0
 ```
+
+---
+
+## What's New (v3.2) -- Multi-Ring Spatial Maps + Domain Clustering
+
+### Per-Ring Spatial Analysis
+- **Ring-indexed peaks**: Each tile peak is tagged with a `ring_index` linking it to the global diffraction ring it belongs to
+- **Per-ring spatial maps**: Presence, peak count, orientation, SNR, and angular variance maps for each diffraction ring
+- **Ring feature vectors**: Per-tile feature matrix (5 features per ring + 4 global) for downstream clustering
+- **Tile-averaged FFT**: Streaming mean of all valid tile power spectra with annotated radial profile
+
+### Domain Clustering (`--cluster`)
+- **Three clustering methods**: K-means, GMM, HDBSCAN via `--cluster-method`
+- **Automatic K selection**: Silhouette scan over k=2..10 when `--cluster-n 0` (default)
+- **Dimensionality reduction**: PCA (default, 95% variance threshold) or UMAP (`--cluster-dimred umap`) with automatic PCA fallback
+- **Spatial regularization**: Majority-vote smoothing to reduce label noise at domain boundaries
+- **Per-cluster physics summaries**: Dominant ring presences, mean orientations, peak count distributions per cluster
+- **Cluster-averaged FFTs**: Streaming mean power spectra per cluster for spectral comparison
+
+### New CLI Flags
+- `--cluster` -- Enable domain clustering (opt-in)
+- `--cluster-method {kmeans,gmm,hdbscan}` -- Clustering algorithm (default: kmeans)
+- `--cluster-n N` -- Number of clusters, 0=auto (default: 0)
+- `--cluster-dimred {pca,umap,none}` -- Dimensionality reduction method (default: pca)
+
+### New Output Artifacts
+- 9 new data files: `ring_maps.npz`, `ring_feature_vectors.npy`, `ring_feature_names.json`, `average_tile_fft.npy`, `average_tile_radial_profile.json`, `cluster_labels.npy`, `cluster_labels_regularized.npy`, `cluster_averaged_ffts.npz`, `clustering_results.json`
+- 14 new PNG visualizations: per-ring presence/peak count/orientation maps, ring overlays, tile-averaged FFT, cluster label map, cluster overlay, feature embedding, cluster-averaged FFTs, radial profiles, silhouette curve, ring-vs-cluster comparison
+
+### Pipeline Stages
+- Pipeline expanded from 9 to 11 stages: Ring Analysis (7) and Domain Clustering (8) inserted after Tile FFT (6)
+- GPA renumbered to stage 9, Peak Finding to 10, Validation to 11
+- Ring analysis runs automatically when global peaks exist; clustering is opt-in via `--cluster`
 
 ---
 
@@ -244,6 +293,8 @@ flowchart TD
 - **Two-Tier SNR Gating** -- Separates high-confidence from weak-evidence tiles
 - **GPA Strain Mapping** -- Full-image or region-wise strain field extraction
 - **13-Gate Validation** -- Comprehensive quality control from Nyquist guard to output
+- **Per-Ring Spatial Maps** -- Presence, peak count, orientation, and SNR maps per diffraction ring
+- **Domain Clustering** -- K-means, GMM, or HDBSCAN with auto-K selection and spatial regularization
 - **Spatial Coherence Validation** -- Detects when results are noise vs. real domains
 - **Orientation Mapping** -- Color-coded visualization of crystal orientations
 - **Domain Metrics** -- Area, perimeter, circularity, orientation statistics
@@ -298,6 +349,15 @@ python analyze.py sample.dm4 --hybrid --auto-discover --snr-tier-a 4.0 --snr-tie
 
 # EFTEM bright-field with physics constraints
 python analyze.py sample.dm4 --hybrid --auto-discover --physics-d-min 0.4 --physics-d-max 1.5 --imaging-mode EFTEM-BF
+
+# Domain clustering with auto-K selection
+python analyze.py sample.dm4 --hybrid --auto-discover --cluster
+
+# Clustering with GMM and fixed 3 clusters
+python analyze.py sample.dm4 --hybrid --auto-discover --cluster --cluster-method gmm --cluster-n 3
+
+# HDBSCAN clustering with UMAP visualization
+python analyze.py sample.dm4 --hybrid --auto-discover --cluster --cluster-method hdbscan --cluster-dimred umap
 ```
 
 ### Classic Auto-Discovery Mode
@@ -376,6 +436,14 @@ Physics & EFTEM:
   --physics-d-max FLOAT   Expected maximum d-spacing in nm (default: 1.5)
   --imaging-mode STR      Imaging mode label (default: EFTEM-BF)
 
+Domain Clustering:
+  --cluster               Enable domain clustering (opt-in)
+  --cluster-method {kmeans,gmm,hdbscan}
+                          Clustering algorithm (default: kmeans)
+  --cluster-n N           Number of clusters, 0=auto (default: 0)
+  --cluster-dimred {pca,umap,none}
+                          Dimensionality reduction method (default: pca)
+
 Peak Detection (E3):
   --peak-method {max,percentile95}
                           Peak intensity method (default: percentile95)
@@ -424,6 +492,12 @@ python analyze.py sample.dm4 --auto-discover --multi-plane --interactive
 
 # Non-interactive batch mode
 python analyze.py *.dm4 --hybrid --auto-discover --no-interactive
+
+# Domain clustering (auto-K, K-means)
+python analyze.py sample.dm4 --hybrid --auto-discover --cluster
+
+# Clustering with HDBSCAN
+python analyze.py sample.dm4 --hybrid --auto-discover --cluster --cluster-method hdbscan
 ```
 
 ## Output Files
@@ -458,6 +532,15 @@ Output is saved to `outputs/<input_filename>/` by default.
 | `gpa_reference.json` | Reference region details *(when GPA enabled)* |
 | `lattice_peaks.npy` | Subpixel lattice-feature positions (N x 5: x, y, intensity, sigma_x, sigma_y) *(when peak-finding enabled)* |
 | `peak_stats.json` | NN-distance statistics and lattice validation *(when peak-finding enabled)* |
+| `ring_maps.npz` | Per-ring spatial maps: presence, peak count, orientation, SNR, angular variance *(when global peaks exist)* |
+| `ring_feature_vectors.npy` | Feature matrix (n_tiles x n_features) for clustering *(when global peaks exist)* |
+| `ring_feature_names.json` | Feature name list for the feature matrix *(when global peaks exist)* |
+| `average_tile_fft.npy` | Mean power spectrum across all valid tiles *(when global peaks exist)* |
+| `average_tile_radial_profile.json` | Radial profile from tile-averaged FFT *(when global peaks exist)* |
+| `cluster_labels.npy` | Tile-level cluster assignments *(when `--cluster` enabled)* |
+| `cluster_labels_regularized.npy` | Spatially regularized cluster labels *(when `--cluster` enabled)* |
+| `cluster_averaged_ffts.npz` | Per-cluster mean power spectra *(when `--cluster` enabled)* |
+| `clustering_results.json` | Method, n_clusters, silhouette score, per-cluster summaries *(when `--cluster` enabled)* |
 
 ## How Auto-Discovery Works
 
@@ -591,6 +674,14 @@ q_scale = 1 / (N * pixel_size_nm)    cycles/nm per FFT pixel
 | `peak_finding.bandpass_bandwidth` | 0.3 | Bandwidth as fraction of \|g_dom\| |
 | `peak_finding.angular_width_deg` | 30.0 | Half-width of directional wedge mask |
 | `roi.min_lcc_fraction` | 0.5 | LCC fraction threshold for G3 |
+| `clustering.enabled` | false | Enable domain clustering |
+| `clustering.method` | kmeans | Clustering algorithm: kmeans, gmm, hdbscan |
+| `clustering.n_clusters` | 0 | Number of clusters (0 = auto via silhouette scan) |
+| `clustering.n_clusters_max` | 10 | Maximum K for auto-K scan |
+| `clustering.dimred_method` | pca | Dimensionality reduction: pca, umap, none |
+| `clustering.pca_variance_threshold` | 0.95 | Cumulative variance to retain in PCA |
+| `clustering.regularize` | true | Apply spatial regularization to labels |
+| `clustering.min_domain_size` | 5 | Minimum domain size (tiles) |
 
 ## Python API
 
@@ -646,6 +737,8 @@ from src.tile_fft import process_all_tiles
 from src.fft_snr_metrics import build_gated_tile_grid
 from src.gpa import run_gpa
 from src.peak_finding import build_bandpass_image, find_subpixel_peaks, validate_peak_lattice
+from src.ring_analysis import build_ring_maps, build_ring_feature_vectors, compute_tile_averaged_fft
+from src.domain_clustering import run_domain_clustering
 from src.validation import validate_pipeline
 from src.reporting import save_pipeline_artifacts
 
@@ -673,6 +766,17 @@ peak_sets, skipped = process_all_tiles(
 )
 tile_grid = FFTGrid(config.tile_size, config.tile_size, config.pixel_size_nm)
 gated = build_gated_tile_grid(peak_sets, skipped, tile_grid, config.tile_size)
+
+# Ring analysis (always-on when global peaks exist)
+ring_maps = build_ring_maps(gated, global_result.peaks)
+ring_features = build_ring_feature_vectors(gated, ring_maps)
+tile_avg_fft = compute_tile_averaged_fft(
+    preproc.image_fft, config.tile_size, config.stride,
+    config.pixel_size_nm, gated.skipped_mask)
+
+# Domain clustering (opt-in)
+if config.clustering.enabled:
+    clustering_result = run_domain_clustering(ring_features, config.clustering)
 
 # Validation
 report = validate_pipeline(
@@ -705,8 +809,10 @@ save_pipeline_artifacts(output_dir, config=config, fft_grid=fft_grid,
 | `src/gpa.py` | GPA engine: full-image and region-wise modes, strain fields |
 | `src/peak_finding.py` | Subpixel peak detection with lattice validation |
 | `src/validation.py` | Unified 13-gate evaluation (G0-G12) and `ValidationReport` |
+| `src/ring_analysis.py` | Per-ring spatial maps, feature vectors, tile/cluster-averaged FFTs |
+| `src/domain_clustering.py` | Domain clustering: K-means/GMM/HDBSCAN, PCA/UMAP, regularization |
 | `src/reporting.py` | JSON/artifact output, parameters.json v3.0 |
-| `src/hybrid_viz.py` | PNG visualization orchestrator (24 artifacts) |
+| `src/hybrid_viz.py` | PNG visualization orchestrator (38 artifacts) |
 
 ### Legacy Modules
 
@@ -734,7 +840,13 @@ python analyze.py myimage.dm4 --hybrid --auto-discover -o test_run/
 # 4. If GPA strain maps are needed:
 python analyze.py myimage.dm4 --hybrid --auto-discover --gpa-mode full -o strain_run/
 
-# 5. For batch processing:
+# 5. Domain clustering with auto-K:
+python analyze.py myimage.dm4 --hybrid --auto-discover --cluster -o cluster_run/
+
+# 6. Clustering with fixed 3 clusters and GMM:
+python analyze.py myimage.dm4 --hybrid --auto-discover --cluster --cluster-method gmm --cluster-n 3
+
+# 7. For batch processing:
 python analyze.py *.dm4 --hybrid --auto-discover --no-interactive --no-gpa
 ```
 

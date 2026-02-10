@@ -4,14 +4,15 @@ flowchart TB
     %% ============================================================
     %% STEM DOMAIN ANALYSIS - HYBRID PIPELINE WORKFLOW (--hybrid)
     %% ============================================================
-    %% 9-stage pipeline with two-branch preprocessing,
+    %% 11-stage pipeline with two-branch preprocessing,
     %% two-tier SNR classification, quality gates G0-G12,
     %% unified low-q / DC exclusion (effective_q_min),
     %% PhysicsConfig (d-range, Nyquist guard),
-    %% and 32 output artifacts (8 data + 24 PNG).
+    %% ring analysis, domain clustering,
+    %% and 50 output artifacts (17 data + 38 PNG).
     %% ============================================================
 
-    subgraph INPUT["1/9 INPUT VALIDATION"]
+    subgraph INPUT["1/11 INPUT VALIDATION"]
         direction TB
         IN_FILE["Input File<br/>.dm4 / .dm3 / .tiff / .npy"]
         IN_META["Metadata Extraction<br/>(pixel_size_nm)"]
@@ -23,7 +24,7 @@ flowchart TB
         IN_FILE --> IN_META --> IN_GRID --> IN_QMIN --> IN_PHYSICS --> IN_G0 --> IN_G1
     end
 
-    subgraph PREPROCESS["2-3/9 TWO-BRANCH PREPROCESSING"]
+    subgraph PREPROCESS["2-3/11 TWO-BRANCH PREPROCESSING"]
         direction TB
 
         subgraph BRANCH_A["Branch A: FFT-Safe (no blur)"]
@@ -44,7 +45,7 @@ flowchart TB
         end
     end
 
-    subgraph ROI["4/9 EARLY ROI MASKING"]
+    subgraph ROI["4/11 EARLY ROI MASKING"]
         direction TB
 
         subgraph ROI_FEATURES["Feature Masks"]
@@ -69,7 +70,7 @@ flowchart TB
         ROI_SMOOTH --> ROI_TILE --> ROI_GRAD --> ROI_G3
     end
 
-    subgraph GLOBAL_FFT["5/9 GLOBAL FFT ANALYSIS"]
+    subgraph GLOBAL_FFT["5/11 GLOBAL FFT ANALYSIS"]
         direction TB
 
         subgraph GFFT_PREP["FFT Preparation"]
@@ -110,7 +111,7 @@ flowchart TB
         GF_TOPK --> GF_G4
     end
 
-    subgraph TILE_FFT["6/9 TILE FFT + TWO-TIER CLASSIFICATION"]
+    subgraph TILE_FFT["6/11 TILE FFT + TWO-TIER CLASSIFICATION"]
         direction TB
 
         TF_G5{{"Gate G5: Tiling Adequacy<br/>periods = tile_size / d_px >= 20<br/><b>FATAL on failure</b>"}}
@@ -148,7 +149,30 @@ flowchart TB
         TF_TIER --> TF_MAPS --> TF_G6 --> TF_G7 --> TF_G8
     end
 
-    subgraph GPA["7/9 GPA (optional, --no-gpa to skip)"]
+    subgraph RING_ANALYSIS["7/11 RING ANALYSIS (always-on when global peaks exist)"]
+        direction TB
+
+        RA_MAPS["<b>Per-Ring Spatial Maps</b><br/>Presence, peak count,<br/>orientation, SNR,<br/>angular variance<br/><i>Dict[ring_idx, ndarray]</i>"]
+        RA_FEATURES["<b>Ring Feature Vectors</b><br/>Per tile: 5 features/ring<br/>(presence, count, SNR,<br/>orientation, variance)<br/>+ 4 global features"]
+        RA_TILEAVG["<b>Tile-Averaged FFT</b><br/>Streaming mean of all<br/>valid tile power spectra<br/>+ radial profile"]
+
+        RA_MAPS --> RA_FEATURES --> RA_TILEAVG
+    end
+
+    subgraph DOMAIN_CLUSTER["8/11 DOMAIN CLUSTERING (opt-in, --cluster)"]
+        direction TB
+
+        DC_NORM["<b>Feature Normalization</b><br/>StandardScaler + NaN imputation"]
+        DC_DIMRED["<b>Dimensionality Reduction</b><br/>PCA (95% variance) or UMAP<br/><i>--cluster-dimred pca|umap|none</i>"]
+        DC_CLUSTER["<b>Clustering</b><br/>K-means / GMM / HDBSCAN<br/><i>--cluster-method, --cluster-n</i>"]
+        DC_AUTOK["<b>Auto-K Selection</b><br/>Silhouette scan k=2..10<br/><i>When --cluster-n 0</i>"]
+        DC_REGULARIZE["<b>Spatial Regularization</b><br/>Majority-vote smoothing<br/>+ adjacency metrics"]
+        DC_SUMMARY["<b>Cluster Summaries</b><br/>Dominant rings, orientations,<br/>cluster-averaged FFTs"]
+
+        DC_NORM --> DC_DIMRED --> DC_CLUSTER --> DC_AUTOK --> DC_REGULARIZE --> DC_SUMMARY
+    end
+
+    subgraph GPA["9/11 GPA (optional, --no-gpa to skip)"]
         direction TB
 
         GPA_ENTRY{{"Entry Gate<br/>Skip if guidance='none'<br/>or tier_a_fraction < 10%"}}
@@ -189,7 +213,7 @@ flowchart TB
         GPA_STRAIN_COMP --> GPA_G11
     end
 
-    subgraph PEAKFIND["8/9 PEAK FINDING (optional, --no-peak-finding to skip)"]
+    subgraph PEAKFIND["10/11 PEAK FINDING (optional, --no-peak-finding to skip)"]
         direction TB
 
         subgraph PF_BANDPASS["Bandpass Filtering"]
@@ -216,7 +240,7 @@ flowchart TB
         PF_SUBPX --> PF_KDTREE --> PF_VALID --> PF_G12
     end
 
-    subgraph VALIDATION["9/9 VALIDATION + REPORTING"]
+    subgraph VALIDATION["11/11 VALIDATION + REPORTING"]
         direction TB
         VAL_GATES["Aggregate All Gates<br/>(G1-G12 results)"]
         VAL_METRICS["Collect Diagnostics<br/>(preproc confidence, ROI coverage,<br/>FWHM distribution, orientation std)"]
@@ -224,10 +248,10 @@ flowchart TB
         VAL_GATES --> VAL_METRICS --> VAL_PASS
     end
 
-    subgraph OUTPUT["Output Artifacts (25 files)"]
+    subgraph OUTPUT["Output Artifacts (34+ files)"]
         direction TB
 
-        subgraph OUT_DATA["Data Artifacts (8 files)"]
+        subgraph OUT_DATA["Data Artifacts (17 files)"]
             direction TB
 
             subgraph OUT_JSON["JSON"]
@@ -245,9 +269,26 @@ flowchart TB
                 ART_TIER[("tier_map.npy<br/><i>uint8 (n_rows, n_cols)<br/>0=skip, 1=reject, 2=B, 3=A</i>")]
                 ART_PEAKS[("lattice_peaks.npy<br/><i>float64 (N, 5)<br/>x, y, intensity, sigma_x, sigma_y</i>")]
             end
+
+            subgraph OUT_RING["Ring Analysis Data"]
+                direction LR
+                ART_RINGMAPS[("ring_maps.npz<br/><i>Per-ring presence, count,<br/>orientation, SNR maps</i>")]
+                ART_RINGFEAT[("ring_feature_vectors.npy<br/><i>float64 (n_tiles, n_features)</i>")]
+                ART_RINGNAMES[("ring_feature_names.json<br/><i>Feature name list</i>")]
+                ART_TILEAVG[("average_tile_fft.npy<br/><i>Mean power spectrum</i>")]
+                ART_TILERADIAL[("average_tile_radial_profile.json<br/><i>q_values, profile, n_tiles</i>")]
+            end
+
+            subgraph OUT_CLUSTER["Clustering Data (--cluster)"]
+                direction LR
+                ART_CLABELS[("cluster_labels.npy<br/><i>int32 (n_rows, n_cols)</i>")]
+                ART_CLABELS_REG[("cluster_labels_regularized.npy<br/><i>int32 (n_rows, n_cols)</i>")]
+                ART_CAVGFFT[("cluster_averaged_ffts.npz<br/><i>Per-cluster mean power</i>")]
+                ART_CRESULTS[("clustering_results.json<br/><i>method, n_clusters, silhouette,<br/>per-cluster summaries</i>")]
+            end
         end
 
-        subgraph OUT_VIZ["PNG Visualizations (24 files, --no-viz to skip, --viz-dpi to set resolution)"]
+        subgraph OUT_VIZ["PNG Visualizations (38 files, --no-viz to skip, --viz-dpi to set resolution)"]
             direction TB
 
             subgraph VIZ_ROW1["Input + Global FFT (3 files)"]
@@ -301,6 +342,28 @@ flowchart TB
                 VIZ_STRAINOUT[("gpa_strain_outlier_map.png<br/><i>Binary overlay of<br/>strain outlier pixels</i>")]
                 VIZ_NNHIST[("peaks_nn_distance_histogram.png<br/><i>NN distance distribution<br/>expected-d line + tol band</i>")]
             end
+
+            subgraph VIZ_ROW8["Ring Analysis (7 files)"]
+                direction LR
+                VIZ_RINGPRES[("ring_presence_maps.png<br/><i>Per-ring presence<br/>viridis [0,1]</i>")]
+                VIZ_RINGCOUNT[("ring_peak_count_maps.png<br/><i>Per-ring peak count<br/>integer colorbar</i>")]
+                VIZ_RINGORIENT[("ring_orientation_maps.png<br/><i>Per-ring orientation<br/>HSV cyclic 0-180°</i>")]
+                VIZ_RINGPEAKLOC[("ring_peak_locations_overlay.png<br/><i>Per-ring tile markers<br/>on original image</i>")]
+                VIZ_RINGORIENTOV[("ring_orientation_overlay.png<br/><i>Per-ring orientation<br/>coloring on image</i>")]
+                VIZ_AVGTILEFFT[("average_tile_fft.png<br/><i>All-tiles mean power<br/>log scale + ring markers</i>")]
+                VIZ_AVGTILERADIAL[("average_tile_radial_profile.png<br/><i>Radial profile from<br/>tile-averaged FFT</i>")]
+            end
+
+            subgraph VIZ_ROW9["Clustering (7 files, --cluster)"]
+                direction LR
+                VIZ_CLUSTMAP[("cluster_label_map.png<br/><i>Discrete colormap<br/>legend with cluster IDs</i>")]
+                VIZ_CLUSTOVERLAY[("cluster_overlay.png<br/><i>Domain boundaries<br/>on raw image</i>")]
+                VIZ_EMBEDDING[("feature_embedding.png<br/><i>2D PCA/UMAP scatter<br/>colored by cluster</i>")]
+                VIZ_CAVGFFTS[("cluster_averaged_ffts.png<br/><i>Per-cluster mean power<br/>spectra (log scale)</i>")]
+                VIZ_CRADIAL[("cluster_radial_profiles.png<br/><i>Overlaid radial profiles<br/>colored by cluster</i>")]
+                VIZ_SILHOUETTE[("silhouette_curve.png<br/><i>Silhouette score vs K<br/>marks selected K</i>")]
+                VIZ_RINGCLUST[("ring_vs_cluster_comparison.png<br/><i>Side-by-side ring presence<br/>vs cluster map</i>")]
+            end
         end
     end
 
@@ -318,11 +381,17 @@ flowchart TB
     ROI -->|"tile grid mask"| TILE_FFT
 
     GLOBAL_FFT -->|"d_dom, q_ranges,<br/>g_vectors"| TILE_FFT
+    GLOBAL_FFT -->|"global_peaks"| RING_ANALYSIS
     GLOBAL_FFT -->|"g_vectors"| GPA
     GLOBAL_FFT -->|"d_dom, |g_dom|"| PEAKFIND
 
+    TILE_FFT -->|"GatedTileGrid"| RING_ANALYSIS
     TILE_FFT -->|"GatedTileGrid<br/>(tier/SNR/orientation maps)"| GPA
     TILE_FFT -->|"GatedTileGrid"| VALIDATION
+
+    RING_ANALYSIS -->|"ring_features"| DOMAIN_CLUSTER
+    RING_ANALYSIS -->|"ring_maps"| VALIDATION
+    DOMAIN_CLUSTER -->|"clustering_result"| VALIDATION
 
     GPA -->|"GPAResult<br/>(phases, strain)"| VALIDATION
     PEAKFIND -->|"peaks, LatticeValidation"| VALIDATION
@@ -360,6 +429,31 @@ flowchart TB
     PEAKFIND -->|"lattice_validation"| ART_PEAKSTATS
     PEAKFIND -->|"peaks + bandpass_image<br/>+ lattice_validation"| VIZ_LATTICE
 
+    RING_ANALYSIS -->|"ring_maps"| ART_RINGMAPS
+    RING_ANALYSIS -->|"feature_matrix"| ART_RINGFEAT
+    RING_ANALYSIS -->|"feature_names"| ART_RINGNAMES
+    RING_ANALYSIS -->|"mean_power"| ART_TILEAVG
+    RING_ANALYSIS -->|"radial_profile"| ART_TILERADIAL
+    RING_ANALYSIS -->|"presence maps"| VIZ_RINGPRES
+    RING_ANALYSIS -->|"peak count maps"| VIZ_RINGCOUNT
+    RING_ANALYSIS -->|"orientation maps"| VIZ_RINGORIENT
+    RING_ANALYSIS -->|"peak locations"| VIZ_RINGPEAKLOC
+    RING_ANALYSIS -->|"orientation overlay"| VIZ_RINGORIENTOV
+    RING_ANALYSIS -->|"tile avg power"| VIZ_AVGTILEFFT
+    RING_ANALYSIS -->|"tile avg radial"| VIZ_AVGTILERADIAL
+
+    DOMAIN_CLUSTER -->|"labels"| ART_CLABELS
+    DOMAIN_CLUSTER -->|"labels_regularized"| ART_CLABELS_REG
+    DOMAIN_CLUSTER -->|"cluster FFTs"| ART_CAVGFFT
+    DOMAIN_CLUSTER -->|"results"| ART_CRESULTS
+    DOMAIN_CLUSTER -->|"label map"| VIZ_CLUSTMAP
+    DOMAIN_CLUSTER -->|"boundaries"| VIZ_CLUSTOVERLAY
+    DOMAIN_CLUSTER -->|"embedding"| VIZ_EMBEDDING
+    DOMAIN_CLUSTER -->|"cluster FFTs"| VIZ_CAVGFFTS
+    DOMAIN_CLUSTER -->|"radial profiles"| VIZ_CRADIAL
+    DOMAIN_CLUSTER -->|"silhouette curve"| VIZ_SILHOUETTE
+    DOMAIN_CLUSTER -->|"comparison"| VIZ_RINGCLUST
+
     ROI -->|"mask + diagnostics"| VIZ_ROI
     GLOBAL_FFT -->|"background residual"| VIZ_BGRESID
     TILE_FFT -->|"tier_map + ref region"| VIZ_REFBND
@@ -383,6 +477,8 @@ flowchart TB
     class TF_HANN,TF_DC,TF_LOCALMAX,TF_SNR,TF_FWHM,TF_ORIENT filterNode
     class GPA_GMASK,GPA_DEMOD,GPA_UNWRAP,GPA_AMPMASK,GPA_SMOOTH,GF_GUIDANCE,GF_DIAG filterNode
     class PF_RING,PF_LOCALMAX,PF_THRESH filterNode
+    class RA_MAPS,RA_FEATURES,RA_TILEAVG filterNode
+    class DC_NORM,DC_DIMRED,DC_CLUSTER,DC_AUTOK,DC_REGULARIZE,DC_SUMMARY filterNode
 
     %% Gate nodes (purple/red)
     classDef gateNode fill:#fce4ec,stroke:#c62828,stroke-width:2px,color:#b71c1c
@@ -393,6 +489,8 @@ flowchart TB
     classDef artifactNode fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#1b5e20
     class ART_PARAMS,ART_REPORT,ART_GVEC,ART_TIER artifactNode
     class ART_GPA_MODE,ART_GPA_REF,ART_PEAKS,ART_PEAKSTATS artifactNode
+    class ART_RINGMAPS,ART_RINGFEAT,ART_RINGNAMES,ART_TILEAVG,ART_TILERADIAL artifactNode
+    class ART_CLABELS,ART_CLABELS_REG,ART_CAVGFFT,ART_CRESULTS artifactNode
 
     %% PNG visualization nodes (teal)
     classDef vizNode fill:#e0f7fa,stroke:#00695c,stroke-width:2px,color:#004d40
@@ -404,10 +502,14 @@ flowchart TB
     class VIZ_LATTICE vizNode
     class VIZ_ROI,VIZ_BGRESID,VIZ_REFBND,VIZ_EXEMPLAR vizNode
     class VIZ_PHASENOISE,VIZ_STRAINOUT,VIZ_NNHIST vizNode
+    class VIZ_RINGPRES,VIZ_RINGCOUNT,VIZ_RINGORIENT,VIZ_RINGPEAKLOC vizNode
+    class VIZ_RINGORIENTOV,VIZ_AVGTILEFFT,VIZ_AVGTILERADIAL vizNode
+    class VIZ_CLUSTMAP,VIZ_CLUSTOVERLAY,VIZ_EMBEDDING vizNode
+    class VIZ_CAVGFFTS,VIZ_CRADIAL,VIZ_SILHOUETTE,VIZ_RINGCLUST vizNode
 
     %% Stage subgraph styling
     classDef stageSubgraph fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
-    class INPUT,PREPROCESS,ROI,GLOBAL_FFT,TILE_FFT,GPA,PEAKFIND,VALIDATION stageSubgraph
+    class INPUT,PREPROCESS,ROI,GLOBAL_FFT,TILE_FFT,RING_ANALYSIS,DOMAIN_CLUSTER,GPA,PEAKFIND,VALIDATION stageSubgraph
 
     %% Artifact subgraph styling
     classDef artifactSubgraph fill:#f1f8e9,stroke:#558b2f,stroke-width:1px,stroke-dasharray: 5 5
