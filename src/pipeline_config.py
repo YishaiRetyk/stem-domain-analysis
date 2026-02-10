@@ -359,7 +359,21 @@ class GlobalFFTResult:
 
 @dataclass
 class PreprocConfig:
-    """FFT-safe preprocessing configuration."""
+    """FFT-safe preprocessing configuration.
+
+    Scientific impact:
+    - These parameters control how strongly intensity outliers are suppressed
+      before FFT analysis.
+    - More aggressive clipping/denoising usually improves peak robustness in
+      noisy micrographs, but can attenuate weak lattice reflections.
+
+    Practical tuning:
+    - Start with defaults.
+    - Increase ``hot_pixel_sigma`` if true Bragg spots are occasionally
+      removed as outliers.
+    - Decrease ``hot_pixel_sigma`` or increase ``robust_norm_clip_sigma`` only
+      when detector spikes dominate the spectrum.
+    """
     clip_percentile: float = 0.1
     normalize_method: str = "robust"        # 'robust' or 'minmax'
     hot_pixel_removal: bool = True          # I1
@@ -370,14 +384,30 @@ class PreprocConfig:
 
 @dataclass
 class SegmentationPreprocConfig:
-    """Segmentation preprocessing configuration."""
+    """Segmentation branch preprocessing.
+
+    ``smooth_sigma`` stabilizes binary/ROI estimation, not the FFT branch.
+    Larger values reduce salt-and-pepper noise in masks but can erode thin
+    features and boundary detail.
+    """
     clip_percentile: float = 0.1
     smooth_sigma: float = 0.5
 
 
 @dataclass
 class ROIConfig:
-    """ROI masking configuration."""
+    """ROI masking and morphology controls.
+
+    Scientific impact:
+    - Determines which image regions contribute to tile-level FFT statistics.
+    - Tight ROI thresholds reduce false positives from void/background areas
+      but may remove physically relevant sparse domains.
+
+    Usage notes:
+    - ``min_coverage_pct``/``max_coverage_pct`` set acceptable usable area.
+    - ``min_lcc_fraction`` and morphology parameters govern mask continuity;
+      increase when fragmented masks degrade downstream orientation maps.
+    """
     min_coverage_pct: float = 10.0
     max_coverage_pct: float = 95.0
     max_fragments: int = 20
@@ -394,14 +424,24 @@ class ROIConfig:
 
 @dataclass
 class TierConfig:
-    """Two-tier SNR configuration."""
+    """Two-tier SNR classification cutoffs.
+
+    ``tier_a_snr`` is the high-confidence threshold; ``tier_b_snr`` is the
+    permissive threshold for marginal-but-usable tiles. Raising either value
+    improves precision at the cost of spatial coverage.
+    """
     tier_a_snr: float = 5.0
     tier_b_snr: float = 3.0
 
 
 @dataclass
 class FWHMConfig:
-    """FWHM measurement configuration."""
+    """Peak-width (FWHM) estimation controls.
+
+    FWHM is a proxy for reciprocal-space sharpness/crystallinity. Reliable
+    fits help discriminate diffuse scattering from coherent lattice peaks.
+    ``min_snr_for_fit`` avoids unstable nonlinear fits on weak peaks.
+    """
     enabled: bool = True
     method: str = "auto"           # auto | proxy_only | curve_fit
     maxfev: int = 500              # max iterations for curve_fit (was 2000)
@@ -428,7 +468,16 @@ class ConfidenceConfig:
 
 @dataclass
 class PeakGateConfig:
-    """Peak quality gate thresholds."""
+    """Per-tile peak quality gates.
+
+    Scientific interpretation:
+    - ``max_fwhm_ratio``: upper bound on peak broadening relative to |g|.
+      Lower values enforce sharper reciprocal-space order.
+    - ``min_pair_fraction``: enforces ±g symmetry consistency expected from
+      real lattice periodicity.
+    - ``min_non_collinear``: requires multiple non-collinear vectors for more
+      stable orientation/strain inference.
+    """
     max_fwhm_ratio: float = 0.15
     min_pair_fraction: float = 0.3          # was min_symmetry
     min_non_collinear: int = 2
@@ -446,7 +495,22 @@ class PeakGateConfig:
 
 @dataclass
 class GlobalFFTConfig:
-    """Global FFT configuration."""
+    """Global radial/azimuthal FFT analysis controls.
+
+    Scientific impact:
+    - Governs how dominant reciprocal spacings are detected and how global
+      FFT guidance is produced for tile-level analysis.
+    - Background model parameters (polynomial and reweighting) affect weak-peak
+      recovery: underfitting leaves baseline bias, overfitting suppresses real
+      broad peaks.
+
+    Recommended workflow:
+    1) Keep smoothing (Savitzky-Golay) modest.
+    2) Tune ``min_peak_snr`` and ``radial_peak_distance`` for your noise level
+       and expected ring crowding.
+    3) Adjust harmonic tolerances only if harmonics/fundamentals are routinely
+       mis-assigned in your modality.
+    """
     max_image_size: int = 4096
     background_poly_degree: int = 6
     min_peak_snr: float = 3.0
@@ -473,7 +537,20 @@ class GlobalFFTConfig:
 
 @dataclass
 class GPAConfig:
-    """GPA configuration."""
+    """Geometric Phase Analysis (GPA) controls.
+
+    Scientific impact:
+    - Sets the strictness of phase extraction, unwrapping acceptance, and
+      strain quality limits.
+    - Conservative thresholds (low phase-noise tolerance, high unwrap success)
+      improve reliability but can reduce valid area in defective/noisy regions.
+
+    Usage guidance:
+    - Use ``mode='auto'`` first; switch to ``region`` when only localized
+      ordered domains are trustworthy.
+    - ``amplitude_threshold`` and mask-sigma factors are the main levers for
+      balancing noise rejection vs. phase coverage.
+    """
     enabled: bool = True
     mode: str = "auto"                      # auto | full | region
     on_fail: str = "fallback_to_region"     # fallback_to_region | skip | error
@@ -506,7 +583,14 @@ class GPAConfig:
 
 @dataclass
 class PeakFindingConfig:
-    """Peak-finding configuration."""
+    """Real-space lattice peak-finding controls.
+
+    ``min_separation_factor`` and ``lattice_tolerance`` set the geometric
+    strictness of nearest-neighbor lattice validation. Increasing strictness
+    reduces false detections but may reject strained/defective lattices.
+    Directional masks (``use_directional_mask``) are usually preferable for
+    anisotropic textures.
+    """
     enabled: bool = True
     min_separation_factor: float = 0.6
     min_separation_px_floor: int = 2
@@ -524,7 +608,11 @@ class PeakFindingConfig:
 
 @dataclass
 class ValidationConfig:
-    """Validation gate thresholds."""
+    """Legacy validation thresholds (kept for backward compatibility).
+
+    New deployments should prefer ``GateThresholdsConfig``. These fields are
+    still accepted and mapped internally for older config files.
+    """
     min_detection_rate: float = 0.05
     min_periods: float = 20.0
     min_tier_a_snr_median: float = 5.0
@@ -553,7 +641,12 @@ class VizConfig:
 
 @dataclass
 class PhysicsConfig:
-    """Physical constraints and imaging mode configuration."""
+    """Physical priors for reciprocal-space filtering.
+
+    Set ``d_min_nm``/``d_max_nm`` when prior crystallographic spacing bounds
+    are known. This narrows search space, improves robustness, and reduces
+    spurious peaks outside physically plausible bands.
+    """
     imaging_mode: str = "EFTEM-BF"          # informational, logged in report
     d_min_nm: float = 0.0                   # expected minimum d-spacing (nm); 0 = unconstrained
     d_max_nm: float = 0.0                   # expected maximum d-spacing (nm); 0 = unconstrained
@@ -562,7 +655,12 @@ class PhysicsConfig:
 
 @dataclass
 class TileFFTConfig:
-    """Tile FFT peak detection configuration."""
+    """Tile-level FFT peak detection controls.
+
+    ``q_dc_min`` is critical: too low admits DC/low-q background, too high can
+    remove long-period superstructure peaks. ``peak_snr_threshold`` is the
+    primary sensitivity knob for per-tile detections.
+    """
     q_dc_min: float = 0.25                  # cycles/nm, replaces pixel-based DC mask
     peak_snr_threshold: float = 2.5         # replaces peak_threshold_frac for primary detection
     local_max_size: int = 5                 # footprint for local max detection (pixels)
@@ -573,7 +671,12 @@ class TileFFTConfig:
 
 @dataclass
 class LowQExclusionConfig:
-    """Unified low-q / DC exclusion configuration."""
+    """Unified low-q/DC exclusion policy.
+
+    Excluding low-q suppresses illumination gradients and thickness contrast.
+    Disable or relax only if your target periodicities are genuinely long-range
+    (large d-spacing, small q).
+    """
     enabled: bool = True
     q_min_cycles_per_nm: float = 0.1   # physical floor (d < 10 nm)
     dc_bin_count: int = 3              # radial bins always excluded
@@ -582,7 +685,19 @@ class LowQExclusionConfig:
 
 @dataclass
 class ClusteringConfig:
-    """Domain clustering configuration (opt-in via --cluster)."""
+    """Domain clustering controls (opt-in via ``--cluster``).
+
+    Scientific impact:
+    - Clustering partitions tiles into orientation/quality domains for
+      mesoscale interpretation.
+    - ``regularize`` and ``min_domain_size`` favor spatially coherent domains,
+      reducing single-tile noise clusters.
+
+    Method hints:
+    - ``kmeans``: fast baseline when roughly spherical clusters are expected.
+    - ``gmm``: allows anisotropic covariance.
+    - ``hdbscan``: robust to irregular cluster shapes and outliers.
+    """
     enabled: bool = False
     method: str = "kmeans"          # kmeans | gmm | hdbscan
     n_clusters: int = 0             # 0 = auto (silhouette scan / hdbscan auto)
@@ -674,7 +789,12 @@ class GateThresholdsConfig:
 
 @dataclass
 class PeakSNRConfig:
-    """Peak SNR and FWHM measurement tunables."""
+    """Local peak-SNR/FWHM metrology settings.
+
+    These govern how signal and local background are sampled around each FFT
+    peak. Annulus settings that are too narrow can bias SNR high; too wide can
+    include neighboring reflections and bias SNR low.
+    """
     signal_disk_radius_px: int = 3
     annular_width_min_q: float = 0.15
     annular_fwhm_multiplier: float = 1.5
@@ -688,7 +808,12 @@ class PeakSNRConfig:
 
 @dataclass
 class ReferenceSelectionConfig:
-    """Reference region scoring weights and bins."""
+    """Reference-region scoring weights for GPA anchoring.
+
+    ``scoring_weight_entropy`` favors orientationally coherent regions,
+    ``scoring_weight_snr`` favors stronger diffraction, and
+    ``scoring_weight_area`` favors larger stable supports.
+    """
     scoring_weight_entropy: float = 0.4
     scoring_weight_snr: float = 0.3
     scoring_weight_area: float = 0.3
@@ -697,7 +822,12 @@ class ReferenceSelectionConfig:
 
 @dataclass
 class RingAnalysisConfig:
-    """Ring analysis tunables."""
+    """Reciprocal-space ring width controls.
+
+    Width multipliers set the integration band around detected q-rings.
+    Wider bands increase tolerance to broad peaks/strain but include more
+    background; narrower bands improve specificity for sharp peaks.
+    """
     ring_width_fwhm_mult: float = 2.0
     ring_width_fallback_frac: float = 0.03
     ring_width_no_fwhm_frac: float = 0.1
@@ -705,7 +835,16 @@ class RingAnalysisConfig:
 
 @dataclass
 class PipelineConfig:
-    """Top-level pipeline configuration."""
+    """Top-level pipeline configuration.
+
+    Researcher quick start:
+    1) Set ``pixel_size_nm`` correctly (all q/d calibration depends on this).
+    2) Choose ``tile_size``/``stride`` to balance spatial resolution and SNR.
+       Smaller tiles improve spatial localization but broaden FFT peaks.
+    3) Tune detection strictness in order: ``global_fft`` -> ``peak_gates`` ->
+       ``gate_thresholds``.
+    4) Enable/tune ``gpa`` only after stable peak detection is achieved.
+    """
     pixel_size_nm: float = 0.1297
     tile_size: int = 256
     stride: int = 128
