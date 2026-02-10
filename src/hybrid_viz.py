@@ -83,6 +83,10 @@ def save_pipeline_visualizations(
             _try("detection_confidence_heatmap",
                  _save_detection_confidence_heatmap, gated_grid, out, dpi)
 
+        _try("peak_detection_heatmap",
+             _save_peak_detection_heatmap, gated_grid, config, pixel_size_nm,
+             out, dpi, effective_q_min)
+
     # 7-10. GPA phase + amplitude
     if gpa_result is not None and gpa_result.phases:
         for i, (key, phase_result) in enumerate(gpa_result.phases.items()):
@@ -260,7 +264,9 @@ def _save_fft_power_spectrum(global_fft_result, fft_grid, out_dir, dpi,
 
     fig, ax = plt.subplots(figsize=(8, 8))
     display = np.log1p(ps)
-    im = ax.imshow(display, cmap="inferno", origin="upper")
+    valid = display[display > 0]
+    vmin = np.percentile(valid, 5) if len(valid) > 0 else 0
+    im = ax.imshow(display, cmap="inferno", origin="upper", vmin=vmin)
     plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="log(Power + 1)")
 
     # Dashed circle at q_min exclusion boundary
@@ -394,6 +400,70 @@ def _save_detection_confidence_heatmap(gated_grid, out_dir, dpi):
     ax.set_title("Detection Confidence Heatmap")
     ax.set_xlabel("Column")
     ax.set_ylabel("Row")
+
+    plt.savefig(str(path), dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Saved: %s", path)
+    return path
+
+
+def _save_peak_detection_heatmap(gated_grid, config, pixel_size_nm, out_dir, dpi,
+                                 effective_q_min=0.0):
+    """Accumulate detected FFT peaks in frequency space across all tiles.
+
+    Produces a heatmap showing where peaks cluster in the shared tile-FFT
+    coordinate system, revealing crystallographic orientations as bright spots
+    on a ring at the dominant d-spacing.
+    """
+    from scipy.ndimage import gaussian_filter
+    path = out_dir / "peak_detection_heatmap.png"
+    _ensure_dir(path)
+
+    tile_size = config.tile_size
+    accumulator = np.zeros((tile_size, tile_size), dtype=np.float64)
+    q_scale = 1.0 / (tile_size * pixel_size_nm)  # cycles/nm per pixel
+    cy, cx = tile_size // 2, tile_size // 2
+
+    n_peaks = 0
+    n_tiles = 0
+    n_rows, n_cols = gated_grid.classifications.shape
+    for r in range(n_rows):
+        for c in range(n_cols):
+            if gated_grid.skipped_mask[r, c]:
+                continue
+            tc = gated_grid.classifications[r, c]
+            if tc is None or tc.tier == "REJECTED":
+                continue
+            n_tiles += 1
+            for pm in tc.peaks:
+                qx = pm.get("qx", None)
+                qy = pm.get("qy", None)
+                if qx is None or qy is None:
+                    continue
+                px = int(round(cx + qx / q_scale))
+                py = int(round(cy + qy / q_scale))
+                if 0 <= px < tile_size and 0 <= py < tile_size:
+                    accumulator[py, px] += 1
+                    n_peaks += 1
+
+    if n_peaks == 0:
+        return None
+
+    # Light Gaussian smooth for visual clarity
+    smoothed = gaussian_filter(accumulator, sigma=1.0)
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    im = ax.imshow(smoothed, cmap="inferno", origin="upper")
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Detection count")
+
+    # Dashed circle at q_min exclusion boundary
+    if effective_q_min > 0:
+        r_px = effective_q_min / q_scale
+        circle = plt.Circle((cx, cy), r_px, fill=False, edgecolor='white',
+                             linestyle='--', linewidth=1.0, alpha=0.8)
+        ax.add_patch(circle)
+
+    ax.set_title(f"Peak Detection Heatmap ({n_peaks} peaks from {n_tiles} tiles)")
 
     plt.savefig(str(path), dpi=dpi, bbox_inches="tight")
     plt.close(fig)
