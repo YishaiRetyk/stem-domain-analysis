@@ -246,11 +246,17 @@ def compute_tile_averaged_fft(
     stride: int,
     pixel_size_nm: float,
     skipped_mask: np.ndarray,
+    effective_q_min: float = 0.0,
 ) -> dict:
     """Streaming mean of all valid tile power spectra.
 
+    Parameters
+    ----------
+    effective_q_min : float
+        Bins with q < effective_q_min are zeroed (DC / low-q suppression).
+
     Returns dict with mean_power (tile_size, tile_size),
-    radial_profile, q_values, n_tiles.
+    radial_profile, q_values, n_tiles, effective_q_min.
     """
     from src.fft_coords import FFTGrid
     from src.fft_features import get_tiling_info, create_2d_hann_window
@@ -259,6 +265,11 @@ def compute_tile_averaged_fft(
     info = get_tiling_info(image_fft.shape, tile_size, stride)
     n_rows, n_cols = info["grid_shape"]
     window = create_2d_hann_window(tile_size)
+
+    # Pre-compute low-q mask
+    grid = FFTGrid(tile_size, tile_size, pixel_size_nm)
+    q_mag = grid.q_mag_grid()
+    lowq_mask = q_mag < effective_q_min if effective_q_min > 0 else None
 
     mean_power = np.zeros((tile_size, tile_size), dtype=np.float64)
     n_tiles = 0
@@ -276,22 +287,25 @@ def compute_tile_averaged_fft(
             windowed = tile.astype(np.float64) * window
             fft_shifted = np.fft.fftshift(np.fft.fft2(windowed))
             power = np.abs(fft_shifted) ** 2
+            if lowq_mask is not None:
+                power[lowq_mask] = 0.0
             mean_power += power
             n_tiles += 1
 
     if n_tiles > 0:
         mean_power /= n_tiles
 
-    # Compute radial profile
-    grid = FFTGrid(tile_size, tile_size, pixel_size_nm)
-    q_mag = grid.q_mag_grid()
+    # Compute radial profile (skip low-q bins)
     q_max = q_mag.max()
     n_bins = tile_size // 2
     bin_edges = np.linspace(0, q_max, n_bins + 1)
     q_values = (bin_edges[:-1] + bin_edges[1:]) / 2
     radial_profile = np.zeros(n_bins)
     for i in range(n_bins):
-        mask = (q_mag >= bin_edges[i]) & (q_mag < bin_edges[i + 1])
+        lo, hi = bin_edges[i], bin_edges[i + 1]
+        if effective_q_min > 0 and hi <= effective_q_min:
+            continue  # skip bins entirely within exclusion zone
+        mask = (q_mag >= max(lo, effective_q_min)) & (q_mag < hi)
         if np.any(mask):
             radial_profile[i] = np.mean(mean_power[mask])
 
@@ -300,6 +314,7 @@ def compute_tile_averaged_fft(
         "radial_profile": radial_profile,
         "q_values": q_values,
         "n_tiles": n_tiles,
+        "effective_q_min": effective_q_min,
     }
 
 
@@ -314,6 +329,7 @@ def compute_cluster_averaged_ffts(
     stride: int,
     pixel_size_nm: float,
     skipped_mask: np.ndarray,
+    effective_q_min: float = 0.0,
 ) -> Dict[int, dict]:
     """Streaming per-cluster mean power spectra.
 
@@ -324,6 +340,8 @@ def compute_cluster_averaged_ffts(
     tile_size, stride : tiling params
     pixel_size_nm : pixel size
     skipped_mask : (n_rows, n_cols) bool
+    effective_q_min : float
+        Bins with q < effective_q_min are zeroed (DC / low-q suppression).
 
     Returns
     -------
@@ -336,6 +354,11 @@ def compute_cluster_averaged_ffts(
     info = get_tiling_info(image_fft.shape, tile_size, stride)
     n_rows, n_cols = info["grid_shape"]
     window = create_2d_hann_window(tile_size)
+
+    # Pre-compute low-q mask
+    grid = FFTGrid(tile_size, tile_size, pixel_size_nm)
+    q_mag = grid.q_mag_grid()
+    lowq_mask = q_mag < effective_q_min if effective_q_min > 0 else None
 
     unique_labels = set(int(x) for x in np.unique(cluster_labels) if x >= 0)
     accum = {
@@ -361,12 +384,12 @@ def compute_cluster_averaged_ffts(
             windowed = tile.astype(np.float64) * window
             fft_shifted = np.fft.fftshift(np.fft.fft2(windowed))
             power = np.abs(fft_shifted) ** 2
+            if lowq_mask is not None:
+                power[lowq_mask] = 0.0
             accum[lid]["sum_power"] += power
             accum[lid]["count"] += 1
 
     # Convert to results
-    grid = FFTGrid(tile_size, tile_size, pixel_size_nm)
-    q_mag = grid.q_mag_grid()
     q_max = q_mag.max()
     n_bins = tile_size // 2
     bin_edges = np.linspace(0, q_max, n_bins + 1)
@@ -380,7 +403,10 @@ def compute_cluster_averaged_ffts(
         mean_power = acc["sum_power"] / n
         radial_profile = np.zeros(n_bins)
         for i in range(n_bins):
-            mask = (q_mag >= bin_edges[i]) & (q_mag < bin_edges[i + 1])
+            lo, hi = bin_edges[i], bin_edges[i + 1]
+            if effective_q_min > 0 and hi <= effective_q_min:
+                continue
+            mask = (q_mag >= max(lo, effective_q_min)) & (q_mag < hi)
             if np.any(mask):
                 radial_profile[i] = np.mean(mean_power[mask])
         results[lid] = {

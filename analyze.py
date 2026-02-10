@@ -1027,7 +1027,8 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
 
         tile_avg_fft = compute_tile_averaged_fft(
             preproc_record.image_fft, config.tile_size, config.stride,
-            pixel_size, gated_grid.skipped_mask)
+            pixel_size, gated_grid.skipped_mask,
+            effective_q_min=tile_effective_q_min)
         print(f"  Tile-averaged FFT: {tile_avg_fft['n_tiles']} tiles")
 
         # --- Step 8: Domain Clustering ---
@@ -1042,6 +1043,7 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
                 stride=config.stride,
                 pixel_size_nm=pixel_size,
                 skipped_mask=gated_grid.skipped_mask,
+                effective_q_min=tile_effective_q_min,
             )
             print(f"  Method: {clustering_result.method_used}")
             print(f"  Clusters: {clustering_result.n_clusters}")

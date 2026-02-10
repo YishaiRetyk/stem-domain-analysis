@@ -165,9 +165,11 @@ def save_pipeline_visualizations(
 
     if tile_avg_fft is not None:
         _try("average_tile_fft",
-             _save_average_tile_fft, tile_avg_fft, global_fft_result, out, dpi)
+             _save_average_tile_fft, tile_avg_fft, global_fft_result, out, dpi,
+             effective_q_min)
         _try("average_tile_radial_profile",
-             _save_average_tile_radial_profile, tile_avg_fft, global_fft_result, out, dpi)
+             _save_average_tile_radial_profile, tile_avg_fft, global_fft_result, out, dpi,
+             effective_q_min)
 
     # --- Clustering visualizations ---
     if clustering_result is not None and clustering_result.n_clusters > 0:
@@ -181,9 +183,11 @@ def save_pipeline_visualizations(
                  _save_feature_embedding_viz, clustering_result, out, dpi)
         if clustering_result.cluster_averaged_ffts:
             _try("cluster_averaged_ffts",
-                 _save_cluster_averaged_ffts_viz, clustering_result, out, dpi)
+                 _save_cluster_averaged_ffts_viz, clustering_result, out, dpi,
+                 effective_q_min)
             _try("cluster_radial_profiles",
-                 _save_cluster_radial_profiles, clustering_result, out, dpi)
+                 _save_cluster_radial_profiles, clustering_result, out, dpi,
+                 effective_q_min)
         if clustering_result.silhouette_curve:
             _try("silhouette_curve",
                  _save_silhouette_curve, clustering_result, out, dpi)
@@ -946,7 +950,8 @@ def _save_ring_orientation_overlay(ring_maps, raw_image, config, out_dir, dpi):
     return path
 
 
-def _save_average_tile_fft(tile_avg_fft, global_fft_result, out_dir, dpi):
+def _save_average_tile_fft(tile_avg_fft, global_fft_result, out_dir, dpi,
+                           effective_q_min=0.0):
     """Annotated all-tiles average power spectrum (log scale)."""
     path = out_dir / "average_tile_fft.png"
     _ensure_dir(path)
@@ -954,8 +959,25 @@ def _save_average_tile_fft(tile_avg_fft, global_fft_result, out_dir, dpi):
     ps = tile_avg_fft["mean_power"]
     fig, ax = plt.subplots(figsize=(8, 8))
     display = np.log1p(ps)
-    im = ax.imshow(display, cmap="inferno", origin="upper")
+    # Clip vmin to suppress residual low-q glow
+    valid = display[display > 0]
+    vmin = np.percentile(valid, 5) if len(valid) > 0 else 0
+    im = ax.imshow(display, cmap="inferno", origin="upper", vmin=vmin)
     plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="log(Power + 1)")
+
+    # Draw dashed circle at q_min exclusion boundary
+    eq_min = tile_avg_fft.get("effective_q_min", effective_q_min)
+    if eq_min > 0:
+        cy, cx = ps.shape[0] // 2, ps.shape[1] // 2
+        q_vals = tile_avg_fft.get("q_values", None)
+        if q_vals is not None and len(q_vals) >= 2:
+            dq = q_vals[1] - q_vals[0]  # q_max / n_bins = pixel q_scale
+            r_px = eq_min / dq if dq > 0 else 0
+            if r_px > 1:
+                circle = plt.Circle((cx, cy), r_px, fill=False, edgecolor='white',
+                                    linestyle='--', linewidth=1.0, alpha=0.8)
+                ax.add_patch(circle)
+
     ax.set_title(f"Tile-Averaged Power Spectrum ({tile_avg_fft['n_tiles']} tiles)")
 
     plt.savefig(str(path), dpi=dpi, bbox_inches="tight")
@@ -964,7 +986,8 @@ def _save_average_tile_fft(tile_avg_fft, global_fft_result, out_dir, dpi):
     return path
 
 
-def _save_average_tile_radial_profile(tile_avg_fft, global_fft_result, out_dir, dpi):
+def _save_average_tile_radial_profile(tile_avg_fft, global_fft_result, out_dir, dpi,
+                                      effective_q_min=0.0):
     """Radial profile from tile-averaged FFT with peak markers."""
     path = out_dir / "average_tile_radial_profile.png"
     _ensure_dir(path)
@@ -974,6 +997,12 @@ def _save_average_tile_radial_profile(tile_avg_fft, global_fft_result, out_dir, 
 
     fig, ax = plt.subplots(figsize=(10, 5))
     ax.semilogy(q, profile, 'k-', lw=0.8, label="Tile-averaged radial profile")
+
+    # Gray shading for low-q exclusion zone
+    eq_min = tile_avg_fft.get("effective_q_min", effective_q_min)
+    if eq_min > 0:
+        ax.axvspan(0, eq_min, alpha=0.15, color='gray',
+                   label=f"Excluded (q < {eq_min:.2f})")
 
     if global_fft_result is not None:
         for p in global_fft_result.peaks:
@@ -1114,8 +1143,13 @@ def _save_feature_embedding_viz(clustering_result, out_dir, dpi):
     return path
 
 
-def _save_cluster_averaged_ffts_viz(clustering_result, out_dir, dpi):
-    """Grid of mean power spectra per cluster (log scale)."""
+def _save_cluster_averaged_ffts_viz(clustering_result, out_dir, dpi,
+                                    effective_q_min=0.0):  # noqa: ARG001
+    """Grid of mean power spectra per cluster (log scale).
+
+    effective_q_min kept in signature for consistency; DC suppression is
+    handled at data level (ring_analysis.py) and via shared vmin clipping.
+    """
     path = out_dir / "cluster_averaged_ffts.png"
     _ensure_dir(path)
 
@@ -1129,10 +1163,17 @@ def _save_cluster_averaged_ffts_viz(clustering_result, out_dir, dpi):
     fig, axes = plt.subplots(n_rows_plot, n_cols, figsize=(5 * n_cols, 4 * n_rows_plot),
                              squeeze=False)
 
+    # Compute shared vmin across all clusters for consistent colorscale
+    all_displays = []
+    for lid, fft_info in sorted(ffts.items()):
+        all_displays.append(np.log1p(fft_info["mean_power"]))
+    all_valid = np.concatenate([d[d > 0].ravel() for d in all_displays])
+    vmin = np.percentile(all_valid, 5) if len(all_valid) > 0 else 0
+
     for idx, (lid, fft_info) in enumerate(sorted(ffts.items())):
         ax = axes[idx // n_cols, idx % n_cols]
-        ps = np.log1p(fft_info["mean_power"])
-        ax.imshow(ps, cmap="inferno", origin="upper")
+        ps = all_displays[idx]
+        ax.imshow(ps, cmap="inferno", origin="upper", vmin=vmin)
         ax.set_title(f"Cluster {lid} ({fft_info['n_tiles']} tiles)", fontsize=9)
         ax.set_xticks([])
         ax.set_yticks([])
@@ -1148,7 +1189,8 @@ def _save_cluster_averaged_ffts_viz(clustering_result, out_dir, dpi):
     return path
 
 
-def _save_cluster_radial_profiles(clustering_result, out_dir, dpi):
+def _save_cluster_radial_profiles(clustering_result, out_dir, dpi,
+                                  effective_q_min=0.0):
     """Overlaid radial profiles colored by cluster."""
     path = out_dir / "cluster_radial_profiles.png"
     _ensure_dir(path)
@@ -1159,6 +1201,11 @@ def _save_cluster_radial_profiles(clustering_result, out_dir, dpi):
 
     fig, ax = plt.subplots(figsize=(10, 5))
     colors = plt.cm.tab10(np.linspace(0, 1, max(len(ffts), 1)))
+
+    # Gray shading for low-q exclusion zone
+    if effective_q_min > 0:
+        ax.axvspan(0, effective_q_min, alpha=0.15, color='gray',
+                   label=f"Excluded (q < {effective_q_min:.2f})")
 
     for idx, (lid, fft_info) in enumerate(sorted(ffts.items())):
         ax.semilogy(fft_info["q_values"], fft_info["radial_profile"],

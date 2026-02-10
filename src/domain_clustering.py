@@ -53,6 +53,7 @@ def run_domain_clustering(
     stride: int = 128,
     pixel_size_nm: float = 0.127,
     skipped_mask: Optional[np.ndarray] = None,
+    effective_q_min: float = 0.0,
 ) -> ClusteringResult:
     """Run the full domain clustering pipeline.
 
@@ -153,7 +154,7 @@ def run_domain_clustering(
         from src.ring_analysis import compute_cluster_averaged_ffts
         cluster_ffts = compute_cluster_averaged_ffts(
             tile_labels_reg, image_fft, tile_size, stride,
-            pixel_size_nm, skipped_mask)
+            pixel_size_nm, skipped_mask, effective_q_min=effective_q_min)
 
     return ClusteringResult(
         tile_labels=tile_labels,
