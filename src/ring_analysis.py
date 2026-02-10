@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from src.pipeline_config import GatedTileGrid, GlobalPeak
+from src.pipeline_config import GatedTileGrid, GlobalPeak, RingAnalysisConfig
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +61,7 @@ class RingFeatureVectors:
 def build_ring_maps(
     gated_grid: GatedTileGrid,
     global_peaks: List[GlobalPeak],
+    ring_config: RingAnalysisConfig = None,
 ) -> RingMaps:
     """Build per-ring spatial maps from classified tile grid.
 
@@ -68,12 +69,18 @@ def build_ring_maps(
     TileClassification.peaks metric dicts, and accumulates per-ring
     presence, count, orientation, and SNR maps.
     """
+    if ring_config is None:
+        ring_config = RingAnalysisConfig()
+
     n_rows, n_cols = gated_grid.grid_shape
     n_rings = len(global_peaks)
 
     rings = []
     for i, gp in enumerate(global_peaks):
-        q_width = max(gp.q_fwhm * 2, gp.q_center * 0.03) if gp.q_fwhm > 0 else gp.q_center * 0.1
+        q_width = (max(gp.q_fwhm * ring_config.ring_width_fwhm_mult,
+                       gp.q_center * ring_config.ring_width_fallback_frac)
+                   if gp.q_fwhm > 0
+                   else gp.q_center * ring_config.ring_width_no_fwhm_frac)
         rings.append(RingInfo(
             ring_index=i,
             q_center=gp.q_center,

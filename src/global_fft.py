@@ -127,6 +127,8 @@ def compute_global_fft(image_fft: np.ndarray,
         degree=bg_degree,
         effective_q_min=effective_q_min,
         q_fit_min=config.q_fit_min,
+        bg_reweight_iterations=config.bg_reweight_iterations,
+        bg_reweight_downweight=config.bg_reweight_downweight,
     )
     corrected = radial_profile - background
     diagnostics["baseline_model"] = baseline_model
@@ -141,7 +143,12 @@ def compute_global_fft(image_fft: np.ndarray,
     # Find radial peaks
     radial_peaks = _find_radial_peaks(q_values, corrected, noise_floor,
                                        min_snr=config.min_peak_snr,
-                                       effective_q_min=effective_q_min)
+                                       effective_q_min=effective_q_min,
+                                       savgol_window_max=config.savgol_window_max,
+                                       savgol_window_min=config.savgol_window_min,
+                                       savgol_polyorder=config.savgol_polyorder,
+                                       radial_peak_distance=config.radial_peak_distance,
+                                       radial_peak_width=config.radial_peak_width)
     diagnostics["n_radial_peaks"] = len(radial_peaks)
     diagnostics["effective_q_min"] = effective_q_min
 
@@ -176,6 +183,7 @@ def compute_global_fft(image_fft: np.ndarray,
     g_vectors = extract_all_g_vectors(
         power, radial_peaks, crop_grid,
         top_k=config.max_g_vectors,
+        config=config,
     )
 
     # Information limit (highest q with detectable signal)
@@ -191,7 +199,7 @@ def compute_global_fft(image_fft: np.ndarray,
 
     # FFT guidance strength classification
     n_peaks = len(peaks)
-    if best_peak_snr >= 8 and n_peaks >= 2:
+    if best_peak_snr >= config.strong_guidance_snr and n_peaks >= 2:
         fft_guidance = "strong"
     elif best_peak_snr >= config.min_peak_snr:
         fft_guidance = "weak"
@@ -221,7 +229,9 @@ def compute_global_fft(image_fft: np.ndarray,
 def _fit_background(q_values: np.ndarray, profile: np.ndarray,
                     degree: int = 6, exclude_dc: int = 5,
                     effective_q_min: float = 0.0,
-                    q_fit_min: float = 0.0) -> tuple:
+                    q_fit_min: float = 0.0,
+                    bg_reweight_iterations: int = 4,
+                    bg_reweight_downweight: float = 0.1) -> tuple:
     """Iterative reweighted polynomial background fit in log space.
 
     Returns
@@ -251,14 +261,16 @@ def _fit_background(q_values: np.ndarray, profile: np.ndarray,
     log_profile = np.log10(profile[valid] + 1e-10)
     weights = np.ones_like(log_profile)
 
+    _bg_reweight_iterations = bg_reweight_iterations
+    _bg_reweight_downweight = bg_reweight_downweight
     coeffs = None
-    for _ in range(4):
+    for _ in range(_bg_reweight_iterations):
         coeffs = np.polyfit(q_fit, log_profile, degree, w=weights)
         fit = np.polyval(coeffs, q_fit)
         residual = log_profile - fit
         mad = np.median(np.abs(residual - np.median(residual)))
         threshold = 2.0 * mad * 1.4826
-        weights = np.where(residual > threshold, 0.1, 1.0)
+        weights = np.where(residual > threshold, _bg_reweight_downweight, 1.0)
 
     background = np.zeros_like(profile)
     if coeffs is not None:
@@ -339,7 +351,12 @@ def _compute_background_diagnostics(q_values, profile, background, corrected,
 
 def _find_radial_peaks(q_values, corrected, noise_floor,
                        min_q=0.5, max_q=15.0, min_snr=2.0,
-                       effective_q_min: float = 0.0):
+                       effective_q_min: float = 0.0,
+                       savgol_window_max: int = 11,
+                       savgol_window_min: int = 5,
+                       savgol_polyorder: int = 2,
+                       radial_peak_distance: int = 5,
+                       radial_peak_width: int = 2):
     """Find peaks in the background-corrected radial profile."""
     from scipy.signal import savgol_filter
 
@@ -349,14 +366,14 @@ def _find_radial_peaks(q_values, corrected, noise_floor,
     if len(valid_idx) < 10:
         return []
 
-    wl = min(11, len(valid_idx) // 2 * 2 + 1)
-    if wl < 5:
-        wl = 5
-    smooth = savgol_filter(corrected[valid_mask], window_length=wl, polyorder=2)
+    wl = min(savgol_window_max, len(valid_idx) // 2 * 2 + 1)
+    if wl < savgol_window_min:
+        wl = savgol_window_min
+    smooth = savgol_filter(corrected[valid_mask], window_length=wl, polyorder=savgol_polyorder)
 
     min_prominence = noise_floor * min_snr
     peaks_idx, props = find_peaks(smooth, prominence=max(min_prominence, 1e-10),
-                                  width=2, distance=5)
+                                  width=radial_peak_width, distance=radial_peak_distance)
 
     results = []
     for i, li in enumerate(peaks_idx):
@@ -387,7 +404,8 @@ def _find_radial_peaks(q_values, corrected, noise_floor,
 def extract_all_g_vectors(power_spectrum: np.ndarray,
                           radial_peaks: list,
                           fft_grid: FFTGrid,
-                          top_k: int = 6) -> List[GVector]:
+                          top_k: int = 6,
+                          config: GlobalFFTConfig = None) -> List[GVector]:
     """Multi-ring g-vector extraction with harmonic de-duplication.
 
     For each radial peak ring:
@@ -396,17 +414,30 @@ def extract_all_g_vectors(power_spectrum: np.ndarray,
     3. Cartesian antipodal pairing
     Then cross-ring harmonic de-duplication and top-K selection.
     """
+    if config is None:
+        config = GlobalFFTConfig()
+
+    q_width_expansion = config.q_width_expansion_frac
+    harmonic_ratio_tol = config.harmonic_ratio_tol
+    harmonic_angle_tol = config.harmonic_angle_tol_deg
+    harmonic_snr_ratio = config.harmonic_snr_ratio
+    nc_min_angle = config.non_collinear_min_angle_deg
+    angular_prom_frac = config.angular_prominence_frac
+    angular_peak_dist = config.angular_peak_distance
+
     all_candidates: List[GVector] = []
 
     for ring_idx, rp in enumerate(radial_peaks[:8]):  # cap at 8 rings
         q_center = rp["q_center"]
         q_fwhm = rp["q_width"]
-        q_width = max(q_fwhm * 2, q_center * 0.03)
+        q_width = max(q_fwhm * 2, q_center * q_width_expansion)
 
         ring_gvecs = _extract_g_vectors_single_ring(
             power_spectrum, q_center, q_width, fft_grid, ring_idx,
             ring_snr=rp.get("snr", 0),
             ring_fwhm=rp.get("q_width", 0.1),
+            angular_prominence_frac=angular_prom_frac,
+            angular_peak_distance=angular_peak_dist,
         )
         all_candidates.extend(ring_gvecs)
 
@@ -422,9 +453,9 @@ def extract_all_g_vectors(power_spectrum: np.ndarray,
         for i, existing in enumerate(deduplicated):
             ratio = v.magnitude / existing.magnitude
             nearest_int = round(ratio)
-            if nearest_int >= 2 and abs(ratio - nearest_int) / nearest_int < 0.05:
-                if _angular_distance_deg(v.angle_deg, existing.angle_deg) < 5:
-                    if v.snr > existing.snr * 2:
+            if nearest_int >= 2 and abs(ratio - nearest_int) / nearest_int < harmonic_ratio_tol:
+                if _angular_distance_deg(v.angle_deg, existing.angle_deg) < harmonic_angle_tol:
+                    if v.snr > existing.snr * harmonic_snr_ratio:
                         deduplicated[i] = v
                     is_harmonic = True
                     break
@@ -437,7 +468,7 @@ def extract_all_g_vectors(power_spectrum: np.ndarray,
     for v in deduplicated:
         if len(selected) >= top_k:
             break
-        if all(_angular_distance_deg(v.angle_deg, s.angle_deg) > 15 for s in selected):
+        if all(_angular_distance_deg(v.angle_deg, s.angle_deg) > nc_min_angle for s in selected):
             selected.append(v)
 
     return selected
@@ -446,7 +477,9 @@ def extract_all_g_vectors(power_spectrum: np.ndarray,
 def _extract_g_vectors_single_ring(power_spectrum, q_center, q_width,
                                     fft_grid: FFTGrid, ring_idx: int,
                                     ring_snr: float = 0,
-                                    ring_fwhm: float = 0.1) -> List[GVector]:
+                                    ring_fwhm: float = 0.1,
+                                    angular_prominence_frac: float = 0.5,
+                                    angular_peak_distance: int = 10) -> List[GVector]:
     """Extract g-vectors from a single q-ring via polar resampling."""
     H, W = power_spectrum.shape
     n_angle = 360
@@ -478,8 +511,8 @@ def _extract_g_vectors_single_ring(power_spectrum, q_center, q_width,
     med_profile = np.median(angular_profile)
     peaks_idx, props = find_peaks(
         angular_profile,
-        prominence=max(med_profile * 0.5, 1e-10),
-        distance=10,
+        prominence=max(med_profile * angular_prominence_frac, 1e-10),
+        distance=angular_peak_distance,
     )
     if len(peaks_idx) == 0:
         return []

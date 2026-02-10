@@ -22,7 +22,8 @@ from src.gates import evaluate_gate
 logger = logging.getLogger(__name__)
 
 
-def _remove_hot_pixels(image: np.ndarray, sigma: float = 5.0) -> tuple:
+def _remove_hot_pixels(image: np.ndarray, sigma: float = 5.0,
+                       median_kernel: int = 3) -> tuple:
     """Replace statistical outlier pixels with local median (I1).
 
     Only replaces pixels where |pixel - local_median| > sigma * local_MAD.
@@ -30,10 +31,10 @@ def _remove_hot_pixels(image: np.ndarray, sigma: float = 5.0) -> tuple:
 
     Returns (cleaned_image, n_replaced).
     """
-    local_median = ndimage.median_filter(image, size=3)
+    local_median = ndimage.median_filter(image, size=median_kernel)
     deviation = np.abs(image - local_median)
-    # Compute local MAD using the same 3x3 window
-    local_mad = ndimage.median_filter(deviation, size=3)
+    # Compute local MAD using the same window
+    local_mad = ndimage.median_filter(deviation, size=median_kernel)
     # Threshold: pixels deviating by more than sigma * local_MAD
     threshold = sigma * local_mad * 1.4826  # convert MAD to Gaussian sigma
     threshold = np.maximum(threshold, 1e-10)  # avoid zero threshold
@@ -45,8 +46,8 @@ def _remove_hot_pixels(image: np.ndarray, sigma: float = 5.0) -> tuple:
     return cleaned, n_replaced
 
 
-def _robust_normalize(image: np.ndarray) -> np.ndarray:
-    """Robust normalisation: (img - median) / (1.4826 * MAD), clip to [-5,5], map to [0,1]."""
+def _robust_normalize(image: np.ndarray, clip_sigma: float = 5.0) -> np.ndarray:
+    """Robust normalisation: (img - median) / (1.4826 * MAD), clip to [-clip_sigma, clip_sigma], map to [0,1]."""
     med = np.median(image)
     mad = np.median(np.abs(image - med))
     sigma = mad * 1.4826
@@ -54,9 +55,9 @@ def _robust_normalize(image: np.ndarray) -> np.ndarray:
         # Degenerate case: constant image
         return np.zeros_like(image)
     normalised = (image - med) / sigma
-    normalised = np.clip(normalised, -5, 5)
-    # Map [-5, 5] to [0, 1]
-    normalised = (normalised + 5) / 10.0
+    normalised = np.clip(normalised, -clip_sigma, clip_sigma)
+    # Map [-clip_sigma, clip_sigma] to [0, 1]
+    normalised = (normalised + clip_sigma) / (2.0 * clip_sigma)
     return normalised
 
 
@@ -115,7 +116,9 @@ def preprocess_fft_safe(image: np.ndarray,
     # Step 2: Optional hot-pixel removal (I1)
     n_hot_replaced = 0
     if config.hot_pixel_removal:
-        img, n_hot_replaced = _remove_hot_pixels(img, sigma=config.hot_pixel_sigma)
+        img, n_hot_replaced = _remove_hot_pixels(
+            img, sigma=config.hot_pixel_sigma,
+            median_kernel=config.hot_pixel_median_kernel)
         logger.info("Hot-pixel removal: replaced %d pixels (sigma=%.1f)",
                      n_hot_replaced, config.hot_pixel_sigma)
     diagnostics["hot_pixels_replaced"] = n_hot_replaced
@@ -159,7 +162,7 @@ def preprocess_fft_safe(image: np.ndarray,
     else:
         # Step 4: Robust normalisation
         if config.normalize_method == "robust":
-            img = _robust_normalize(img)
+            img = _robust_normalize(img, clip_sigma=config.robust_norm_clip_sigma)
             diagnostics["normalize_method"] = "robust"
         else:
             img = _minmax_normalize(img)

@@ -149,6 +149,61 @@ flowchart TD
 
 ---
 
+## What's New (v3.3) -- Configurable Pipeline Parameters
+
+### Fully Configurable Gate Thresholds
+- All 13 quality gate thresholds (G0-G12) are now configurable via YAML config or `GateThresholdsConfig`
+- Previously hardcoded values are exposed as named fields with unchanged defaults
+- `GateThresholdsConfig.threshold_dict(gate_id)` provides per-gate threshold dicts
+- G3 `min_lcc_fraction` is now configurable (was hardcoded to 0.5)
+
+### New Config Dataclasses
+- **`GateThresholdsConfig`**: 22 fields controlling all gate pass/fail thresholds
+- **`PeakSNRConfig`**: 9 fields for peak SNR measurement (signal disk radius, annular width, FWHM patch radius, symmetry tolerance, non-collinear angle)
+- **`ReferenceSelectionConfig`**: 4 fields for reference region scoring (entropy/SNR/area weights, orientation bins)
+- **`RingAnalysisConfig`**: 3 fields for ring width calculation
+
+### Extended Existing Configs
+- **`GlobalFFTConfig`**: 15 new fields (background fitting, Savitzky-Golay parameters, harmonic rejection, angular peak detection)
+- **`GPAConfig`**: 10 new fields (mask sigma factors, bimodal detection, amplitude erosion, phase noise thresholds)
+- **`PreprocConfig`**: 2 new fields (hot pixel median kernel, robust normalization clip sigma)
+- **`ROIConfig`**: 4 new fields (variance window, morphological kernel, smoothing sigma, gradient sigma)
+- **`PeakFindingConfig`**: 4 new fields (taper width, background percentile, filter size, adaptive tolerance floor)
+- **`TileFFTConfig`**: 3 new fields (annulus factors, background disk radius)
+- **`ClusteringConfig`**: 5 new fields (min valid tiles, regularization iterations, UMAP/K-means parameters)
+- **`ConfidenceConfig`**: 1 new field (SNR ceiling multiplier)
+
+### YAML Configuration
+All parameters are loadable from YAML via `--config`. Example:
+```yaml
+gate_thresholds:
+  g5_min_periods: 15.0
+  g9_min_area: 4
+  g12_min_fraction_valid: 0.30
+peak_snr:
+  signal_disk_radius_px: 5
+  fwhm_patch_radius: 7
+reference_selection:
+  scoring_weight_entropy: 0.5
+  scoring_weight_snr: 0.3
+  scoring_weight_area: 0.2
+global_fft:
+  strong_guidance_snr: 10.0
+```
+
+### Backward Compatibility
+- Old-style `validation:` YAML keys (e.g., `min_periods`, `ref_snr_min`) automatically sync to the new `gate_thresholds:` fields when `gate_thresholds:` is absent
+- All defaults match the previously hardcoded values -- zero behavioral change without explicit configuration
+
+### Bug Fixes
+- **Reference selection config threading**: `select_reference_region()` now correctly receives config values from `run_gpa()` (was ignoring caller-provided `min_area`/`max_entropy`/`min_snr`)
+- **G3 LCC fraction**: Now configurable via `gate_thresholds.g3_min_lcc_fraction` (was hardcoded 0.5 in gate evaluation logic)
+
+### New CLI Flag
+- `--strong-guidance-snr FLOAT` -- Override the SNR threshold for "strong" FFT guidance classification (default: 8.0)
+
+---
+
 ## What's New (v3.2) -- Multi-Ring Spatial Maps + Domain Clustering
 
 ### Per-Ring Spatial Analysis
@@ -292,7 +347,7 @@ flowchart TD
 - **Adaptive Threshold Calibration** -- Sets threshold based on actual peak intensity
 - **Two-Tier SNR Gating** -- Separates high-confidence from weak-evidence tiles
 - **GPA Strain Mapping** -- Full-image or region-wise strain field extraction
-- **13-Gate Validation** -- Comprehensive quality control from Nyquist guard to output
+- **13-Gate Validation** -- Comprehensive quality control from Nyquist guard to output, all thresholds configurable
 - **Per-Ring Spatial Maps** -- Presence, peak count, orientation, and SNR maps per diffraction ring
 - **Domain Clustering** -- K-means, GMM, or HDBSCAN with auto-K selection and spatial regularization
 - **Spatial Coherence Validation** -- Detects when results are noise vs. real domains
@@ -358,6 +413,12 @@ python analyze.py sample.dm4 --hybrid --auto-discover --cluster --cluster-method
 
 # HDBSCAN clustering with UMAP visualization
 python analyze.py sample.dm4 --hybrid --auto-discover --cluster --cluster-method hdbscan --cluster-dimred umap
+
+# Custom gate thresholds and parameters via YAML config
+python analyze.py sample.dm4 --hybrid --auto-discover --config custom_config.yaml
+
+# Override strong guidance SNR threshold from CLI
+python analyze.py sample.dm4 --hybrid --auto-discover --strong-guidance-snr 10.0
 ```
 
 ### Classic Auto-Discovery Mode
@@ -430,6 +491,8 @@ Hybrid Pipeline:
   --no-peak-finding       Skip peak-finding stage
   --report-format {json,html,both}
                           Report output format (default: json)
+  --strong-guidance-snr FLOAT
+                          SNR threshold for "strong" FFT guidance (default: 8.0)
 
 Physics & EFTEM:
   --physics-d-min FLOAT   Expected minimum d-spacing in nm (default: 0.4)
@@ -498,6 +561,9 @@ python analyze.py sample.dm4 --hybrid --auto-discover --cluster
 
 # Clustering with HDBSCAN
 python analyze.py sample.dm4 --hybrid --auto-discover --cluster --cluster-method hdbscan
+
+# Custom config from YAML (gate thresholds, SNR params, etc.)
+python analyze.py sample.dm4 --hybrid --auto-discover --config my_config.yaml
 ```
 
 ## Output Files
@@ -580,7 +646,7 @@ Raw FFT profiles show a strong power-law decay that masks diffraction peaks:
 
 ## Quality Gates (Hybrid Pipeline)
 
-The hybrid pipeline evaluates 13 quality gates (G0-G12) at each stage:
+The hybrid pipeline evaluates 13 quality gates (G0-G12) at each stage. All thresholds are configurable via `GateThresholdsConfig` in YAML or Python API (defaults shown below):
 
 | Gate | Metric | Default Threshold | On Failure |
 |------|--------|-------------------|------------|
@@ -682,6 +748,69 @@ q_scale = 1 / (N * pixel_size_nm)    cycles/nm per FFT pixel
 | `clustering.pca_variance_threshold` | 0.95 | Cumulative variance to retain in PCA |
 | `clustering.regularize` | true | Apply spatial regularization to labels |
 | `clustering.min_domain_size` | 5 | Minimum domain size (tiles) |
+| `clustering.kmeans_n_init` | 10 | Number of K-means initializations |
+| `clustering.umap_n_neighbors` | 15 | UMAP n_neighbors parameter |
+| `clustering.umap_min_dist` | 0.1 | UMAP min_dist parameter |
+
+#### Gate Thresholds (`gate_thresholds.*`)
+
+All gate pass/fail thresholds can be overridden via `GateThresholdsConfig`:
+
+| Parameter | Default | Gate |
+|-----------|---------|------|
+| `gate_thresholds.g0_nyquist_safety_margin` | 0.95 | G0 |
+| `gate_thresholds.g2_max_clipped_fraction` | 0.005 | G2 |
+| `gate_thresholds.g2_min_range_ratio` | 10.0 | G2 |
+| `gate_thresholds.g3_min_coverage` | 10.0 | G3 |
+| `gate_thresholds.g3_max_coverage` | 95.0 | G3 |
+| `gate_thresholds.g3_max_fragments` | 20 | G3 |
+| `gate_thresholds.g3_min_lcc_fraction` | 0.5 | G3 |
+| `gate_thresholds.g4_min_peak_snr` | 3.0 | G4 |
+| `gate_thresholds.g5_min_periods` | 20.0 | G5 |
+| `gate_thresholds.g6_min_fraction` | 0.05 | G6 |
+| `gate_thresholds.g7_min_median_snr` | 5.0 | G7 |
+| `gate_thresholds.g8_min_mean_symmetry` | 0.3 | G8 |
+| `gate_thresholds.g9_min_area` | 9 | G9 |
+| `gate_thresholds.g9_max_entropy` | 0.3 | G9 |
+| `gate_thresholds.g9_min_snr` | 5.0 | G9 |
+| `gate_thresholds.g10_max_phase_noise` | 0.3 | G10 |
+| `gate_thresholds.g10_min_unwrap_success` | 0.7 | G10 |
+| `gate_thresholds.g11_max_ref_strain` | 0.005 | G11 |
+| `gate_thresholds.g11_max_outlier_fraction` | 0.20 | G11 |
+| `gate_thresholds.g11_strain_outlier_threshold` | 0.05 | G11 |
+| `gate_thresholds.g12_min_fraction_valid` | 0.50 | G12 |
+| `gate_thresholds.g12_tolerance` | 0.20 | G12 |
+
+#### Peak SNR Measurement (`peak_snr.*`)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `peak_snr.signal_disk_radius_px` | 3 | Pixel radius of signal measurement disk |
+| `peak_snr.annular_width_min_q` | 0.15 | Minimum annular background width (cycles/nm) |
+| `peak_snr.annular_fwhm_multiplier` | 1.5 | Multiplier for FWHM-based annular width |
+| `peak_snr.min_background_pixels` | 20 | Minimum pixels for valid background estimate |
+| `peak_snr.fwhm_patch_radius` | 5 | Patch radius for FWHM measurement (px) |
+| `peak_snr.moment_sigma_floor` | 0.3 | Minimum sigma for moment-based FWHM proxy |
+| `peak_snr.fit_condition_max` | 100.0 | Maximum condition number for curve_fit |
+| `peak_snr.symmetry_tolerance_px` | 2.0 | Tolerance for antipodal peak pairing (px) |
+| `peak_snr.non_collinear_min_angle_deg` | 15.0 | Minimum angle between non-collinear peaks |
+
+#### Reference Selection (`reference_selection.*`)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `reference_selection.scoring_weight_entropy` | 0.4 | Weight for orientation entropy in scoring |
+| `reference_selection.scoring_weight_snr` | 0.3 | Weight for mean SNR in scoring |
+| `reference_selection.scoring_weight_area` | 0.3 | Weight for region area in scoring |
+| `reference_selection.orientation_bins` | 12 | Number of bins for orientation histogram |
+
+#### Ring Analysis (`ring_analysis.*`)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `ring_analysis.ring_width_fwhm_mult` | 2.0 | Ring width = mult * FWHM |
+| `ring_analysis.ring_width_fallback_frac` | 0.03 | Fallback ring width as fraction of q_center |
+| `ring_analysis.ring_width_no_fwhm_frac` | 0.1 | Ring width when no FWHM available |
 
 ## Python API
 
@@ -742,8 +871,19 @@ from src.domain_clustering import run_domain_clustering
 from src.validation import validate_pipeline
 from src.reporting import save_pipeline_artifacts
 
-# Configure
+# Configure (all parameters customizable via YAML or Python)
 config = PipelineConfig(pixel_size_nm=0.1297)
+
+# Optional: customize gate thresholds
+config.gate_thresholds.g5_min_periods = 15.0    # relax tiling requirement
+config.gate_thresholds.g9_min_area = 4           # smaller reference region OK
+
+# Optional: customize peak SNR measurement
+config.peak_snr.signal_disk_radius_px = 5
+
+# Or load from YAML:
+# config = PipelineConfig.from_dict(yaml.safe_load(open("config.yaml")))
+
 fft_grid = FFTGrid(height, width, config.pixel_size_nm)
 
 # Branch A: FFT-safe preprocessing (no blur)
@@ -765,10 +905,12 @@ peak_sets, skipped = process_all_tiles(
     tile_size=config.tile_size, stride=config.stride,
 )
 tile_grid = FFTGrid(config.tile_size, config.tile_size, config.pixel_size_nm)
-gated = build_gated_tile_grid(peak_sets, skipped, tile_grid, config.tile_size)
+gated = build_gated_tile_grid(peak_sets, skipped, tile_grid, config.tile_size,
+                               peak_snr_config=config.peak_snr)
 
 # Ring analysis (always-on when global peaks exist)
-ring_maps = build_ring_maps(gated, global_result.peaks)
+ring_maps = build_ring_maps(gated, global_result.peaks,
+                             ring_config=config.ring_analysis)
 ring_features = build_ring_feature_vectors(gated, ring_maps)
 tile_avg_fft = compute_tile_averaged_fft(
     preproc.image_fft, config.tile_size, config.stride,
@@ -778,10 +920,11 @@ tile_avg_fft = compute_tile_averaged_fft(
 if config.clustering.enabled:
     clustering_result = run_domain_clustering(ring_features, config.clustering)
 
-# Validation
+# Validation (with configurable gate thresholds)
 report = validate_pipeline(
     preproc_record=preproc, roi_result=roi,
     global_fft_result=global_result, gated_grid=gated,
+    gate_thresholds=config.gate_thresholds,
 )
 
 # Save all artifacts
@@ -796,8 +939,8 @@ save_pipeline_artifacts(output_dir, config=config, fft_grid=fft_grid,
 | Module | Purpose |
 |--------|---------|
 | `src/fft_coords.py` | Canonical FFT coordinate system (`FFTGrid` class) |
-| `src/pipeline_config.py` | All parameter dataclasses, config classes, and defaults |
-| `src/gates.py` | Gate registry G1-G12 with thresholds and failure behaviors |
+| `src/pipeline_config.py` | All parameter dataclasses, config classes, defaults, and YAML serialization |
+| `src/gates.py` | Gate registry G0-G12 with configurable thresholds and failure behaviors |
 | `src/preprocess_fft_safe.py` | Branch A: hot-pixel removal + robust normalize, no blur |
 | `src/preprocess_segmentation.py` | Branch B: clip + normalize + Gaussian smooth |
 | `src/roi_masking.py` | Early ROI mask (intensity + variance, geometric gates) |

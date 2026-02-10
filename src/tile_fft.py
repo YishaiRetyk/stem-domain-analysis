@@ -197,7 +197,10 @@ def extract_tile_peaks(power: np.ndarray,
         peaks = []
         for peak, py, px in candidates:
             snr = _lightweight_peak_snr(power_masked, q_mag, peak.q_mag,
-                                        py, px, dc_mask)
+                                        py, px, dc_mask,
+                                        annulus_inner_factor=tile_fft_config.annulus_inner_factor,
+                                        annulus_outer_factor=tile_fft_config.annulus_outer_factor,
+                                        background_disk_r_sq=tile_fft_config.background_disk_r_sq)
             if snr >= tile_fft_config.peak_snr_threshold:
                 peaks.append(peak)
     else:
@@ -212,7 +215,10 @@ def extract_tile_peaks(power: np.ndarray,
 
 def _lightweight_peak_snr(power: np.ndarray, q_mag: np.ndarray,
                           peak_q: float, py: int, px: int,
-                          dc_mask: np.ndarray) -> float:
+                          dc_mask: np.ndarray,
+                          annulus_inner_factor: float = 0.9,
+                          annulus_outer_factor: float = 1.1,
+                          background_disk_r_sq: int = 9) -> float:
     """Compute a lightweight SNR for a candidate peak.
 
     signal = peak value at (py, px)
@@ -221,15 +227,15 @@ def _lightweight_peak_snr(power: np.ndarray, q_mag: np.ndarray,
     """
     signal = float(power[py, px])
 
-    # Annulus: q in [0.9 * peak_q, 1.1 * peak_q]
-    q_lo = 0.9 * peak_q
-    q_hi = 1.1 * peak_q
+    # Annulus: q in [inner_factor * peak_q, outer_factor * peak_q]
+    q_lo = annulus_inner_factor * peak_q
+    q_hi = annulus_outer_factor * peak_q
     annulus = (q_mag >= q_lo) & (q_mag <= q_hi)
 
-    # Exclude 3-pixel disk around peak
+    # Exclude disk around peak
     H, W = power.shape
     yy, xx = np.ogrid[:H, :W]
-    disk = ((yy - py) ** 2 + (xx - px) ** 2) <= 9  # r=3
+    disk = ((yy - py) ** 2 + (xx - px) ** 2) <= background_disk_r_sq
     bg_mask = annulus & ~disk & ~dc_mask
 
     n_bg = int(np.sum(bg_mask))

@@ -59,10 +59,10 @@ def select_gpa_mode(gated_grid: GatedTileGrid,
     orientations = gated_grid.orientation_map[tier_a_mask]
     valid_orient = orientations[~np.isnan(orientations)]
     if len(valid_orient) > 2:
-        hist, _ = np.histogram(valid_orient, bins=12, range=(0, 180))
+        hist, _ = np.histogram(valid_orient, bins=config.orientation_bins, range=(0, 180))
         probs = hist.astype(float) / hist.sum()
         probs_nz = probs[probs > 0]
-        orientation_entropy = float(-np.sum(probs_nz * np.log2(probs_nz)) / np.log2(12))
+        orientation_entropy = float(-np.sum(probs_nz * np.log2(probs_nz)) / np.log2(config.orientation_bins))
     else:
         orientation_entropy = 1.0
 
@@ -71,14 +71,14 @@ def select_gpa_mode(gated_grid: GatedTileGrid,
     if len(valid_orient) > 10:
         from scipy.signal import find_peaks as _fp
         from scipy.ndimage import gaussian_filter1d
-        hist_smooth = gaussian_filter1d(hist.astype(float), sigma=0.5)
-        peaks_idx, _ = _fp(hist_smooth, distance=2)
+        hist_smooth = gaussian_filter1d(hist.astype(float), sigma=config.bimodal_smooth_sigma)
+        peaks_idx, _ = _fp(hist_smooth, distance=config.bimodal_peak_distance)
         if len(peaks_idx) >= 2:
             top2 = sorted(peaks_idx, key=lambda i: hist_smooth[i], reverse=True)[:2]
             v_start, v_end = sorted(top2)
             valley_min = np.min(hist_smooth[v_start:v_end + 1])
             min_peak = min(hist_smooth[top2[0]], hist_smooth[top2[1]])
-            if valley_min < min_peak * 0.5:
+            if valley_min < min_peak * config.bimodal_valley_ratio:
                 orientation_is_bimodal = True
 
     # Global peak SNR
@@ -147,7 +147,8 @@ def compute_gpa_phase(image_fft: np.ndarray,
                       fft_grid: FFTGrid,
                       amplitude_threshold: float = 0.1,
                       ctx=None,
-                      _cached_ft_shifted=None) -> GPAPhaseResult:
+                      _cached_ft_shifted=None,
+                      amplitude_erosion_iterations: int = 2) -> GPAPhaseResult:
     """GPA phase extraction following Hytch et al. (1998).
 
     Uses subpixel-correct real-space phase ramp (F2).
@@ -171,6 +172,7 @@ def compute_gpa_phase(image_fft: np.ndarray,
             return _compute_gpa_phase_gpu(
                 image_fft, g_vector, mask_sigma_q, fft_grid,
                 amplitude_threshold, ctx, _cached_ft_shifted,
+                amplitude_erosion_iterations,
             )
         except Exception as e:
             # OOM fallback: clear GPU memory and retry on CPU
@@ -241,7 +243,7 @@ def compute_gpa_phase(image_fft: np.ndarray,
     phase_unwrapped[~amplitude_mask] = np.nan
 
     # Post-mask with eroded amplitude mask (F3)
-    amplitude_mask_eroded = ndimage.binary_erosion(amplitude_mask, iterations=2)
+    amplitude_mask_eroded = ndimage.binary_erosion(amplitude_mask, iterations=amplitude_erosion_iterations)
     phase_unwrapped[~amplitude_mask_eroded] = np.nan
 
     # Unwrap quality
@@ -261,7 +263,8 @@ def compute_gpa_phase(image_fft: np.ndarray,
 
 
 def _compute_gpa_phase_gpu(image_fft, g_vector, mask_sigma_q, fft_grid,
-                            amplitude_threshold, ctx, _cached_ft_shifted):
+                            amplitude_threshold, ctx, _cached_ft_shifted,
+                            amplitude_erosion_iterations=2):
     """GPU-accelerated GPA phase extraction (steps 1-8 on GPU, 9+ on CPU)."""
     xp = ctx.xp
     H, W = image_fft.shape
@@ -335,7 +338,7 @@ def _compute_gpa_phase_gpu(image_fft, g_vector, mask_sigma_q, fft_grid,
     phase_unwrapped[~amplitude_mask] = np.nan
 
     # Step 10: Post-mask with eroded amplitude mask
-    amplitude_mask_eroded = ndimage.binary_erosion(amplitude_mask, iterations=2)
+    amplitude_mask_eroded = ndimage.binary_erosion(amplitude_mask, iterations=amplitude_erosion_iterations)
     phase_unwrapped[~amplitude_mask_eroded] = np.nan
 
     # Unwrap quality
@@ -357,7 +360,8 @@ def _compute_gpa_phase_gpu(image_fft, g_vector, mask_sigma_q, fft_grid,
 def check_phase_noise(phase_result: GPAPhaseResult,
                       ref_tiles: List,
                       tile_size: int,
-                      stride: int) -> float:
+                      stride: int,
+                      phase_noise_min_pixels: int = 10) -> float:
     """Compute phase noise sigma in the reference region.
 
     Returns sigma_phi in radians on unwrapped, amplitude-masked phase.
@@ -376,7 +380,7 @@ def check_phase_noise(phase_result: GPAPhaseResult,
         ref_mask[y0:y1, x0:x1] = True
 
     combined = ref_mask & mask & ~np.isnan(phase)
-    if np.sum(combined) < 10:
+    if np.sum(combined) < phase_noise_min_pixels:
         return float('inf')
 
     ref_phase = phase[combined]
@@ -463,7 +467,7 @@ def compute_strain_field(displacement: DisplacementField,
 # GPA Execution (full and region modes)
 # ======================================================================
 
-def _determine_mask_sigma(g_vectors: List[GVector], config: GPAConfig,
+def _determine_mask_sigma(g_vectors: List[GVector], config: GPAConfig,  # noqa: C901
                           effective_q_min: float = 0.0) -> float:
     """Determine the Gaussian mask radius in q-space.
 
@@ -476,16 +480,16 @@ def _determine_mask_sigma(g_vectors: List[GVector], config: GPAConfig,
         # Auto: 0.5 * min(peak FWHM)
         fwhms = [g.fwhm for g in g_vectors if g.fwhm > 0]
         if fwhms:
-            sigma = 0.5 * np.median(fwhms)
+            sigma = config.mask_sigma_fwhm_factor * np.median(fwhms)
         else:
             g_magnitudes = [g.magnitude for g in g_vectors if g.magnitude > 0]
-            sigma = 0.06 * min(g_magnitudes) if g_magnitudes else 0.06
+            sigma = config.mask_sigma_fallback_factor * min(g_magnitudes) if g_magnitudes else config.mask_sigma_fallback_factor
 
     # DC-safety clamp: sigma <= 0.18 * min(|g|)
     if effective_q_min > 0 and g_vectors:
         g_magnitudes = [g.magnitude for g in g_vectors if g.magnitude > 0]
         if g_magnitudes:
-            max_safe_sigma = 0.18 * min(g_magnitudes)
+            max_safe_sigma = config.mask_sigma_dc_clamp_factor * min(g_magnitudes)
             if sigma > max_safe_sigma:
                 logger.warning("GPA mask sigma clamped: %.4f → %.4f "
                                "(0.18 × min|g|=%.4f) for DC safety",
@@ -518,10 +522,12 @@ def run_gpa_full(image_fft: np.ndarray,
             image_fft, gv, mask_sigma, fft_grid,
             amplitude_threshold=config.amplitude_threshold,
             ctx=ctx,
+            amplitude_erosion_iterations=config.amplitude_erosion_iterations,
         )
         # Phase noise in reference region
         sigma_phi = check_phase_noise(phase_result, ref_region.tiles,
-                                      tile_size, stride)
+                                      tile_size, stride,
+                                      phase_noise_min_pixels=config.phase_noise_min_pixels)
         phase_result.phase_noise_sigma = sigma_phi
 
         # Subtract reference mean phase
@@ -721,6 +727,7 @@ def run_gpa_region(image_fft: np.ndarray,
                 amplitude_threshold=config.amplitude_threshold,
                 ctx=ctx,
                 _cached_ft_shifted=cached_ft_shifted,
+                amplitude_erosion_iterations=config.amplitude_erosion_iterations,
             )
 
             # Extract domain region and insert into combined
@@ -737,12 +744,14 @@ def run_gpa_region(image_fft: np.ndarray,
         phase = compute_gpa_phase(image_fft, gv, mask_sigma, fft_grid,
                                   amplitude_threshold=config.amplitude_threshold,
                                   ctx=ctx,
-                                  _cached_ft_shifted=cached_ft_shifted)
+                                  _cached_ft_shifted=cached_ft_shifted,
+                                  amplitude_erosion_iterations=config.amplitude_erosion_iterations)
         phase.phase_unwrapped = combined_phase_unwrapped[key].astype(np.float32)
         phase.amplitude_mask = combined_amplitude_mask[key]
 
         if best_ref_region:
-            sigma_phi = check_phase_noise(phase, best_ref_region.tiles, tile_size, stride)
+            sigma_phi = check_phase_noise(phase, best_ref_region.tiles, tile_size, stride,
+                                          phase_noise_min_pixels=config.phase_noise_min_pixels)
             phase.phase_noise_sigma = sigma_phi
             qc[f"phase_noise_{key}"] = sigma_phi
 
@@ -791,7 +800,9 @@ def run_gpa(image_fft: np.ndarray,
             tile_size: int = 256,
             stride: int = 128,
             ctx=None,
-            effective_q_min: float = 0.0) -> Optional[GPAResult]:
+            effective_q_min: float = 0.0,
+            gate_thresholds=None,
+            ref_config=None) -> Optional[GPAResult]:
     """Run GPA with mode auto-selection and failure handling.
 
     Returns GPAResult or None if skipped.
@@ -813,16 +824,17 @@ def run_gpa(image_fft: np.ndarray,
         return None
 
     # Skip GPA if tile evidence is insufficient
-    if gated_grid.tier_summary.tier_a_fraction < 0.1:
-        logger.info("GPA skipped: tier_a_fraction=%.3f < 0.1",
-                     gated_grid.tier_summary.tier_a_fraction)
+    if gated_grid.tier_summary.tier_a_fraction < config.min_tier_a_fraction_for_gpa:
+        logger.info("GPA skipped: tier_a_fraction=%.3f < %.2f",
+                     gated_grid.tier_summary.tier_a_fraction,
+                     config.min_tier_a_fraction_for_gpa)
         return None
 
     mode_decision = select_gpa_mode(gated_grid, global_fft_result, config)
 
     try:
         if mode_decision.selected_mode == "full":
-            ref_region = select_reference_region(gated_grid)
+            ref_region = select_reference_region(gated_grid, ref_config=ref_config)
             result = run_gpa_full(image_fft, g_vectors, ref_region, fft_grid,
                                   config, tile_size, stride, ctx=ctx,
                                   effective_q_min=effective_q_min)

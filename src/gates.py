@@ -9,7 +9,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-from src.pipeline_config import GateResult
+from src.pipeline_config import GateResult, GateThresholdsConfig
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +109,8 @@ GATE_DEFS: Dict[str, GateDef] = {
 
 
 def evaluate_gate(gate_id: str, value: Any,
-                  threshold_override: Any = None) -> GateResult:
+                  threshold_override: Any = None,
+                  gate_thresholds: Optional[GateThresholdsConfig] = None) -> GateResult:
     """Evaluate a gate and return a GateResult.
 
     Parameters
@@ -119,14 +120,23 @@ def evaluate_gate(gate_id: str, value: Any,
     value : scalar or dict
         The measured value(s).
     threshold_override : optional
-        Override the default threshold.
+        Override the default threshold (takes precedence over *gate_thresholds*).
+    gate_thresholds : GateThresholdsConfig, optional
+        Consolidated config; used when *threshold_override* is None.
 
     Returns
     -------
     GateResult
     """
     gate_def = GATE_DEFS[gate_id]
-    threshold = threshold_override if threshold_override is not None else gate_def.default_threshold
+    if threshold_override is not None:
+        threshold = threshold_override
+    elif gate_thresholds is not None:
+        threshold = gate_thresholds.threshold_dict(gate_id)
+        if threshold is None:
+            threshold = gate_def.default_threshold
+    else:
+        threshold = gate_def.default_threshold
 
     passed = True
     reason = ""
@@ -192,9 +202,9 @@ def evaluate_gate(gate_id: str, value: Any,
         if ncomp > t.get("max_fragments", 20):
             passed = False
             reason += f"fragments={ncomp} > max; "
-        if lcc_frac < 0.5:
+        if lcc_frac < t.get("min_lcc_fraction", 0.5):
             passed = False
-            reason += f"lcc_fraction={lcc_frac:.2f} < 0.5; "
+            reason += f"lcc_fraction={lcc_frac:.2f} < {t.get('min_lcc_fraction', 0.5)}; "
         if passed:
             reason = f"coverage={cov:.1f}%, fragments={ncomp}, lcc={lcc_frac:.2f}: OK"
 

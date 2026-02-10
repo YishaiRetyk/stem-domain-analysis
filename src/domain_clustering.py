@@ -68,7 +68,7 @@ def run_domain_clustering(
     valid = ring_features.valid_mask
     n_valid = int(np.sum(valid))
 
-    if n_valid < 3:
+    if n_valid < config.min_valid_tiles:
         logger.warning("Too few valid tiles (%d) for clustering", n_valid)
         n_rows, n_cols = ring_features.grid_shape
         empty_labels = np.full((n_rows, n_cols), -1, dtype=np.int32)
@@ -115,7 +115,7 @@ def run_domain_clustering(
         from src.cluster_domains import spatial_regularize, compute_adjacency_metrics
         adj_pre = compute_adjacency_metrics(tile_labels)
         tile_labels_reg = spatial_regularize(tile_labels, {
-            "regularize_iterations": 2,
+            "regularize_iterations": config.spatial_regularize_iterations,
             "min_domain_size": config.min_domain_size,
         })
         adj_post = compute_adjacency_metrics(tile_labels_reg)
@@ -131,8 +131,8 @@ def run_domain_clustering(
         try:
             from umap import UMAP
             reducer = UMAP(n_components=2, random_state=config.random_state,
-                           n_neighbors=min(15, features_scaled.shape[0] - 1),
-                           min_dist=0.1)
+                           n_neighbors=min(config.umap_n_neighbors, features_scaled.shape[0] - 1),
+                           min_dist=config.umap_min_dist)
             embedding_2d_full = np.zeros((n_rows * n_cols, 2), dtype=np.float64)
             embedding_2d_full[valid] = reducer.fit_transform(features_scaled)
             embedding_2d = embedding_2d_full
@@ -269,7 +269,7 @@ def _cluster_kmeans(
     if config.n_clusters > 0:
         # Fixed K
         k = min(config.n_clusters, n_samples)
-        km = KMeans(n_clusters=k, random_state=config.random_state, n_init=10)
+        km = KMeans(n_clusters=k, random_state=config.random_state, n_init=config.kmeans_n_init)
         labels = km.fit_predict(features)
         sil = _safe_silhouette(features, labels)
         return labels, k, sil, None
@@ -285,7 +285,7 @@ def _cluster_kmeans(
     best_labels = None
 
     for k in range(2, k_max + 1):
-        km = KMeans(n_clusters=k, random_state=config.random_state, n_init=10)
+        km = KMeans(n_clusters=k, random_state=config.random_state, n_init=config.kmeans_n_init)
         labels = km.fit_predict(features)
         score = _safe_silhouette(features, labels)
         if score is not None:

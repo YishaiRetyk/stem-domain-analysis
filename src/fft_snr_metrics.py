@@ -13,7 +13,7 @@ from typing import List, Optional
 
 from src.pipeline_config import (
     TilePeakSet, TileClassification, TierSummary, GatedTileGrid,
-    TierConfig, PeakGateConfig, FWHMConfig, ConfidenceConfig,
+    TierConfig, PeakGateConfig, FWHMConfig, ConfidenceConfig, PeakSNRConfig,
 )
 from src.fft_coords import FFTGrid
 from src.fft_peak_detection import classify_tile
@@ -33,7 +33,7 @@ def compute_tile_confidence(tc, tier_config, peak_gate_config, conf_config):
 
     # SNR: piecewise linear, 0 at tier_b_snr, 1 at 2×tier_a_snr
     snr_floor = tier_config.tier_b_snr
-    snr_ceil = 2.0 * tier_config.tier_a_snr
+    snr_ceil = conf_config.snr_ceiling_multiplier * tier_config.tier_a_snr
     snr_norm = np.clip((tc.best_snr - snr_floor) / (snr_ceil - snr_floor + 1e-10), 0, 1)
 
     pf = np.clip(tc.pair_fraction, 0, 1)
@@ -75,6 +75,7 @@ def build_gated_tile_grid(peak_sets: List[TilePeakSet],
                           log_interval_s: float = 5.0,
                           effective_q_min: float = 0.0,
                           confidence_config: ConfidenceConfig = None,
+                          peak_snr_config: PeakSNRConfig = None,
                           ) -> GatedTileGrid:
     """Classify all tiles and build the unified GatedTileGrid.
 
@@ -133,7 +134,8 @@ def build_gated_tile_grid(peak_sets: List[TilePeakSet],
             continue
 
         tc = classify_tile(ps, tile_grid, tier_config, peak_gate_config,
-                           fwhm_config, effective_q_min=effective_q_min)
+                           fwhm_config, effective_q_min=effective_q_min,
+                           peak_snr_config=peak_snr_config)
         classifications[r, c] = tc
         tier_map[r, c] = tc.tier
         snr_map[r, c] = tc.best_snr

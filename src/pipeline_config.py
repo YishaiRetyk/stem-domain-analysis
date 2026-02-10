@@ -364,6 +364,8 @@ class PreprocConfig:
     normalize_method: str = "robust"        # 'robust' or 'minmax'
     hot_pixel_removal: bool = True          # I1
     hot_pixel_sigma: float = 5.0            # I1: outlier threshold in MAD units
+    hot_pixel_median_kernel: int = 3        # median filter kernel size for hot pixel removal
+    robust_norm_clip_sigma: float = 5.0     # clip range in sigma units for robust norm
 
 
 @dataclass
@@ -384,6 +386,10 @@ class ROIConfig:
     variance_threshold_pct: float = 20.0
     min_lcc_fraction: float = 0.5           # largest connected component / total mask area
     gradient_threshold_pct: float = 30.0    # percentile for gradient-magnitude fallback
+    variance_window_size: int = 32          # window size for local variance computation
+    morph_kernel_size: int = 5              # morphological opening kernel size
+    smooth_sigma: float = 2.0              # Gaussian smoothing sigma for mask edges
+    gradient_smooth_sigma: float = 1.0      # Gaussian smoothing for gradient computation
 
 
 @dataclass
@@ -417,6 +423,7 @@ class ConfidenceConfig:
     w_orientation_confidence: float = 0.15
     w_non_collinearity: float = 0.10
     w_fwhm_quality: float = 0.15
+    snr_ceiling_multiplier: float = 2.0
 
 
 @dataclass
@@ -447,6 +454,21 @@ class GlobalFFTConfig:
     q_fit_min: float = 0.30                 # cycles/nm; 0 = derive from PhysicsConfig.d_max_nm
     background_max_degree: int = 4          # hard cap on polynomial degree
     background_default_degree: int = 3      # used unless overridden
+    strong_guidance_snr: float = 8.0        # SNR threshold for "strong" FFT guidance
+    bg_reweight_iterations: int = 4         # iterative reweight cycles for background fit
+    bg_reweight_downweight: float = 0.1     # weight for outlier bins in reweighted fit
+    savgol_window_max: int = 11             # max Savitzky-Golay window for radial smoothing
+    savgol_window_min: int = 5              # min Savitzky-Golay window
+    savgol_polyorder: int = 2               # Savitzky-Golay polynomial order
+    radial_peak_distance: int = 5           # min distance between radial peaks
+    radial_peak_width: int = 2              # min width for radial peak detection
+    q_width_expansion_frac: float = 0.03    # fractional q-width expansion for ring extraction
+    harmonic_ratio_tol: float = 0.05        # tolerance for harmonic ratio matching
+    harmonic_angle_tol_deg: float = 5.0     # angle tolerance for harmonic de-duplication
+    harmonic_snr_ratio: float = 2.0         # SNR ratio to prefer harmonic over fundamental
+    non_collinear_min_angle_deg: float = 15.0  # min angle between non-collinear g-vectors
+    angular_prominence_frac: float = 0.5    # angular prominence as fraction of median
+    angular_peak_distance: int = 10         # min distance between angular peaks
 
 
 @dataclass
@@ -467,6 +489,19 @@ class GPAConfig:
     auto_min_valid_tile_fraction: float = 0.3
     auto_max_orientation_entropy: float = 0.5
     auto_min_global_peak_snr: float = 5.0
+    # GPA mask sigma determination
+    mask_sigma_fwhm_factor: float = 0.5     # sigma = factor * median(fwhm)
+    mask_sigma_fallback_factor: float = 0.06  # sigma = factor * min(|g|) when no fwhm
+    mask_sigma_dc_clamp_factor: float = 0.18  # DC safety clamp: sigma <= factor * min(|g|)
+    # Orientation histogram for mode selection
+    orientation_bins: int = 12
+    bimodal_smooth_sigma: float = 0.5
+    bimodal_peak_distance: int = 2
+    bimodal_valley_ratio: float = 0.5
+    # Phase extraction
+    amplitude_erosion_iterations: int = 2
+    phase_noise_min_pixels: int = 10
+    min_tier_a_fraction_for_gpa: float = 0.1
 
 
 @dataclass
@@ -481,6 +516,10 @@ class PeakFindingConfig:
     use_directional_mask: bool = True       # g-oriented wedge masks instead of full ring
     angular_width_deg: float = 30.0         # half-width of angular wedge per g-vector
     adaptive_tolerance: bool = True         # adaptive NN tolerance from IQR
+    taper_width_fraction: float = 0.3       # cosine taper width as fraction of bandwidth
+    background_percentile: float = 50.0     # percentile for local background estimation
+    background_filter_size_mult: int = 2    # multiplier for background filter size
+    adaptive_tolerance_floor: float = 0.1   # minimum adaptive tolerance
 
 
 @dataclass
@@ -527,6 +566,9 @@ class TileFFTConfig:
     q_dc_min: float = 0.25                  # cycles/nm, replaces pixel-based DC mask
     peak_snr_threshold: float = 2.5         # replaces peak_threshold_frac for primary detection
     local_max_size: int = 5                 # footprint for local max detection (pixels)
+    annulus_inner_factor: float = 0.9       # inner annulus bound = factor * peak_q
+    annulus_outer_factor: float = 1.1       # outer annulus bound = factor * peak_q
+    background_disk_r_sq: int = 9           # squared radius for peak exclusion disk (r=3)
 
 
 @dataclass
@@ -552,6 +594,113 @@ class ClusteringConfig:
     dimred_method: str = "pca"      # pca | umap | none
     pca_variance_threshold: float = 0.95
     random_state: int = 42
+    min_valid_tiles: int = 3                # minimum valid tiles for clustering
+    spatial_regularize_iterations: int = 2  # iterations for spatial regularization
+    umap_n_neighbors: int = 15
+    umap_min_dist: float = 0.1
+    kmeans_n_init: int = 10
+
+
+@dataclass
+class GateThresholdsConfig:
+    """All gate thresholds (G0-G12) in a single dataclass.
+
+    ``threshold_dict(gate_id)`` returns the dict that ``evaluate_gate()``
+    already expects via *threshold_override*.
+    """
+    # G0
+    g0_nyquist_safety_margin: float = 0.95
+    # G2
+    g2_max_clipped_fraction: float = 0.005
+    g2_min_range_ratio: float = 10.0
+    # G3
+    g3_min_coverage: float = 10.0
+    g3_max_coverage: float = 95.0
+    g3_max_fragments: int = 20
+    g3_min_lcc_fraction: float = 0.5
+    # G4
+    g4_min_peak_snr: float = 3.0
+    # G5
+    g5_min_periods: float = 20.0
+    # G6
+    g6_min_fraction: float = 0.05
+    # G7
+    g7_min_median_snr: float = 5.0
+    # G8
+    g8_min_mean_symmetry: float = 0.3
+    # G9
+    g9_min_area: int = 9
+    g9_max_entropy: float = 0.3
+    g9_min_snr: float = 5.0
+    # G10
+    g10_max_phase_noise: float = 0.3
+    g10_min_unwrap_success: float = 0.7
+    # G11
+    g11_max_ref_strain: float = 0.005
+    g11_max_outlier_fraction: float = 0.20
+    g11_strain_outlier_threshold: float = 0.05
+    # G12
+    g12_min_fraction_valid: float = 0.50
+    g12_tolerance: float = 0.20
+
+    def threshold_dict(self, gate_id: str) -> Optional[dict]:
+        """Return the threshold dict matching GATE_DEFS format for *gate_id*."""
+        _map = {
+            "G0": {"nyquist_safety_margin": self.g0_nyquist_safety_margin},
+            "G2": {"max_clipped_fraction": self.g2_max_clipped_fraction,
+                    "min_range_ratio": self.g2_min_range_ratio},
+            "G3": {"min_coverage": self.g3_min_coverage,
+                    "max_coverage": self.g3_max_coverage,
+                    "max_fragments": self.g3_max_fragments,
+                    "min_lcc_fraction": self.g3_min_lcc_fraction},
+            "G4": {"min_peak_snr": self.g4_min_peak_snr},
+            "G5": {"min_periods": self.g5_min_periods},
+            "G6": {"min_fraction": self.g6_min_fraction},
+            "G7": {"min_median_snr": self.g7_min_median_snr},
+            "G8": {"min_mean_symmetry": self.g8_min_mean_symmetry},
+            "G9": {"min_area": self.g9_min_area,
+                    "max_entropy": self.g9_max_entropy,
+                    "min_snr": self.g9_min_snr},
+            "G10": {"max_phase_noise": self.g10_max_phase_noise,
+                     "min_unwrap_success": self.g10_min_unwrap_success},
+            "G11": {"max_ref_strain": self.g11_max_ref_strain,
+                     "max_outlier_fraction": self.g11_max_outlier_fraction,
+                     "strain_outlier_threshold": self.g11_strain_outlier_threshold},
+            "G12": {"min_fraction_valid": self.g12_min_fraction_valid,
+                     "tolerance": self.g12_tolerance},
+        }
+        return _map.get(gate_id)
+
+
+@dataclass
+class PeakSNRConfig:
+    """Peak SNR and FWHM measurement tunables."""
+    signal_disk_radius_px: int = 3
+    annular_width_min_q: float = 0.15
+    annular_fwhm_multiplier: float = 1.5
+    min_background_pixels: int = 20
+    fwhm_patch_radius: int = 5
+    moment_sigma_floor: float = 0.3
+    fit_condition_max: float = 100.0
+    symmetry_tolerance_px: float = 2.0
+    non_collinear_min_angle_deg: float = 15.0
+
+
+@dataclass
+class ReferenceSelectionConfig:
+    """Reference region scoring weights and bins."""
+    scoring_weight_entropy: float = 0.4
+    scoring_weight_snr: float = 0.3
+    scoring_weight_area: float = 0.3
+    orientation_bins: int = 12
+
+
+@dataclass
+class RingAnalysisConfig:
+    """Ring analysis tunables."""
+    ring_width_fwhm_mult: float = 2.0
+    ring_width_fallback_frac: float = 0.03
+    ring_width_no_fwhm_frac: float = 0.1
 
 
 @dataclass
@@ -576,6 +725,10 @@ class PipelineConfig:
     tile_fft: TileFFTConfig = field(default_factory=TileFFTConfig)
     confidence: ConfidenceConfig = field(default_factory=ConfidenceConfig)
     clustering: ClusteringConfig = field(default_factory=ClusteringConfig)
+    gate_thresholds: GateThresholdsConfig = field(default_factory=GateThresholdsConfig)
+    peak_snr: PeakSNRConfig = field(default_factory=PeakSNRConfig)
+    reference_selection: ReferenceSelectionConfig = field(default_factory=ReferenceSelectionConfig)
+    ring_analysis: RingAnalysisConfig = field(default_factory=RingAnalysisConfig)
 
     def to_dict(self) -> dict:
         """Serialise to a JSON-safe dict."""
@@ -607,6 +760,10 @@ class PipelineConfig:
             "tile_fft": (TileFFTConfig, "tile_fft"),
             "confidence": (ConfidenceConfig, "confidence"),
             "clustering": (ClusteringConfig, "clustering"),
+            "gate_thresholds": (GateThresholdsConfig, "gate_thresholds"),
+            "peak_snr": (PeakSNRConfig, "peak_snr"),
+            "reference_selection": (ReferenceSelectionConfig, "reference_selection"),
+            "ring_analysis": (RingAnalysisConfig, "ring_analysis"),
         }
         for attr, (klass, key) in _mapping.items():
             if key in d and isinstance(d[key], dict):
@@ -615,4 +772,23 @@ class PipelineConfig:
                     if hasattr(sub, k):
                         setattr(sub, k, v)
                 setattr(cfg, attr, sub)
+
+        # Backward-compat: sync old-style validation keys → gate_thresholds
+        if "validation" in d and isinstance(d["validation"], dict) and "gate_thresholds" not in d:
+            v = d["validation"]
+            gt = cfg.gate_thresholds
+            _compat = {
+                "min_detection_rate": "g6_min_fraction",
+                "min_periods": "g5_min_periods",
+                "min_tier_a_snr_median": "g7_min_median_snr",
+                "min_symmetry_mean": "g8_min_mean_symmetry",
+                "ref_area_min": "g9_min_area",
+                "ref_entropy_max": "g9_max_entropy",
+                "ref_snr_min": "g9_min_snr",
+                "peak_lattice_fraction_min": "g12_min_fraction_valid",
+            }
+            for old_key, new_attr in _compat.items():
+                if old_key in v:
+                    setattr(gt, new_attr, v[old_key])
+
         return cfg

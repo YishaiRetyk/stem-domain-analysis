@@ -97,9 +97,14 @@ class TestCachedGrids:
     def test_grid_identity(self):
         """Repeated access returns the same object (no re-allocation)."""
         from src import fft_peak_detection as mod
-        assert mod._X11 is _X11
-        assert mod._Y11 is _Y11
-        assert mod._DIST11 is _DIST11
+        # Capture current references, then verify they don't change
+        x11_a = mod._X11
+        y11_a = mod._Y11
+        dist_a = mod._DIST11
+        mod._ensure_patch_cache(5)  # should be a no-op when already 5
+        assert mod._X11 is x11_a
+        assert mod._Y11 is y11_a
+        assert mod._DIST11 is dist_a
 
     def test_dist_center_is_zero(self):
         assert _DIST11[5, 5] == 0.0

@@ -18,7 +18,7 @@ from src.gates import evaluate_gate
 logger = logging.getLogger(__name__)
 
 
-def _compute_gradient_magnitude(image, sigma=1.0):
+def _compute_gradient_magnitude(image, sigma=1.0):  # sigma from config.gradient_smooth_sigma
     """Compute gradient magnitude using Sobel operators on smoothed image."""
     from scipy.ndimage import sobel, gaussian_filter
     smoothed = gaussian_filter(image.astype(np.float64), sigma=sigma)
@@ -79,7 +79,7 @@ def compute_roi_mask(image_seg: np.ndarray,
     intensity_mask = image_seg > intensity_thresh
 
     # Variance mask: exclude smooth/uniform regions
-    local_var = _compute_local_variance(image_seg, window_size=32)
+    local_var = _compute_local_variance(image_seg, window_size=config.variance_window_size)
     var_thresh = np.percentile(local_var, config.variance_threshold_pct)
     variance_mask = local_var > var_thresh
 
@@ -88,9 +88,9 @@ def compute_roi_mask(image_seg: np.ndarray,
 
     # Morphological cleanup
     mask = ndimage.binary_fill_holes(mask)
-    mask = ndimage.binary_opening(mask, structure=np.ones((5, 5)))
+    mask = ndimage.binary_opening(mask, structure=np.ones((config.morph_kernel_size, config.morph_kernel_size)))
     # Slight smoothing for clean edges
-    mask_f = ndimage.gaussian_filter(mask.astype(np.float64), sigma=2.0)
+    mask_f = ndimage.gaussian_filter(mask.astype(np.float64), sigma=config.smooth_sigma)
     mask = mask_f > 0.5
 
     mask_uint8 = mask.astype(np.uint8)
@@ -118,7 +118,7 @@ def compute_roi_mask(image_seg: np.ndarray,
         logger.info("Primary mask coverage=%.1f%%, lcc_fraction=%.2f -- "
                      "applying gradient-magnitude fallback.",
                      coverage_pct, lcc_fraction)
-        grad_mag = _compute_gradient_magnitude(image_seg)
+        grad_mag = _compute_gradient_magnitude(image_seg, sigma=config.gradient_smooth_sigma)
         grad_thresh = np.percentile(grad_mag, config.gradient_threshold_pct)
         grad_mask = grad_mag > grad_thresh
 
@@ -127,8 +127,8 @@ def compute_roi_mask(image_seg: np.ndarray,
 
         # Morphological cleanup on combined mask
         combined = ndimage.binary_fill_holes(combined)
-        combined = ndimage.binary_opening(combined, structure=np.ones((5, 5)))
-        combined_f = ndimage.gaussian_filter(combined.astype(np.float64), sigma=2.0)
+        combined = ndimage.binary_opening(combined, structure=np.ones((config.morph_kernel_size, config.morph_kernel_size)))
+        combined_f = ndimage.gaussian_filter(combined.astype(np.float64), sigma=config.smooth_sigma)
         combined = combined_f > 0.5
 
         mask_uint8 = combined.astype(np.uint8)

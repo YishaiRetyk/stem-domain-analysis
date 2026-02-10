@@ -15,7 +15,7 @@ from scipy.signal import windows
 from typing import List, Optional, Tuple
 
 from src.fft_coords import FFTGrid
-from src.pipeline_config import SubpixelPeak, LatticeValidation
+from src.pipeline_config import SubpixelPeak, LatticeValidation, PeakFindingConfig
 from src.gates import evaluate_gate
 
 logger = logging.getLogger(__name__)
@@ -32,7 +32,8 @@ def build_bandpass_image(image_fft: np.ndarray,
                          effective_q_min: float = 0.0,
                          g_vectors=None,
                          angular_width_deg: float = 30.0,
-                         use_directional_mask: bool = True) -> np.ndarray:
+                         use_directional_mask: bool = True,
+                         taper_width_fraction: float = 0.3) -> np.ndarray:
     """Build bandpass-filtered image for peak finding (I5).
 
     Ring mask at |g_dom| with cosine-tapered edges.
@@ -54,7 +55,7 @@ def build_bandpass_image(image_fft: np.ndarray,
     q_bandwidth = bandwidth_fraction * q_center
     q_inner = q_center - q_bandwidth
     q_outer = q_center + q_bandwidth
-    taper_width = q_bandwidth * 0.3
+    taper_width = q_bandwidth * taper_width_fraction
 
     # Build ring mask with cosine taper
     ring_mask = np.zeros((H, W))
@@ -112,7 +113,9 @@ def find_subpixel_peaks(peak_image: np.ndarray,
                          expected_d_nm: float,
                          pixel_size_nm: float,
                          min_prominence: float = 0.1,
-                         tile_size: int = 256) -> List[SubpixelPeak]:
+                         tile_size: int = 256,
+                         background_percentile: float = 50.0,
+                         background_filter_size_mult: int = 2) -> List[SubpixelPeak]:
     """Find subpixel peaks with d-spacing-adaptive separation (C9).
 
     min_separation_px = clamp(0.6 * expected_d_nm / pixel_size_nm, min=2, max=tile_size/4)
@@ -130,7 +133,8 @@ def find_subpixel_peaks(peak_image: np.ndarray,
     local_max = ndimage.maximum_filter(peak_image, footprint=footprint)
 
     # Threshold: min_prominence * local background
-    bg_estimate = ndimage.percentile_filter(peak_image, percentile=50, size=max(31, footprint_size * 2))
+    bg_estimate = ndimage.percentile_filter(peak_image, percentile=background_percentile,
+                                               size=max(31, footprint_size * background_filter_size_mult))
     threshold = bg_estimate + min_prominence * np.std(peak_image)
 
     peaks_mask = (peak_image == local_max) & (peak_image > threshold)
@@ -184,7 +188,8 @@ def validate_peak_lattice(peaks: List[SubpixelPeak],
                            expected_d_nm: float,
                            pixel_size_nm: float,
                            tolerance: float = 0.2,
-                           adaptive: bool = True) -> LatticeValidation:
+                           adaptive: bool = True,
+                           adaptive_tolerance_floor: float = 0.1) -> LatticeValidation:
     """Validate detected peaks against expected lattice spacing.
 
     Checks NN distances against expected d-spacing.
@@ -220,7 +225,7 @@ def validate_peak_lattice(peaks: List[SubpixelPeak],
         q75, q25 = np.percentile(nn_distances, [75, 25])
         iqr = q75 - q25
         tolerance_actual = min(tolerance, iqr / expected_d_nm)
-        tolerance_actual = max(tolerance_actual, 0.1)
+        tolerance_actual = max(tolerance_actual, adaptive_tolerance_floor)
         if tolerance_actual < tolerance:
             logger.info("Adaptive tolerance: %.3f (IQR=%.3f nm, nominal=%.3f)",
                         tolerance_actual, iqr, tolerance)

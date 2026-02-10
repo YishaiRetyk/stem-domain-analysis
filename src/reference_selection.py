@@ -11,7 +11,7 @@ import logging
 import numpy as np
 from scipy import ndimage
 
-from src.pipeline_config import ReferenceRegion, GatedTileGrid
+from src.pipeline_config import ReferenceRegion, GatedTileGrid, ReferenceSelectionConfig
 from src.gates import evaluate_gate
 
 logger = logging.getLogger(__name__)
@@ -20,7 +20,8 @@ logger = logging.getLogger(__name__)
 def select_reference_region(gated_grid: GatedTileGrid,
                             min_area: int = 9,
                             max_entropy: float = 0.3,
-                            min_snr: float = 5.0) -> ReferenceRegion:
+                            min_snr: float = 5.0,
+                            ref_config: ReferenceSelectionConfig = None) -> ReferenceRegion:
     """Select the best reference region from Tier A tiles.
 
     Uses connected components of Tier A tiles.
@@ -31,6 +32,9 @@ def select_reference_region(gated_grid: GatedTileGrid,
     ReferenceRegion
         Best region. Raises ValueError if no valid region found.
     """
+    if ref_config is None:
+        ref_config = ReferenceSelectionConfig()
+
     tier_map = gated_grid.tier_map
     snr_map = gated_grid.snr_map
     orientation_map = gated_grid.orientation_map
@@ -59,10 +63,10 @@ def select_reference_region(gated_grid: GatedTileGrid,
         orientations = orientation_map[comp_mask]
         valid_orient = orientations[~np.isnan(orientations)]
         if len(valid_orient) > 0:
-            hist, _ = np.histogram(valid_orient, bins=12, range=(0, 180))
+            hist, _ = np.histogram(valid_orient, bins=ref_config.orientation_bins, range=(0, 180))
             probs = hist / hist.sum()
             probs = probs[probs > 0]
-            entropy = float(-np.sum(probs * np.log2(probs)) / np.log2(12))
+            entropy = float(-np.sum(probs * np.log2(probs)) / np.log2(ref_config.orientation_bins))
         else:
             entropy = 1.0
 
@@ -102,7 +106,9 @@ def select_reference_region(gated_grid: GatedTileGrid,
     for c in candidates:
         snr_norm = c["mean_snr"] / (max_snr_val + 1e-10)
         area_norm = c["area"] / (max_area_val + 1e-10)
-        c["score"] = 0.4 * (1.0 - c["entropy"]) + 0.3 * snr_norm + 0.3 * area_norm
+        c["score"] = (ref_config.scoring_weight_entropy * (1.0 - c["entropy"])
+                      + ref_config.scoring_weight_snr * snr_norm
+                      + ref_config.scoring_weight_area * area_norm)
 
     # Select best
     best = max(candidates, key=lambda c: c["score"])

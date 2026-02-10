@@ -722,7 +722,7 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
     import logging
     import psutil
     from src.fft_coords import FFTGrid, compute_effective_q_min
-    from src.pipeline_config import PipelineConfig, GPAConfig, TierConfig
+    from src.pipeline_config import PipelineConfig, GPAConfig, TierConfig, PeakSNRConfig, ReferenceSelectionConfig, RingAnalysisConfig
     from src.preprocess_fft_safe import preprocess_fft_safe
     from src.preprocess_segmentation import preprocess_segmentation
     from src.roi_masking import compute_roi_mask, downsample_to_tile_grid
@@ -799,6 +799,11 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
     config.clustering.method = args.cluster_method
     config.clustering.n_clusters = args.cluster_n
     config.clustering.dimred_method = args.cluster_dimred
+    if args.strong_guidance_snr is not None:
+        config.global_fft.strong_guidance_snr = args.strong_guidance_snr
+
+    # Extract config sub-objects for threading
+    gt = config.gate_thresholds
 
     # --- GPU / device context ---
     from src.gpu_backend import DeviceContext, get_gpu_info
@@ -825,7 +830,7 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
         "min_dim": min(H, W) >= 512,
         "has_pixel_size": pixel_size > 0,
     }
-    g1 = evaluate_gate("G1", g1_checks)
+    g1 = evaluate_gate("G1", g1_checks, gate_thresholds=gt)
     gate_results = {"G1": g1}
     if not g1.passed:
         print(f"  FATAL: Input validation failed: {g1.reason}")
@@ -864,7 +869,7 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
             "q_min_requested": q_min_req,
             "q_nyquist": q_nyquist,
             "safety_margin": physics.nyquist_safety_margin,
-        })
+        }, gate_thresholds=gt)
         gate_results["G0"] = g0
         if not g0.passed and "FATAL" in g0.reason:
             print(f"  FATAL: {g0.reason}")
@@ -886,7 +891,7 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
     gate_results["G2"] = evaluate_gate("G2", {
         "clipped_fraction": preproc_record.diagnostics.get("clipped_fraction", 0),
         "intensity_range_ratio": preproc_record.diagnostics.get("intensity_range_ratio", 100),
-    })
+    }, gate_thresholds=gt)
     print(f"  Confidence: {preproc_record.confidence}")
     print(f"  G2 {'PASS' if gate_results['G2'].passed else 'FAIL (DEGRADE)'}")
 
@@ -907,7 +912,7 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
     gate_results["G3"] = evaluate_gate("G3", {
         "coverage_pct": roi_result.coverage_pct,
         "n_components": roi_result.n_components,
-    })
+    }, gate_thresholds=gt)
     print(f"  Coverage: {roi_result.coverage_pct:.1f}%, components: {roi_result.n_components}")
     print(f"  G3 {'PASS' if gate_results['G3'].passed else 'FAIL (FALLBACK)'}")
     if not gate_results["G3"].passed:
@@ -922,7 +927,7 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
     d_dom = global_fft_result.d_dom
 
     best_global_snr = max((p.snr for p in global_fft_result.peaks), default=0)
-    gate_results["G4"] = evaluate_gate("G4", best_global_snr)
+    gate_results["G4"] = evaluate_gate("G4", best_global_snr, gate_thresholds=gt)
     print(f"  d_dom: {d_dom:.3f} nm" if d_dom else "  d_dom: not found")
     print(f"  Peaks found: {len(global_fft_result.peaks)}, g-vectors: {len(global_fft_result.g_vectors)}")
     print(f"  G4 {'PASS' if gate_results['G4'].passed else 'FAIL (FALLBACK)'}")
@@ -944,7 +949,7 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
     d_for_g5 = d_dom if d_dom else (args.d_max if args.d_max else 1.0)
     d_px = d_for_g5 / pixel_size
     periods = config.tile_size / d_px if d_px > 0 else 0
-    gate_results["G5"] = evaluate_gate("G5", periods)
+    gate_results["G5"] = evaluate_gate("G5", periods, gate_thresholds=gt)
     if not gate_results["G5"].passed:
         print(f"  FATAL: Only {periods:.1f} periods per tile (need >=20)")
         # Save what we have and exit
@@ -955,6 +960,7 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
             pixel_size_nm=pixel_size, d_dom_nm=d_dom,
             effective_q_min=effective_q_min,
             tile_effective_q_min=tile_effective_q_min,
+            gate_thresholds=gt,
         )
         save_pipeline_artifacts(
             output_path, config=config, fft_grid=fft_grid,
@@ -988,6 +994,7 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
         tier_config=config.tier, peak_gate_config=config.peak_gates,
         effective_q_min=tile_effective_q_min,
         confidence_config=config.confidence,
+        peak_snr_config=config.peak_snr,
     )
 
     # Free tile power spectra — no longer needed after classification
@@ -1000,11 +1007,11 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
           f"Rejected: {ts.n_rejected}, Skipped: {ts.n_skipped}")
     print(f"  Tier A fraction: {ts.tier_a_fraction:.3f}")
 
-    gate_results["G6"] = evaluate_gate("G6", ts.tier_a_fraction)
-    gate_results["G7"] = evaluate_gate("G7", ts.median_snr_tier_a)
+    gate_results["G6"] = evaluate_gate("G6", ts.tier_a_fraction, gate_thresholds=gt)
+    gate_results["G7"] = evaluate_gate("G7", ts.median_snr_tier_a, gate_thresholds=gt)
     tier_a_sym = gated_grid.symmetry_map[gated_grid.tier_map == "A"]
     mean_sym = float(np.mean(tier_a_sym)) if len(tier_a_sym) > 0 else 0.0
-    gate_results["G8"] = evaluate_gate("G8", mean_sym)
+    gate_results["G8"] = evaluate_gate("G8", mean_sym, gate_thresholds=gt)
     for gid in ("G6", "G7", "G8"):
         print(f"  {gid} {'PASS' if gate_results[gid].passed else 'FAIL'}")
 
@@ -1020,7 +1027,8 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
             compute_tile_averaged_fft, compute_cluster_summaries,
         )
 
-        ring_maps = build_ring_maps(gated_grid, global_fft_result.peaks)
+        ring_maps = build_ring_maps(gated_grid, global_fft_result.peaks,
+                                     ring_config=config.ring_analysis)
         ring_features = build_ring_feature_vectors(gated_grid, ring_maps)
         print(f"  Rings: {ring_maps.n_rings}, features: {ring_features.feature_matrix.shape[1]}")
         print(f"  Valid tiles: {int(np.sum(ring_features.valid_mask))}")
@@ -1079,6 +1087,8 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
             stride=config.stride,
             ctx=ctx,
             effective_q_min=effective_q_min,
+            gate_thresholds=gt,
+            ref_config=config.reference_selection,
         )
         if gpa_result is not None:
             print(f"  Mode used: {gpa_result.mode}")
@@ -1094,14 +1104,14 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
                     "unwrap_success": {k: v.unwrap_success_fraction
                                        for k, v in gpa_result.phases.items()},
                 }
-                gate_results["G10"] = evaluate_gate("G10", g10_val)
+                gate_results["G10"] = evaluate_gate("G10", g10_val, gate_thresholds=gt)
                 print(f"  G10 {'PASS' if gate_results['G10'].passed else 'FAIL'}")
             if gpa_result.qc.get("g11_passed") is not None:
                 g11_val = {
                     "ref_strain_max": gpa_result.qc.get("ref_strain_mean_exx", 0),
                     "outlier_fraction": gpa_result.qc.get("strain_outlier_fraction", 0),
                 }
-                gate_results["G11"] = evaluate_gate("G11", g11_val)
+                gate_results["G11"] = evaluate_gate("G11", g11_val, gate_thresholds=gt)
                 print(f"  G11 {'PASS' if gate_results['G11'].passed else 'FAIL'}")
         else:
             print("  GPA skipped")
@@ -1141,7 +1151,7 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
                 peaks, d_dom, pixel_size,
                 tolerance=config.peak_finding.lattice_tolerance,
             )
-            gate_results["G12"] = evaluate_gate("G12", lattice_validation.fraction_valid)
+            gate_results["G12"] = evaluate_gate("G12", lattice_validation.fraction_valid, gate_thresholds=gt)
             print(f"  Lattice valid: {lattice_validation.fraction_valid:.1%}")
             print(f"  G12 {'PASS' if gate_results['G12'].passed else 'FAIL'}")
     else:
@@ -1162,6 +1172,7 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
         d_dom_nm=d_dom,
         effective_q_min=effective_q_min,
         tile_effective_q_min=tile_effective_q_min,
+        gate_thresholds=gt,
     )
 
     saved = save_pipeline_artifacts(
@@ -1350,6 +1361,9 @@ Examples:
     parser.add_argument('--cluster-dimred', type=str, default='pca',
                         choices=['pca', 'umap', 'none'], dest='cluster_dimred',
                         help='Dimensionality reduction for clustering (default: pca)')
+    parser.add_argument('--strong-guidance-snr', type=float, default=None,
+                        dest='strong_guidance_snr',
+                        help='SNR threshold for strong FFT guidance (default: 8.0)')
 
     args = parser.parse_args()
     

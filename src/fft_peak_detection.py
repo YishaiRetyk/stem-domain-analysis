@@ -13,7 +13,7 @@ from typing import List, Optional, Tuple
 from src.fft_coords import FFTGrid
 from src.pipeline_config import (
     PeakSNR, PeakFWHM, TilePeak, TilePeakSet, TileClassification,
-    TierConfig, PeakGateConfig, FWHMConfig,
+    TierConfig, PeakGateConfig, FWHMConfig, PeakSNRConfig,
 )
 
 logger = logging.getLogger(__name__)
@@ -48,7 +48,8 @@ def compute_peak_snr(power: np.ndarray,
                      all_peaks: List[TilePeak],
                      fft_grid: FFTGrid,
                      _cached: Optional[dict] = None,
-                     effective_q_min: float = 0.0) -> PeakSNR:
+                     effective_q_min: float = 0.0,
+                     peak_snr_config: Optional[PeakSNRConfig] = None) -> PeakSNR:
     """Compute peak-height SNR with peak-excluding annular background.
 
     Signal = max(power[disk_r3]) around peak centre.
@@ -61,6 +62,14 @@ def compute_peak_snr(power: np.ndarray,
         Pre-computed arrays from classify_tile to avoid per-peak reallocation.
         Keys: 'x_grid', 'y_grid', 'exclusion_mask'.
     """
+    if peak_snr_config is None:
+        peak_snr_config = PeakSNRConfig()
+    signal_r = peak_snr_config.signal_disk_radius_px
+    signal_r_sq = signal_r ** 2
+    annular_width_min = peak_snr_config.annular_width_min_q
+    annular_fwhm_mult = peak_snr_config.annular_fwhm_multiplier
+    min_bg_px = peak_snr_config.min_background_pixels
+
     H, W = power.shape
 
     if _cached is not None:
@@ -75,9 +84,9 @@ def compute_peak_snr(power: np.ndarray,
     # Peak pixel position
     peak_px_x, peak_px_y = fft_grid.q_to_px(target_peak.qx, target_peak.qy)
 
-    # Signal: max in 3-pixel-radius disk
+    # Signal: max in signal_r-pixel-radius disk
     dist_sq = (x_grid - peak_px_x) ** 2 + (y_grid - peak_px_y) ** 2
-    signal_disk = dist_sq <= 9  # r=3
+    signal_disk = dist_sq <= signal_r_sq
     if not np.any(signal_disk):
         return PeakSNR(0, 0, 1, 0, 0, "no signal pixels")
     signal_peak = float(np.max(power[signal_disk]))
@@ -85,7 +94,7 @@ def compute_peak_snr(power: np.ndarray,
     # Annular band at peak's |q|
     q_mag_grid = fft_grid.q_mag_grid()
     peak_q = target_peak.q_mag
-    annular_width = max(0.15, target_peak.fwhm * 1.5 if target_peak.fwhm > 0 else 0.15)
+    annular_width = max(annular_width_min, target_peak.fwhm * annular_fwhm_mult if target_peak.fwhm > 0 else annular_width_min)
     annulus_mask = np.abs(q_mag_grid - peak_q) <= annular_width
     if effective_q_min > 0:
         annulus_mask &= (q_mag_grid >= effective_q_min)
@@ -94,7 +103,7 @@ def compute_peak_snr(power: np.ndarray,
     n_bg = int(np.sum(background_mask))
 
     note = None
-    if n_bg < 20:
+    if n_bg < min_bg_px:
         background_mask = annulus_mask & ~signal_disk
         n_bg = int(np.sum(background_mask))
         note = "full-annulus fallback (insufficient background after peak exclusion)"
@@ -127,7 +136,7 @@ def compute_peak_snr(power: np.ndarray,
 # FWHM measurement (B2): cached grids, proxy width, gated curve_fit
 # ======================================================================
 
-# --- Cached 11×11 patch grids (R=5) computed once at import time ---
+# --- Cached patch grids (default R=5, rebuilt lazily if config differs) ---
 _PATCH_R = 5
 _PATCH_SIZE = 2 * _PATCH_R + 1
 _Y11, _X11 = np.mgrid[:_PATCH_SIZE, :_PATCH_SIZE]
@@ -136,6 +145,20 @@ _OUTER_RING11 = _DIST11 >= (_PATCH_R - 1)
 # Pre-computed radial bin masks for fallback
 _RADIAL_MASKS11 = [(_DIST11 >= dr) & (_DIST11 < dr + 1)
                     for dr in range(_PATCH_R + 1)]
+
+
+def _ensure_patch_cache(radius: int):
+    """Rebuild the module-level patch cache if *radius* differs from default."""
+    global _PATCH_R, _PATCH_SIZE, _Y11, _X11, _DIST11, _OUTER_RING11, _RADIAL_MASKS11
+    if radius == _PATCH_R:
+        return
+    _PATCH_R = radius
+    _PATCH_SIZE = 2 * _PATCH_R + 1
+    _Y11, _X11 = np.mgrid[:_PATCH_SIZE, :_PATCH_SIZE]
+    _DIST11 = np.sqrt((_X11 - _PATCH_R) ** 2 + (_Y11 - _PATCH_R) ** 2)
+    _OUTER_RING11 = _DIST11 >= (_PATCH_R - 1)
+    _RADIAL_MASKS11 = [(_DIST11 >= dr) & (_DIST11 < dr + 1)
+                        for dr in range(_PATCH_R + 1)]
 
 
 def _gaussian_2d(coords, amplitude, cx, cy, sigma_x, sigma_y, theta):
@@ -297,7 +320,8 @@ def measure_peak_fwhm(power: np.ndarray,
 def check_symmetry(peaks: List[TilePeak],
                    fft_grid: FFTGrid,
                    tolerance_px: float = 2.0,
-                   median_fwhm_q: float = 0.0) -> Tuple[float, int]:
+                   median_fwhm_q: float = 0.0,
+                   peak_snr_config: Optional[PeakSNRConfig] = None) -> Tuple[float, int]:
     """Check ±g symmetry among peaks.
 
     Parameters
@@ -345,7 +369,8 @@ def check_symmetry(peaks: List[TilePeak],
 # Non-collinearity check
 # ======================================================================
 
-def count_non_collinear(peaks: List[TilePeak], min_angle_deg: float = 15.0) -> int:
+def count_non_collinear(peaks: List[TilePeak], min_angle_deg: float = 15.0,
+                        peak_snr_config: Optional[PeakSNRConfig] = None) -> int:
     """Count maximum number of non-collinear g-vectors."""
     if not peaks:
         return 0
@@ -367,7 +392,8 @@ def classify_tile(peak_set: TilePeakSet,
                   tier_config: TierConfig = None,
                   peak_gate_config: PeakGateConfig = None,
                   fwhm_config: FWHMConfig = None,
-                  effective_q_min: float = 0.0) -> TileClassification:
+                  effective_q_min: float = 0.0,
+                  peak_snr_config: Optional[PeakSNRConfig] = None) -> TileClassification:
     """Classify a tile as Tier A, Tier B, or REJECTED.
 
     Uses power_spectrum from peak_set for SNR and FWHM computation.
@@ -383,6 +409,9 @@ def classify_tile(peak_set: TilePeakSet,
         peak_gate_config = PeakGateConfig()
     if fwhm_config is None:
         fwhm_config = FWHMConfig()
+    if peak_snr_config is None:
+        peak_snr_config = PeakSNRConfig()
+    _ensure_patch_cache(peak_snr_config.fwhm_patch_radius)
 
     peaks = peak_set.peaks
     power = peak_set.power_spectrum
@@ -405,7 +434,8 @@ def classify_tile(peak_set: TilePeakSet,
     for p in peaks:
         snr_results.append(compute_peak_snr(power, p, peaks, fft_grid,
                                             _cached=_cached,
-                                            effective_q_min=effective_q_min))
+                                            effective_q_min=effective_q_min,
+                                            peak_snr_config=peak_snr_config))
 
     # --- Pass 2: FWHM with policy gating ---
     fwhm_method = fwhm_config.method if fwhm_config.enabled else "proxy_only"
@@ -471,10 +501,15 @@ def classify_tile(peak_set: TilePeakSet,
             best_orientation = p.angle_deg
 
     # Symmetry
-    symmetry_score, n_paired = check_symmetry(peaks, fft_grid)
+    symmetry_score, n_paired = check_symmetry(
+        peaks, fft_grid,
+        tolerance_px=peak_snr_config.symmetry_tolerance_px,
+        peak_snr_config=peak_snr_config)
 
     # Non-collinearity
-    n_non_collinear = count_non_collinear(peaks)
+    n_non_collinear = count_non_collinear(
+        peaks, min_angle_deg=peak_snr_config.non_collinear_min_angle_deg,
+        peak_snr_config=peak_snr_config)
 
     # Orientation confidence (circular concentration R from doubled angles)
     if peaks:

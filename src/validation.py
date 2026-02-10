@@ -16,6 +16,7 @@ from src.pipeline_config import (
     ValidationReport, GateResult, TierSummary,
     FFTPreprocRecord, ROIMaskResult, GlobalFFTResult,
     GatedTileGrid, GPAResult, LatticeValidation,
+    GateThresholdsConfig,
 )
 from src.gates import evaluate_gate, GATE_DEFS
 
@@ -36,6 +37,7 @@ def validate_pipeline(
     d_dom_nm: Optional[float] = None,
     effective_q_min: float = 0.0,
     tile_effective_q_min: float = 0.0,
+    gate_thresholds: Optional[GateThresholdsConfig] = None,
 ) -> ValidationReport:
     """Evaluate all gates and produce a unified ValidationReport.
 
@@ -75,7 +77,7 @@ def validate_pipeline(
             "clipped_fraction": preproc_record.diagnostics.get("clipped_fraction", 0),
             "intensity_range_ratio": preproc_record.diagnostics.get("intensity_range_ratio", 100),
         }
-        gates["G2"] = evaluate_gate("G2", g2_value)
+        gates["G2"] = evaluate_gate("G2", g2_value, gate_thresholds=gate_thresholds)
         diagnostics["preproc_confidence"] = preproc_record.confidence
         if "spectral_entropy" in preproc_record.qc_metrics:
             diagnostics["spectral_entropy_fft_branch"] = preproc_record.qc_metrics["spectral_entropy"]
@@ -86,19 +88,19 @@ def validate_pipeline(
             "coverage_pct": roi_result.coverage_pct,
             "n_components": roi_result.n_components,
         }
-        gates["G3"] = evaluate_gate("G3", g3_value)
+        gates["G3"] = evaluate_gate("G3", g3_value, gate_thresholds=gate_thresholds)
         diagnostics["roi_coverage_pct"] = roi_result.coverage_pct
 
     # --- G4: Global FFT viability ---
     if "G4" not in gates and global_fft_result is not None:
         best_snr = max((p.snr for p in global_fft_result.peaks), default=0)
-        gates["G4"] = evaluate_gate("G4", best_snr)
+        gates["G4"] = evaluate_gate("G4", best_snr, gate_thresholds=gate_thresholds)
 
     # --- G5: Tiling adequacy ---
     if "G5" not in gates and d_dom_nm is not None and pixel_size_nm > 0:
         d_px = d_dom_nm / pixel_size_nm
         periods = tile_size / d_px if d_px > 0 else 0
-        gates["G5"] = evaluate_gate("G5", periods)
+        gates["G5"] = evaluate_gate("G5", periods, gate_thresholds=gate_thresholds)
         diagnostics["periods_per_tile"] = periods
 
     # --- G6, G7, G8: Tier classification gates ---
@@ -107,16 +109,16 @@ def validate_pipeline(
         tier_summary = gated_grid.tier_summary
 
         if "G6" not in gates:
-            gates["G6"] = evaluate_gate("G6", tier_summary.tier_a_fraction)
+            gates["G6"] = evaluate_gate("G6", tier_summary.tier_a_fraction, gate_thresholds=gate_thresholds)
         if "G7" not in gates:
-            gates["G7"] = evaluate_gate("G7", tier_summary.median_snr_tier_a)
+            gates["G7"] = evaluate_gate("G7", tier_summary.median_snr_tier_a, gate_thresholds=gate_thresholds)
 
         # G8: mean symmetry of Tier A
         if "G8" not in gates:
             tier_a_mask = gated_grid.tier_map == "A"
             tier_a_sym = gated_grid.symmetry_map[tier_a_mask]
             mean_sym = float(np.mean(tier_a_sym)) if len(tier_a_sym) > 0 else 0.0
-            gates["G8"] = evaluate_gate("G8", mean_sym)
+            gates["G8"] = evaluate_gate("G8", mean_sym, gate_thresholds=gate_thresholds)
 
         # Diagnostics: FWHM distribution
         tier_a_fwhm = gated_grid.fwhm_map[gated_grid.tier_map == "A"]
@@ -139,7 +141,7 @@ def validate_pipeline(
             "entropy": ref.entropy,
             "snr": ref.mean_snr,
         }
-        gates["G9"] = evaluate_gate("G9", g9_value)
+        gates["G9"] = evaluate_gate("G9", g9_value, gate_thresholds=gate_thresholds)
 
     # --- G10, G11: GPA phase/strain gates ---
     if gpa_result is not None:
@@ -151,14 +153,14 @@ def validate_pipeline(
                 "unwrap_success": {k: v.unwrap_success_fraction
                                    for k, v in gpa_result.phases.items()},
             }
-            gates["G10"] = evaluate_gate("G10", g10_value)
+            gates["G10"] = evaluate_gate("G10", g10_value, gate_thresholds=gate_thresholds)
 
         if "G11" not in gates and gpa_result.strain is not None:
             g11_value = {
                 "ref_strain_max": gpa_result.qc.get("ref_strain_mean_exx", 0),
                 "outlier_fraction": gpa_result.qc.get("strain_outlier_fraction", 0),
             }
-            gates["G11"] = evaluate_gate("G11", g11_value)
+            gates["G11"] = evaluate_gate("G11", g11_value, gate_thresholds=gate_thresholds)
 
         diagnostics["gpa_mode"] = gpa_result.mode
         if gpa_result.mode_decision:
@@ -166,7 +168,7 @@ def validate_pipeline(
 
     # --- G12: Peak lattice consistency ---
     if "G12" not in gates and lattice_validation is not None:
-        gates["G12"] = evaluate_gate("G12", lattice_validation.fraction_valid)
+        gates["G12"] = evaluate_gate("G12", lattice_validation.fraction_valid, gate_thresholds=gate_thresholds)
 
     # --- Overall pass/fail ---
     # FATAL gates must pass. Others contribute to confidence.
