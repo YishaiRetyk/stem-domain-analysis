@@ -11,11 +11,14 @@ import logging
 import numpy as np
 from scipy.signal import windows, find_peaks
 from scipy.ndimage import map_coordinates
-from typing import List, Optional, TYPE_CHECKING
+from scipy import sparse
+from scipy.sparse.linalg import spsolve
+from typing import List, Optional, Tuple, TYPE_CHECKING
 
 from src.fft_coords import FFTGrid
 from src.pipeline_config import (
     GVector, GlobalPeak, GlobalFFTResult, GlobalFFTConfig,
+    DCMaskConfig, PhysicsConfig,
 )
 from src.gates import evaluate_gate
 
@@ -39,11 +42,62 @@ def _angular_distance_deg(a1: float, a2: float) -> float:
     return min(d, 360 - d)
 
 
+def select_d_dom(peaks, *, config=None, d_min_nm=None, d_max_nm=None):
+    """Select dominant d-spacing from peaks, filtering by physics bounds.
+
+    Picks highest-SNR peak within [d_min_nm, d_max_nm]. Falls back to
+    global highest-SNR if no candidate is within bounds.
+    """
+    if not peaks:
+        return None
+
+    # Extract bounds from config if available
+    if config is not None:
+        if d_max_nm is None and hasattr(config, 'd_max_nm') and config.d_max_nm is not None:
+            d_max_nm = config.d_max_nm
+        if d_min_nm is None and hasattr(config, 'd_min_nm') and config.d_min_nm is not None:
+            d_min_nm = config.d_min_nm
+
+    candidates = []
+    excluded = []
+    for pk in peaks:
+        d = pk.d_spacing
+        if d_max_nm is not None and d > d_max_nm:
+            excluded.append(pk)
+            continue
+        if d_min_nm is not None and d < d_min_nm:
+            excluded.append(pk)
+            continue
+        candidates.append(pk)
+
+    if candidates:
+        best = max(candidates, key=lambda pk: pk.snr)
+        if excluded:
+            for ex in excluded:
+                logger.info("Excluded peak d=%.3f nm (SNR=%.1f) — outside bounds "
+                            "[%s, %s]", ex.d_spacing, ex.snr,
+                            d_min_nm or '...', d_max_nm or '...')
+        logger.info("Selected d_dom=%.3f nm (SNR=%.1f) within bounds [%s, %s]",
+                     best.d_spacing, best.snr,
+                     d_min_nm or '...', d_max_nm or '...')
+        return best.d_spacing
+
+    # Fallback: no peaks within bounds — use global best
+    best = max(peaks, key=lambda pk: pk.snr)
+    logger.warning("No peaks within d bounds [%s, %s]. "
+                   "Falling back to d_dom=%.3f nm (SNR=%.1f)",
+                   d_min_nm or '...', d_max_nm or '...',
+                   best.d_spacing, best.snr)
+    return best.d_spacing
+
+
 def compute_global_fft(image_fft: np.ndarray,
                        fft_grid: FFTGrid,
                        config: GlobalFFTConfig = None,
                        ctx: Optional["DeviceContext"] = None,
-                       effective_q_min: float = 0.0) -> GlobalFFTResult:
+                       effective_q_min: float = 0.0,
+                       dc_mask_config: DCMaskConfig = None,
+                       physics_config: PhysicsConfig = None) -> GlobalFFTResult:
     """Run full-image FFT and extract g-vectors.
 
     Parameters
@@ -53,6 +107,10 @@ def compute_global_fft(image_fft: np.ndarray,
     fft_grid : FFTGrid
         Canonical coordinate system for the full image.
     config : GlobalFFTConfig, optional
+    dc_mask_config : DCMaskConfig, optional
+        When provided and ``enabled=True``, estimate dynamic DC radius.
+    physics_config : PhysicsConfig, optional
+        Used for physics-based caps on dynamic DC radius.
 
     Returns
     -------
@@ -120,15 +178,25 @@ def compute_global_fft(image_fft: np.ndarray,
     q_scale = crop_grid.qx_scale  # same as qy_scale for square crops
     q_values = np.arange(max_r + 1) * q_scale
 
-    # Background fit (reuse logic from peak_discovery)
-    bg_degree = min(config.background_default_degree, config.background_max_degree)
-    background, baseline_model = _fit_background(
-        q_values, radial_profile,
-        degree=bg_degree,
-        effective_q_min=effective_q_min,
-        q_fit_min=config.q_fit_min,
-        bg_reweight_iterations=config.bg_reweight_iterations,
-        bg_reweight_downweight=config.bg_reweight_downweight,
+    # Dynamic DC mask estimation (global only — tiles reuse this value)
+    dynamic_dc_q = None
+    if dc_mask_config is not None and dc_mask_config.enabled:
+        dynamic_dc_q, dc_diag = estimate_dynamic_dc_radius(
+            q_values, radial_profile, dc_mask_config,
+            physics_config=physics_config,
+        )
+        diagnostics["dc_mask"] = dc_diag
+        logger.info("Dynamic DC radius: %.3f cycles/nm", dynamic_dc_q)
+
+    # Effective q_min for background fit: max of low-q exclusion and dynamic DC
+    bg_effective_q_min = effective_q_min
+    if dynamic_dc_q is not None:
+        bg_effective_q_min = max(effective_q_min, dynamic_dc_q)
+
+    # Background fit (dispatch to polynomial_robust or AsLS)
+    background, baseline_model = fit_background_dispatch(
+        q_values, radial_profile, config,
+        effective_q_min=bg_effective_q_min,
     )
     corrected = radial_profile - background
     diagnostics["baseline_model"] = baseline_model
@@ -173,11 +241,17 @@ def compute_global_fft(image_fft: np.ndarray,
             index=p["index"],
         ))
 
-    # Dominant d-spacing
+    # Dominant d-spacing — filter by physics bounds if available
     d_dom = None
     if peaks:
-        best = max(peaks, key=lambda pk: pk.snr)
-        d_dom = best.d_spacing
+        _d_min = None
+        _d_max = None
+        if physics_config is not None:
+            if physics_config.d_min_nm > 0:
+                _d_min = physics_config.d_min_nm
+            if physics_config.d_max_nm > 0:
+                _d_max = physics_config.d_max_nm
+        d_dom = select_d_dom(peaks, d_min_nm=_d_min, d_max_nm=_d_max)
 
     # Multi-ring g-vector extraction (B4)
     g_vectors = extract_all_g_vectors(
@@ -219,6 +293,7 @@ def compute_global_fft(image_fft: np.ndarray,
         information_limit_q=info_limit_q,
         diagnostics=diagnostics,
         fft_guidance_strength=fft_guidance,
+        dynamic_dc_q=dynamic_dc_q,
     )
 
 
@@ -290,6 +365,345 @@ def _fit_background(q_values: np.ndarray, profile: np.ndarray,
         "coeffs": coeffs.tolist() if coeffs is not None else [],
     }
     return background, baseline_model
+
+
+def _fit_background_asls(q_values: np.ndarray, profile: np.ndarray,
+                         lam: float = 1e6, p: float = 0.001, n_iter: int = 10,
+                         effective_q_min: float = 0.0, q_fit_min: float = 0.0,
+                         domain: str = "log") -> Tuple[np.ndarray, dict]:
+    """Asymmetric Least Squares (AsLS) background fit.
+
+    Operates in log or linear domain. All q values are in cycles/nm.
+
+    Parameters
+    ----------
+    q_values, profile : np.ndarray
+        Radial profile and corresponding q values (cycles/nm).
+    lam : float
+        Smoothness penalty (larger = smoother baseline).
+    p : float
+        Asymmetry weight (small p penalises positive residuals less,
+        so the baseline stays below peaks).
+    n_iter : int
+        Number of reweighted iterations.
+    effective_q_min, q_fit_min : float
+        Bins below max(effective_q_min, q_fit_min) are excluded from fit.
+    domain : str
+        ``"log"`` (default) — fit in log10 space; ``"linear"`` — raw values.
+
+    Returns
+    -------
+    background : np.ndarray
+        Background estimate, same length as *profile*.
+    baseline_model : dict
+        Serialisable description ``{"type": "asls", ...}``.
+    """
+    actual_min = max(effective_q_min, q_fit_min)
+
+    # Build fit mask
+    if actual_min > 0:
+        fit_mask = (profile > 0) & (q_values >= actual_min)
+    else:
+        # Skip first 5 DC bins (same heuristic as polynomial fitter)
+        fit_mask = (profile > 0) & (np.arange(len(profile)) >= 5)
+
+    n_fit = int(np.sum(fit_mask))
+    if n_fit < 4:
+        baseline_model = {
+            "type": "asls", "lam": lam, "p": p, "n_iter": n_iter,
+            "domain": domain, "q_fit_min": float(q_fit_min),
+        }
+        return np.zeros_like(profile), baseline_model
+
+    y_raw = profile[fit_mask]
+
+    # Transform to working domain
+    if domain == "log":
+        eps = max(1e-10, float(y_raw[y_raw > 0].min()) * 1e-3) if np.any(y_raw > 0) else 1e-10
+        y = np.log10(y_raw + eps)
+    else:
+        y = y_raw.copy()
+
+    m = len(y)
+    # Second-difference penalty matrix  D^T D
+    D = sparse.diags([1.0, -2.0, 1.0], [0, 1, 2], shape=(m - 2, m)).tocsc()
+    DTD = D.T.dot(D)
+
+    w = np.ones(m)
+    z = y.copy()
+    for _ in range(n_iter):
+        W = sparse.diags(w, 0, shape=(m, m))
+        C = W + lam * DTD
+        z = spsolve(C, w * y)
+        # Asymmetric weights: p for y > z (peaks), 1-p for y <= z (below baseline)
+        w = np.where(y > z, p, 1 - p)
+
+    # Back-transform
+    if domain == "log":
+        fitted_values = 10.0 ** z
+    else:
+        # Linear domain: clip to >= 0 to avoid negative baselines
+        fitted_values = np.clip(z, 0, None)
+
+    # Assemble full-length background
+    background = np.zeros_like(profile)
+    background[fit_mask] = fitted_values
+
+    # Fill excluded region with raw profile (same as polynomial fitter)
+    if actual_min > 0:
+        excluded = q_values < actual_min
+        background[excluded] = profile[excluded]
+    else:
+        background[:5] = profile[:5]
+
+    baseline_model = {
+        "type": "asls", "lam": lam, "p": p, "n_iter": n_iter,
+        "domain": domain, "q_fit_min": float(q_fit_min),
+    }
+    return background, baseline_model
+
+
+def fit_background_dispatch(q_values: np.ndarray, profile: np.ndarray,
+                            config: GlobalFFTConfig,
+                            effective_q_min: float = 0.0) -> Tuple[np.ndarray, dict]:
+    """Route background fitting to the configured method.
+
+    Parameters
+    ----------
+    q_values, profile : np.ndarray
+    config : GlobalFFTConfig
+        Uses ``background_method``, polynomial params, and AsLS params.
+    effective_q_min : float
+        Low-q exclusion boundary (cycles/nm).
+
+    Returns
+    -------
+    background, baseline_model
+    """
+    if config.background_method == "asls":
+        return _fit_background_asls(
+            q_values, profile,
+            lam=config.asls_lambda,
+            p=config.asls_p,
+            n_iter=config.asls_n_iter,
+            effective_q_min=effective_q_min,
+            q_fit_min=config.q_fit_min,
+            domain=config.asls_domain,
+        )
+    elif config.background_method == "polynomial_robust":
+        bg_degree = min(config.background_default_degree, config.background_max_degree)
+        return _fit_background(
+            q_values, profile,
+            degree=bg_degree,
+            effective_q_min=effective_q_min,
+            q_fit_min=config.q_fit_min,
+            bg_reweight_iterations=config.bg_reweight_iterations,
+            bg_reweight_downweight=config.bg_reweight_downweight,
+        )
+    else:
+        raise ValueError(
+            f"Unknown background_method: {config.background_method!r}. "
+            f"Choose from 'polynomial_robust', 'asls'."
+        )
+
+
+def estimate_dynamic_dc_radius(
+    q_values: np.ndarray,
+    radial_profile: np.ndarray,
+    dc_mask_config: DCMaskConfig,
+    physics_config: PhysicsConfig = None,
+) -> Tuple[float, dict]:
+    """Estimate dynamic DC center mask radius from the radial profile.
+
+    All q values are in cycles/nm (d = 1/q).  Runs on the GLOBAL
+    radial profile only; tiles reuse the returned ``q_dc`` value.
+
+    Algorithm
+    ---------
+    1. Work in log10 space.
+    2. Smooth with Savitzky-Golay (auto-adjusted window).
+    3. Compute derivative ``dJ/dq``.
+    4. Estimate noise sigma from MAD of derivative in high-q region.
+    5. Scan from low q: first run of *consecutive_bins* where
+       ``|deriv| < k * sigma_noise``.
+    6. Clamp to ``[q_dc_min_floor, 0.5 * q_max]`` with optional physics cap.
+
+    Returns ``(q_dc, diagnostics_dict)``.
+    """
+    cfg = dc_mask_config
+    diagnostics: dict = {"method": cfg.method}
+
+    # Fixed mode: return floor immediately without derivative analysis
+    if cfg.method == "fixed":
+        diagnostics["q_dc_final"] = cfg.q_dc_min_floor
+        return cfg.q_dc_min_floor, diagnostics
+
+    q_max = float(q_values[-1])  # lock to profile last bin (user note #1)
+
+    # Short-profile fallback: need at least 2 × consecutive_bins
+    if len(q_values) < 2 * cfg.consecutive_bins:
+        diagnostics["fallback"] = "profile_too_short"
+        return cfg.q_dc_min_floor, diagnostics
+
+    # 1. Log-space transform
+    eps = 1e-10
+    log_profile = np.log10(radial_profile + eps)
+
+    # 2. Savitzky-Golay smoothing (auto-adjust window)
+    from scipy.signal import savgol_filter
+    from scipy.ndimage import gaussian_filter1d
+
+    win = cfg.savgol_window
+    # Clamp to <= len(profile) - 1 and ensure odd
+    win = min(win, len(log_profile) - 1)
+    if win % 2 == 0:
+        win -= 1
+
+    if win < 7:
+        # Fallback to Gaussian smoothing when profile too short
+        smoothed = gaussian_filter1d(log_profile, sigma=1.5)
+        diagnostics["smoothing"] = "gaussian_fallback"
+    else:
+        polyorder = min(cfg.savgol_polyorder, win - 1)
+        smoothed = savgol_filter(log_profile, window_length=win, polyorder=polyorder)
+        diagnostics["smoothing"] = "savgol"
+        diagnostics["savgol_window_used"] = win
+
+    # 3. Derivative
+    deriv = np.gradient(smoothed, q_values)
+
+    # 4. Noise sigma from high-q region
+    lo_frac = cfg.noise_q_range_lo
+    hi_frac = cfg.noise_q_range_hi
+    noise_lo = lo_frac * q_max
+    noise_hi = hi_frac * q_max
+    noise_mask = (q_values >= noise_lo) & (q_values <= noise_hi)
+
+    # Auto-widen if fewer than 20 bins
+    if int(np.sum(noise_mask)) < 20:
+        lo_frac = 0.60
+        hi_frac = 0.95
+        noise_lo = lo_frac * q_max
+        noise_hi = hi_frac * q_max
+        noise_mask = (q_values >= noise_lo) & (q_values <= noise_hi)
+        diagnostics["noise_region_widened"] = True
+
+    noise_deriv = deriv[noise_mask]
+    if len(noise_deriv) < 3:
+        diagnostics["fallback"] = "no_noise_region"
+        return cfg.q_dc_min_floor, diagnostics
+
+    # MAD-clip outliers in noise region
+    med_nd = np.median(noise_deriv)
+    mad_nd = np.median(np.abs(noise_deriv - med_nd))
+    clip_threshold = 3.0 * mad_nd * 1.4826
+    clipped = noise_deriv[np.abs(noise_deriv - med_nd) <= clip_threshold]
+    if len(clipped) < 3:
+        clipped = noise_deriv
+    sigma_noise = float(np.median(np.abs(clipped - np.median(clipped))) * 1.4826)
+    if sigma_noise < 1e-15:
+        sigma_noise = float(np.std(clipped))
+
+    diagnostics["sigma_noise"] = sigma_noise
+    diagnostics["n_noise_bins"] = int(np.sum(noise_mask))
+
+    # 5. Scan from low q for consecutive bins below threshold
+    threshold = cfg.slope_threshold_k * sigma_noise
+    abs_deriv = np.abs(deriv)
+    below = abs_deriv < threshold
+
+    q_dc_dynamic = None
+    run_count = 0
+    for i in range(len(below)):
+        if below[i]:
+            run_count += 1
+            if run_count >= cfg.consecutive_bins:
+                # First bin of the stable run
+                start_idx = i - cfg.consecutive_bins + 1
+                q_dc_dynamic = float(q_values[start_idx])
+                break
+        else:
+            run_count = 0
+
+    if q_dc_dynamic is None:
+        # No stable region found → return floor
+        diagnostics["fallback"] = "no_stable_region"
+        return cfg.q_dc_min_floor, diagnostics
+
+    diagnostics["q_dc_raw"] = q_dc_dynamic
+
+    # 6. Enforce floor
+    q_dc = max(cfg.q_dc_min_floor, q_dc_dynamic)
+    diagnostics["floor_applied"] = q_dc > q_dc_dynamic
+
+    # 7. Caps
+    cap_applied = []
+
+    # Physics cap: 0.8 / d_max_nm
+    if cfg.auto_cap_from_physics and physics_config is not None and physics_config.d_max_nm > 0:
+        physics_cap = 0.8 / physics_config.d_max_nm
+        if q_dc > physics_cap:
+            q_dc = physics_cap
+            cap_applied.append(f"physics_d_max={physics_config.d_max_nm}")
+        diagnostics["physics_cap"] = physics_cap
+
+    # Explicit max_dc_mask_q cap
+    if cfg.max_dc_mask_q > 0 and q_dc > cfg.max_dc_mask_q:
+        q_dc = cfg.max_dc_mask_q
+        cap_applied.append(f"max_dc_mask_q={cfg.max_dc_mask_q}")
+
+    # Global safety clamp: 0.5 * q_max (use same q_max as profile last bin)
+    q_safety = 0.5 * q_max
+    if q_dc > q_safety:
+        q_dc = q_safety
+        cap_applied.append(f"0.5*q_max={q_safety:.3f}")
+
+    diagnostics["cap_applied"] = cap_applied
+    diagnostics["q_dc_final"] = q_dc
+    return q_dc, diagnostics
+
+
+def build_dc_taper_mask(q_mag_grid: np.ndarray, q_dc: float,
+                        soft_taper: bool = False,
+                        taper_width_q: float = 0.05) -> np.ndarray:
+    """Build a DC center mask in frequency space.
+
+    Parameters
+    ----------
+    q_mag_grid : (H, W) array
+        Magnitude of q at each pixel (cycles/nm).
+    q_dc : float
+        DC mask radius (cycles/nm).
+    soft_taper : bool
+        If True, use cosine taper; if False, hard binary mask.
+    taper_width_q : float
+        Width of cosine transition region (cycles/nm).
+
+    Returns
+    -------
+    mask : (H, W) float array in [0, 1].
+        0 inside DC, 1 outside. For hard mask: exactly 0/1.
+    """
+    if not soft_taper:
+        return (q_mag_grid >= q_dc).astype(np.float64)
+
+    # Guard: non-positive taper width → fall back to hard mask
+    if taper_width_q <= 0:
+        logger.warning("taper_width_q=%.4f <= 0; falling back to hard DC mask",
+                        taper_width_q)
+        return (q_mag_grid >= q_dc).astype(np.float64)
+
+    # Cosine taper: 0 for q < q_dc - w/2, 1 for q > q_dc + w/2
+    w = taper_width_q
+    lo = q_dc - w / 2
+    hi = q_dc + w / 2
+    mask = np.ones_like(q_mag_grid, dtype=np.float64)
+    mask[q_mag_grid < lo] = 0.0
+    transition = (q_mag_grid >= lo) & (q_mag_grid <= hi)
+    # Cosine ramp: 0 at lo → 1 at hi
+    frac = (q_mag_grid[transition] - lo) / (w + 1e-15)
+    mask[transition] = 0.5 * (1 - np.cos(np.pi * frac))
+    return mask
 
 
 def _compute_background_diagnostics(q_values, profile, background, corrected,

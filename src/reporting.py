@@ -174,6 +174,21 @@ def build_parameters_v3(
             if bg_diag:
                 params["background_diagnostics"] = bg_diag
 
+    # DC mask
+    dc_cfg = config.dc_mask
+    dc_section: Dict[str, Any] = {"enabled": dc_cfg.enabled}
+    if dc_cfg.enabled and global_fft_result is not None:
+        dc_section["dynamic_dc_q"] = global_fft_result.dynamic_dc_q
+        dc_section["method"] = dc_cfg.method
+        dc_section["q_dc_min_floor"] = dc_cfg.q_dc_min_floor
+        dc_section["soft_taper"] = dc_cfg.soft_taper
+        # Include diagnostics from global FFT if available
+        if global_fft_result.diagnostics and "dc_mask" in global_fft_result.diagnostics:
+            dc_section["diagnostics"] = _make_serialisable(
+                global_fft_result.diagnostics["dc_mask"]
+            )
+    params["dc_mask"] = dc_section
+
     # Tile FFT
     if gated_grid is not None:
         ts = gated_grid.tier_summary

@@ -395,8 +395,7 @@ class TestStage2TileFFT:
 
     # 17
     def test_g5_d_aware_tiling(self):
-        """check_tiling_adequacy with d_max_nm uses max(d_dom, d_max)."""
-        # d_dom = 0.4 nm, d_max = 1.0 nm -> should use 1.0 nm
+        """check_tiling_adequacy uses d_dom directly (physics filtering happens at selection time)."""
         tile_size = 256
         pixel_size = 0.1297
 
@@ -404,21 +403,28 @@ class TestStage2TileFFT:
         periods_base, passed_base = check_tiling_adequacy(
             tile_size, d_dom_nm=0.4, pixel_size_nm=pixel_size)
         # d_px = 0.4/0.1297 ~ 3.08, periods = 256/3.08 ~ 83 -> passes
+        assert passed_base is True
 
-        # With d_max_nm = 1.0 -> d_px = 1.0/0.1297 ~ 7.71, periods = 256/7.71 ~ 33
+        # With d_max_nm = 1.0 -> d_max is now ignored (d_dom used directly)
+        # Physics-bound filtering happens at d_dom selection time, not at G5
         periods_dmax, passed_dmax = check_tiling_adequacy(
             tile_size, d_dom_nm=0.4, pixel_size_nm=pixel_size, d_max_nm=1.0)
 
-        assert periods_dmax < periods_base
-        # d_max makes effective d larger, so fewer periods
-        assert periods_dmax == pytest.approx(
-            tile_size / (1.0 / pixel_size), rel=0.01)
+        # d_max_nm no longer inflates the effective d, so periods are same as base
+        assert periods_dmax == pytest.approx(periods_base, rel=0.01)
+        assert passed_dmax is True
 
-        # Very large d_max should fail G5
-        _, passed_huge = check_tiling_adequacy(
+        # Small d_dom with many periods still passes
+        periods_small, passed_small = check_tiling_adequacy(
             tile_size, d_dom_nm=0.4, pixel_size_nm=pixel_size, d_max_nm=10.0)
+        assert periods_small == pytest.approx(periods_base, rel=0.01)
+        assert passed_small is True
+
+        # Large d_dom itself should fail G5
+        _, passed_large_d = check_tiling_adequacy(
+            tile_size, d_dom_nm=10.0, pixel_size_nm=pixel_size)
         # d_px = 10.0/0.1297 ~ 77, periods = 256/77 ~ 3.3 < 20
-        assert passed_huge is False
+        assert passed_large_d is False
 
 
 # =====================================================================

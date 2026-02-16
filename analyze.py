@@ -801,6 +801,17 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
     config.clustering.dimred_method = args.cluster_dimred
     if args.strong_guidance_snr is not None:
         config.global_fft.strong_guidance_snr = args.strong_guidance_snr
+    # DC masking and SNR CLI overrides
+    if args.dynamic_dc:
+        config.dc_mask.enabled = True
+    if args.dc_floor is not None:
+        config.dc_mask.q_dc_min_floor = args.dc_floor
+    if args.dc_soft_taper:
+        config.dc_mask.soft_taper = True
+    if args.snr_signal_method is not None:
+        config.peak_snr.signal_method = args.snr_signal_method
+    if args.bg_method is not None:
+        config.global_fft.background_method = args.bg_method
 
     # Extract config sub-objects for threading
     gt = config.gate_thresholds
@@ -923,7 +934,9 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
     log_memory("Before Global FFT")
     print("\n[5/9] Global FFT analysis...")
     global_fft_result = compute_global_fft(preproc_record.image_fft, fft_grid, config.global_fft, ctx=ctx,
-                                           effective_q_min=effective_q_min)
+                                           effective_q_min=effective_q_min,
+                                           dc_mask_config=config.dc_mask,
+                                           physics_config=config.physics)
     d_dom = global_fft_result.d_dom
 
     best_global_snr = max((p.snr for p in global_fft_result.peaks), default=0)
@@ -945,10 +958,11 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
     log_memory("Before Tile FFT")
     print("\n[6/9] Tile FFT + Two-tier classification...")
 
-    # G5: tiling adequacy
+    # G5: tiling adequacy — use selected d_dom (already filtered by physics bounds)
     d_for_g5 = d_dom if d_dom else (args.d_max if args.d_max else 1.0)
     d_px = d_for_g5 / pixel_size
     periods = config.tile_size / d_px if d_px > 0 else 0
+    print(f"  G5: periods/tile={periods:.1f} using d_used={d_for_g5:.3f} nm")
     gate_results["G5"] = evaluate_gate("G5", periods, gate_thresholds=gt)
     if not gate_results["G5"].passed:
         print(f"  FATAL: Only {periods:.1f} periods per tile (need >=20)")
@@ -980,12 +994,19 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
         return 1
     print(f"  Periods/tile: {periods:.1f} (G5 PASS)")
 
+    # Dynamic DC passes from global → tiles
+    _dynamic_dc_q = global_fft_result.dynamic_dc_q or 0.0
+    if _dynamic_dc_q > 0:
+        print(f"  Dynamic DC mask: {_dynamic_dc_q:.3f} cycles/nm")
+
     peak_sets, skipped_mask = process_all_tiles(
         preproc_record.image_fft, roi_grid, fft_grid,
         tile_size=config.tile_size, stride=config.stride,
         q_ranges=q_ranges if q_ranges else None,
         ctx=ctx,
         effective_q_min=tile_effective_q_min,
+        dynamic_dc_q=_dynamic_dc_q,
+        dc_mask_config=config.dc_mask,
     )
 
     tile_fft_grid = FFTGrid(config.tile_size, config.tile_size, pixel_size)
@@ -1364,6 +1385,21 @@ Examples:
     parser.add_argument('--strong-guidance-snr', type=float, default=None,
                         dest='strong_guidance_snr',
                         help='SNR threshold for strong FFT guidance (default: 8.0)')
+
+    # --- DC masking and SNR flags ---
+    parser.add_argument('--dynamic-dc', action='store_true', dest='dynamic_dc',
+                        help='Enable dynamic DC mask estimation from radial profile')
+    parser.add_argument('--dc-floor', type=float, default=None, dest='dc_floor',
+                        help='Override minimum DC mask radius (cycles/nm)')
+    parser.add_argument('--dc-soft-taper', action='store_true', dest='dc_soft_taper',
+                        help='Use cosine taper instead of hard DC mask')
+    parser.add_argument('--snr-signal-method', type=str, default=None,
+                        choices=['max', 'integrated_sum', 'integrated_median'],
+                        dest='snr_signal_method',
+                        help='SNR signal extraction method (default: max)')
+    parser.add_argument('--bg-method', type=str, default=None,
+                        choices=['polynomial_robust', 'asls'], dest='bg_method',
+                        help='Background fitting method (default: polynomial_robust)')
 
     args = parser.parse_args()
     

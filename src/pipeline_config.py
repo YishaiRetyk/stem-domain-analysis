@@ -351,6 +351,7 @@ class GlobalFFTResult:
     information_limit_q: Optional[float]
     diagnostics: dict = field(default_factory=dict)
     fft_guidance_strength: str = "none"     # "strong", "weak", or "none"
+    dynamic_dc_q: Optional[float] = None    # cycles/nm; set by dynamic DC estimation
 
 
 # ======================================================================
@@ -533,6 +534,11 @@ class GlobalFFTConfig:
     non_collinear_min_angle_deg: float = 15.0  # min angle between non-collinear g-vectors
     angular_prominence_frac: float = 0.5    # angular prominence as fraction of median
     angular_peak_distance: int = 10         # min distance between angular peaks
+    background_method: str = "polynomial_robust"  # "polynomial_robust" | "asls"
+    asls_lambda: float = 1e6
+    asls_p: float = 0.001
+    asls_n_iter: int = 10
+    asls_domain: str = "log"               # "log" | "linear"
 
 
 @dataclass
@@ -667,6 +673,7 @@ class TileFFTConfig:
     annulus_inner_factor: float = 0.9       # inner annulus bound = factor * peak_q
     annulus_outer_factor: float = 1.1       # outer annulus bound = factor * peak_q
     background_disk_r_sq: int = 9           # squared radius for peak exclusion disk (r=3)
+    lightweight_snr_method: str = "ratio"  # "ratio" (legacy) | "zscore"
 
 
 @dataclass
@@ -681,6 +688,29 @@ class LowQExclusionConfig:
     q_min_cycles_per_nm: float = 0.1   # physical floor (d < 10 nm)
     dc_bin_count: int = 3              # radial bins always excluded
     auto_q_min: bool = True            # derive q_min from image geometry
+
+
+@dataclass
+class DCMaskConfig:
+    """Dynamic DC center masking configuration.
+
+    All q-space values are in cycles/nm (d = 1/q).
+    Dynamic DC estimation runs on the GLOBAL radial profile only;
+    tiles reuse the global estimate via dynamic_dc_q.
+    """
+    enabled: bool = False                      # opt-in; False = current behavior
+    method: str = "derivative"                 # "derivative" | "fixed"
+    savgol_window: int = 11                    # auto-clamped to len(profile)-1, odd
+    savgol_polyorder: int = 2
+    slope_threshold_k: float = 2.5             # |dJ/dq| < k * sigma_noise
+    consecutive_bins: int = 7                  # N consecutive bins below threshold
+    noise_q_range_lo: float = 0.70             # fraction of q_max for noise region
+    noise_q_range_hi: float = 0.90             # auto-widens to 0.60-0.95 if <20 bins
+    q_dc_min_floor: float = 0.15               # absolute minimum DC mask (cycles/nm)
+    soft_taper: bool = False                   # cosine taper vs hard mask
+    taper_width_q: float = 0.05                # taper transition width (cycles/nm)
+    max_dc_mask_q: float = 0.0                 # 0 = uncapped (hard upper bound)
+    auto_cap_from_physics: bool = True         # derive cap from d_max_nm
 
 
 @dataclass
@@ -796,7 +826,7 @@ class PeakSNRConfig:
     include neighboring reflections and bias SNR low.
     """
     signal_disk_radius_px: int = 3
-    annular_width_min_q: float = 0.15
+    annular_width_min_q: float = 0.15         # cycles/nm
     annular_fwhm_multiplier: float = 1.5
     min_background_pixels: int = 20
     fwhm_patch_radius: int = 5
@@ -804,6 +834,7 @@ class PeakSNRConfig:
     fit_condition_max: float = 100.0
     symmetry_tolerance_px: float = 2.0
     non_collinear_min_angle_deg: float = 15.0
+    signal_method: str = "max"                 # "max" (legacy) | "integrated_sum" | "integrated_median"
 
 
 @dataclass
@@ -864,6 +895,7 @@ class PipelineConfig:
     tile_fft: TileFFTConfig = field(default_factory=TileFFTConfig)
     confidence: ConfidenceConfig = field(default_factory=ConfidenceConfig)
     clustering: ClusteringConfig = field(default_factory=ClusteringConfig)
+    dc_mask: DCMaskConfig = field(default_factory=DCMaskConfig)
     gate_thresholds: GateThresholdsConfig = field(default_factory=GateThresholdsConfig)
     peak_snr: PeakSNRConfig = field(default_factory=PeakSNRConfig)
     reference_selection: ReferenceSelectionConfig = field(default_factory=ReferenceSelectionConfig)
@@ -899,6 +931,7 @@ class PipelineConfig:
             "tile_fft": (TileFFTConfig, "tile_fft"),
             "confidence": (ConfidenceConfig, "confidence"),
             "clustering": (ClusteringConfig, "clustering"),
+            "dc_mask": (DCMaskConfig, "dc_mask"),
             "gate_thresholds": (GateThresholdsConfig, "gate_thresholds"),
             "peak_snr": (PeakSNRConfig, "peak_snr"),
             "reference_selection": (ReferenceSelectionConfig, "reference_selection"),

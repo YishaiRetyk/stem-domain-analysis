@@ -43,6 +43,44 @@ def _build_exclusion_mask(x_grid: np.ndarray, y_grid: np.ndarray,
     return exclusion_mask
 
 
+def _compute_signal_from_disk(power: np.ndarray, signal_disk: np.ndarray,
+                              method: str = "max") -> float:
+    """Aggregate signal from the peak disk.
+
+    Parameters
+    ----------
+    power : np.ndarray
+        Power spectrum (cycles/nm coordinate system).
+    signal_disk : np.ndarray[bool]
+        Mask of signal pixels.
+    method : str
+        "max" — single brightest pixel (legacy).
+        "integrated_sum" — sum of all pixels in disk.  Assumes pixel
+            noise is approximately uncorrelated so that background
+            scales as ``n_px`` and noise sigma scales as ``sqrt(n_px)``.
+            Caller (``compute_peak_snr``) applies the corresponding
+            scaling when computing the z-score.
+        "integrated_median" — median of pixels in disk.
+
+    Returns
+    -------
+    float
+        Aggregated signal value.
+    """
+    vals = power[signal_disk]
+    if len(vals) == 0:
+        return 0.0
+    if method == "max":
+        return float(np.max(vals))
+    elif method == "integrated_sum":
+        return float(np.sum(vals))
+    elif method == "integrated_median":
+        return float(np.median(vals))
+    else:
+        raise ValueError(f"Unknown signal_method: {method!r}. "
+                         f"Choose from 'max', 'integrated_sum', 'integrated_median'.")
+
+
 def compute_peak_snr(power: np.ndarray,
                      target_peak: TilePeak,
                      all_peaks: List[TilePeak],
@@ -84,12 +122,13 @@ def compute_peak_snr(power: np.ndarray,
     # Peak pixel position
     peak_px_x, peak_px_y = fft_grid.q_to_px(target_peak.qx, target_peak.qy)
 
-    # Signal: max in signal_r-pixel-radius disk
+    # Signal: aggregate in signal_r-pixel-radius disk
     dist_sq = (x_grid - peak_px_x) ** 2 + (y_grid - peak_px_y) ** 2
     signal_disk = dist_sq <= signal_r_sq
     if not np.any(signal_disk):
         return PeakSNR(0, 0, 1, 0, 0, "no signal pixels")
-    signal_peak = float(np.max(power[signal_disk]))
+    signal_method = peak_snr_config.signal_method
+    signal_peak = _compute_signal_from_disk(power, signal_disk, method=signal_method)
 
     # Annular band at peak's |q|
     q_mag_grid = fft_grid.q_mag_grid()
@@ -116,7 +155,15 @@ def compute_peak_snr(power: np.ndarray,
     bg_mad = float(np.median(np.abs(bg_values - bg_median)))
     bg_sigma = bg_mad * 1.4826
 
-    snr = (signal_peak - bg_median) / (bg_sigma + 1e-10)
+    if signal_method == "integrated_sum":
+        # Scale background to match summed signal (sum of n_px pixels)
+        n_signal_px = int(np.sum(signal_disk))
+        bg_level = bg_median * n_signal_px
+        bg_sigma_scaled = bg_sigma * np.sqrt(n_signal_px)
+        snr = (signal_peak - bg_level) / (bg_sigma_scaled + 1e-10)
+    else:
+        # "max" and "integrated_median": per-pixel comparison
+        snr = (signal_peak - bg_median) / (bg_sigma + 1e-10)
 
     if effective_q_min > 0 and peak_q < 2 * effective_q_min:
         low_q_note = f"peak q={peak_q:.3f} < 2×q_min={2*effective_q_min:.3f}"

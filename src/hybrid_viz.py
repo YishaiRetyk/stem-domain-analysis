@@ -236,6 +236,11 @@ def _save_radial_profile(global_fft_result, out_dir, dpi,
         ax.axvspan(0, effective_q_min, alpha=0.15, color='gray',
                    label=f"Excluded (q < {effective_q_min:.2f})")
 
+    # Dynamic DC boundary (orange dashed line, distinct from gray low-q shading)
+    if r.dynamic_dc_q is not None and r.dynamic_dc_q > 0:
+        ax.axvline(r.dynamic_dc_q, color='orange', linestyle='--', lw=1.2,
+                   label=f"Dynamic DC ({r.dynamic_dc_q:.2f})")
+
     for p in r.peaks:
         ax.axvline(p.q_center, color="red", alpha=0.5, lw=0.7)
         ax.annotate(f"d={p.d_spacing:.3f} nm",
@@ -278,6 +283,14 @@ def _save_fft_power_spectrum(global_fft_result, fft_grid, out_dir, dpi,
         circle = plt.Circle((cx, cy), r_px, fill=False, edgecolor='white',
                              linestyle='--', linewidth=1.0, alpha=0.8)
         ax.add_patch(circle)
+
+    # Solid orange circle at dynamic DC boundary (distinct from low-q dashed)
+    if global_fft_result.dynamic_dc_q is not None and global_fft_result.dynamic_dc_q > 0:
+        q_scale = min(fft_grid.qx_scale, fft_grid.qy_scale)
+        dc_r_px = global_fft_result.dynamic_dc_q / q_scale
+        dc_circle = plt.Circle((cx, cy), dc_r_px, fill=False, edgecolor='orange',
+                                linestyle='-', linewidth=1.2, alpha=0.9)
+        ax.add_patch(dc_circle)
 
     # Annotate g-vectors as arrows from centre
     for gv in global_fft_result.g_vectors:

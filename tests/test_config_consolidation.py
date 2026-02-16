@@ -28,6 +28,7 @@ from src.pipeline_config import (
     PeakFindingConfig,
     TileFFTConfig,
     ClusteringConfig,
+    DCMaskConfig,
     ConfidenceConfig,
     TierConfig,
     PeakGateConfig,
@@ -727,3 +728,58 @@ class TestFWHMPatchCacheRebuild:
         """Restore default cache after each test."""
         from src import fft_peak_detection as mod
         mod._ensure_patch_cache(5)
+
+
+# ======================================================================
+# Category 9: DCMaskConfig, signal method, background method
+# ======================================================================
+
+class TestDCMaskAndNewConfigs:
+    """Tests for DCMaskConfig and new fields on existing configs."""
+
+    def test_dc_mask_config_defaults(self):
+        dc = DCMaskConfig()
+        assert dc.enabled is False
+        assert dc.method == "derivative"
+        assert dc.savgol_window == 11
+        assert dc.q_dc_min_floor == 0.15
+        assert dc.soft_taper is False
+        assert dc.max_dc_mask_q == 0.0
+        assert dc.auto_cap_from_physics is True
+        assert dc.noise_q_range_lo == 0.70
+        assert dc.noise_q_range_hi == 0.90
+
+    def test_dc_mask_yaml_roundtrip(self):
+        cfg = PipelineConfig()
+        cfg.dc_mask.enabled = True
+        cfg.dc_mask.q_dc_min_floor = 0.20
+        cfg.dc_mask.soft_taper = True
+        d = cfg.to_dict()
+        cfg2 = PipelineConfig.from_dict(d)
+        assert cfg2.dc_mask.enabled is True
+        assert cfg2.dc_mask.q_dc_min_floor == 0.20
+        assert cfg2.dc_mask.soft_taper is True
+
+    def test_peak_snr_signal_method_default(self):
+        ps = PeakSNRConfig()
+        assert ps.signal_method == "max"
+
+    def test_global_fft_background_method_default(self):
+        gf = GlobalFFTConfig()
+        assert gf.background_method == "polynomial_robust"
+        assert gf.asls_lambda == 1e6
+        assert gf.asls_p == 0.001
+        assert gf.asls_n_iter == 10
+        assert gf.asls_domain == "log"
+
+    def test_pipeline_config_has_dc_mask(self):
+        cfg = PipelineConfig()
+        assert hasattr(cfg, "dc_mask")
+        assert isinstance(cfg.dc_mask, DCMaskConfig)
+        # Verify from_dict ignores missing dc_mask gracefully
+        cfg2 = PipelineConfig.from_dict({})
+        assert cfg2.dc_mask.enabled is False
+
+    def test_tile_fft_lightweight_snr_method_default(self):
+        tf = TileFFTConfig()
+        assert tf.lightweight_snr_method == "ratio"
