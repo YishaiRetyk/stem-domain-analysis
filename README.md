@@ -149,6 +149,41 @@ flowchart TD
 
 ---
 
+## What's New (v3.4) -- Dynamic DC Masking & SNR Enhancements
+
+### Dynamic DC Center Masking (`--dynamic-dc`)
+- **Derivative-based DC estimation**: Automatically determines the DC contamination radius from the global radial profile by finding where `|dJ/dq|` drops below a noise-derived threshold for N consecutive bins
+- **Tiles reuse global estimate**: The DC boundary is computed once on the full-image FFT and propagated to all tiles (no per-tile recomputation)
+- **Hard mask or cosine taper**: Default is hard cutoff; `--dc-soft-taper` enables a smooth cosine transition to reduce ringing
+- **Configurable via `DCMaskConfig`** (13 fields): Savitzky-Golay smoothing, slope threshold, noise region, floor/cap bounds, taper width
+- **CLI flags**: `--dynamic-dc` (enable), `--dc-floor <float>` (override minimum radius in cycles/nm), `--dc-soft-taper` (cosine taper)
+
+### AsLS Background Fitting (`--bg-method asls`)
+- **Asymmetric Least Squares** baseline estimation as an alternative to the iterative-reweighted polynomial background fit
+- Uses `scipy.sparse` for efficient banded-matrix operations
+- Supports both log-domain and linear-domain fitting
+- **CLI flag**: `--bg-method {polynomial_robust,asls}`
+
+### SNR Signal Extraction Methods (`--snr-signal-method`)
+- Configurable signal aggregation from the peak measurement disk:
+  - `max` -- legacy default, single brightest pixel
+  - `integrated_sum` -- sum of all pixels in the signal disk
+  - `integrated_median` -- median of all pixels in the signal disk
+- **CLI flag**: `--snr-signal-method {max,integrated_sum,integrated_median}`
+
+### Lightweight SNR Zscore Mode
+- Tile-level peak SNR can use MAD-based zscore instead of the simple signal/background ratio
+- Configured via `TileFFTConfig.lightweight_snr_method`
+
+### Visualization
+- Orange dashed line on radial profile marks the dynamic DC boundary (distinct from the gray low-q exclusion region)
+- Solid orange circle on the 2D power spectrum shows the DC mask radius
+
+### Reporting
+- `dc_mask` section added to `parameters.json` with `enabled`, `dynamic_dc_q`, `method`, and `diagnostics` fields
+
+---
+
 ## What's New (v3.3) -- Configurable Pipeline Parameters
 
 ### Fully Configurable Gate Thresholds
@@ -493,6 +528,13 @@ Hybrid Pipeline:
                           Report output format (default: json)
   --strong-guidance-snr FLOAT
                           SNR threshold for "strong" FFT guidance (default: 8.0)
+  --dynamic-dc            Enable derivative-based DC center masking
+  --dc-floor FLOAT        Override minimum DC mask radius (cycles/nm)
+  --dc-soft-taper         Use cosine taper instead of hard DC mask
+  --bg-method {polynomial_robust,asls}
+                          Background fitting method (default: polynomial_robust)
+  --snr-signal-method {max,integrated_sum,integrated_median}
+                          Peak signal aggregation method (default: max)
 
 Physics & EFTEM:
   --physics-d-min FLOAT   Expected minimum d-spacing in nm (default: 0.4)
@@ -811,6 +853,24 @@ All gate pass/fail thresholds can be overridden via `GateThresholdsConfig`:
 | `ring_analysis.ring_width_fwhm_mult` | 2.0 | Ring width = mult * FWHM |
 | `ring_analysis.ring_width_fallback_frac` | 0.03 | Fallback ring width as fraction of q_center |
 | `ring_analysis.ring_width_no_fwhm_frac` | 0.1 | Ring width when no FWHM available |
+
+#### DC Mask (`dc_mask.*`)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `dc_mask.enabled` | false | Enable dynamic DC masking (opt-in) |
+| `dc_mask.method` | derivative | Estimation method: derivative or fixed |
+| `dc_mask.savgol_window` | 11 | Savitzky-Golay smoothing window (auto-clamped, odd) |
+| `dc_mask.savgol_polyorder` | 2 | Savitzky-Golay polynomial order |
+| `dc_mask.slope_threshold_k` | 2.5 | \|dJ/dq\| < k * sigma_noise for DC boundary |
+| `dc_mask.consecutive_bins` | 7 | Required consecutive bins below threshold |
+| `dc_mask.noise_q_range_lo` | 0.70 | Noise region lower bound (fraction of q_max) |
+| `dc_mask.noise_q_range_hi` | 0.90 | Noise region upper bound (fraction of q_max) |
+| `dc_mask.q_dc_min_floor` | 0.15 | Absolute minimum DC mask (cycles/nm) |
+| `dc_mask.soft_taper` | false | Cosine taper vs hard mask |
+| `dc_mask.taper_width_q` | 0.05 | Taper transition width (cycles/nm) |
+| `dc_mask.max_dc_mask_q` | 0.0 | Hard upper bound (0 = uncapped) |
+| `dc_mask.auto_cap_from_physics` | true | Derive cap from d_max_nm |
 
 ## Python API
 
