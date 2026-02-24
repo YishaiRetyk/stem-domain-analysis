@@ -204,9 +204,9 @@ def compute_global_fft(image_fft: np.ndarray,
     # Noise floor
     neg_vals = corrected[corrected < 0]
     if len(neg_vals) > 10:
-        noise_floor = float(np.std(neg_vals) * 1.4826)
+        noise_floor = float(np.median(np.abs(neg_vals)) * 1.4826)
     else:
-        noise_floor = float(np.std(corrected[corrected < np.median(corrected)]))
+        noise_floor = float(np.median(np.abs(corrected - np.median(corrected))) * 1.4826)
 
     # Find radial peaks
     radial_peaks = _find_radial_peaks(q_values, corrected, noise_floor,

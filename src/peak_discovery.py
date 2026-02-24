@@ -371,9 +371,9 @@ def discover_peaks(
     # Estimate noise floor from negative regions (should be near zero if good fit)
     negative_vals = corrected_profile[corrected_profile < 0]
     if len(negative_vals) > 10:
-        noise_floor = np.std(negative_vals) * 1.4826  # MAD-based estimate
+        noise_floor = np.median(np.abs(negative_vals)) * 1.4826  # MAD-based estimate
     else:
-        noise_floor = np.std(corrected_profile[corrected_profile < np.median(corrected_profile)])
+        noise_floor = np.median(np.abs(corrected_profile - np.median(corrected_profile))) * 1.4826
     
     if verbose:
         print(f"    Estimated noise floor: {noise_floor:.1f}")

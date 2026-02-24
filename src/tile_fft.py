@@ -302,7 +302,7 @@ def _subpixel_refine(power: np.ndarray, px: int, py: int) -> Tuple[float, float]
         right = power[py, px + 1]
         denom = 2 * centre - left - right
         if denom > 0:
-            sx = px + 0.5 * (left - right) / denom
+            sx = px + 0.5 * (right - left) / denom
 
     # Y direction
     if 1 <= py < h - 1:
@@ -311,7 +311,7 @@ def _subpixel_refine(power: np.ndarray, px: int, py: int) -> Tuple[float, float]
         bottom = power[py + 1, px]
         denom = 2 * centre - top - bottom
         if denom > 0:
-            sy = py + 0.5 * (top - bottom) / denom
+            sy = py + 0.5 * (bottom - top) / denom
 
     return sx, sy
 

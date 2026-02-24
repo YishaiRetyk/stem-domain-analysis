@@ -157,14 +157,14 @@ def find_subpixel_peaks(peak_image: np.ndarray,
             right = peak_image[py, px + 1]
             denom = 2 * center - left - right
             if denom > 0:
-                sx = px + 0.5 * (left - right) / denom
+                sx = px + 0.5 * (right - left) / denom
 
             # Y refinement
             top = peak_image[py - 1, px]
             bottom = peak_image[py + 1, px]
             denom = 2 * center - top - bottom
             if denom > 0:
-                sy = py + 0.5 * (top - bottom) / denom
+                sy = py + 0.5 * (bottom - top) / denom
 
         # Prominence
         local_bg = bg_estimate[py, px]
