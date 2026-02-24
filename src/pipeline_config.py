@@ -199,6 +199,65 @@ class GatedTileGrid:
             _warned_symmetry_map = True
         return self.pair_fraction_map
 
+    def to_structured(self) -> Dict[str, Any]:
+        """Return a dict of parallel arrays (SoA view).
+
+        Keys include all existing numeric maps plus derived ``n_peaks``
+        and ``best_d_spacing`` arrays.
+        """
+        n_rows, n_cols = self.grid_shape
+        n_peaks = np.zeros((n_rows, n_cols), dtype=np.int32)
+        best_d_spacing = np.full((n_rows, n_cols), np.nan, dtype=np.float64)
+
+        for r in range(n_rows):
+            for c in range(n_cols):
+                tc = self.classifications[r, c]
+                if tc is not None:
+                    n_peaks[r, c] = len(tc.peaks)
+                    if tc.peaks:
+                        d_vals = [p.get("d_spacing", 0) for p in tc.peaks if p.get("d_spacing", 0) > 0]
+                        if d_vals:
+                            best_d_spacing[r, c] = d_vals[0]
+
+        result: Dict[str, Any] = {
+            "tier_map": self.tier_map,
+            "snr_map": self.snr_map,
+            "pair_fraction_map": self.pair_fraction_map,
+            "fwhm_map": self.fwhm_map,
+            "orientation_map": self.orientation_map,
+            "skipped_mask": self.skipped_mask,
+            "n_peaks": n_peaks,
+            "best_d_spacing": best_d_spacing,
+        }
+        if self.orientation_confidence_map is not None:
+            result["orientation_confidence_map"] = self.orientation_confidence_map
+        if self.detection_confidence_map is not None:
+            result["detection_confidence_map"] = self.detection_confidence_map
+        return result
+
+    def to_peaks_dataframe(self) -> List[Dict[str, Any]]:
+        """Flatten all peaks into a list of dicts (one row per peak per tile).
+
+        Suitable for ``pd.DataFrame(grid.to_peaks_dataframe())``.
+        """
+        rows: List[Dict[str, Any]] = []
+        n_rows, n_cols = self.grid_shape
+        for r in range(n_rows):
+            for c in range(n_cols):
+                tc = self.classifications[r, c]
+                if tc is None:
+                    continue
+                for pi, p in enumerate(tc.peaks):
+                    row = {
+                        "tile_row": r,
+                        "tile_col": c,
+                        "tier": tc.tier,
+                        "peak_idx": pi,
+                    }
+                    row.update(p)
+                    rows.append(row)
+        return rows
+
 
 # ======================================================================
 # Reference selection

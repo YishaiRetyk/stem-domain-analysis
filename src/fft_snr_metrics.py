@@ -103,7 +103,7 @@ def build_gated_tile_grid(peak_sets: List[TilePeakSet],
     tile_grid = FFTGrid(tile_size, tile_size, fft_grid.pixel_size_nm)
 
     classifications = np.empty((n_rows, n_cols), dtype=object)
-    tier_map = np.full((n_rows, n_cols), "", dtype=object)
+    tier_map = np.full((n_rows, n_cols), "", dtype="U10")
     snr_map = np.zeros((n_rows, n_cols))
     pair_fraction_map = np.zeros((n_rows, n_cols))
     fwhm_map = np.zeros((n_rows, n_cols))
