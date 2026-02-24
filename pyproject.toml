@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stem-domain-analysis"
+version = "0.1.0"
+description = "STEM-HAADF domain analysis pipeline with hybrid FFT + GPA + Peak-Finding workflow"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.20",
+    "scipy>=1.7",
+    "scikit-image>=0.19",
+    "scikit-learn>=1.0",
+    "matplotlib>=3.5",
+    "matplotlib-scalebar>=0.8.0",
+    "ncempy>=1.8",
+    "psutil>=5.9",
+]
+
+[project.optional-dependencies]
+gpu = [
+    "cupy-cuda12x>=13.0",
+    "cucim-cu12>=24.0",
+]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+stem-analyze = "analyze:main"
+
+[tool.setuptools]
+py-modules = ["analyze"]
+packages = ["src", "src.legacy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--ignore=tests/test_domain_clustering.py"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+ignore = [
+    "F401",   # unused imports (common in scientific code / re-exports)
+    "F541",   # f-string without placeholders
+    "F841",   # local variable assigned but never used
+    "E402",   # module-level import not at top (delayed imports for perf)
+    "E741",   # ambiguous variable name (e.g. l, I — standard in math)
+    "F811",   # redefinition of unused name (re-imports in tests)
+]
