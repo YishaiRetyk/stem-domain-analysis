@@ -614,7 +614,7 @@ def save_per_plane_maps(
         output_dir: Output directory
         pixel_size_nm: Pixel size for scale bar
     """
-    from src.radial_analysis import save_orientation_map
+    from src.legacy.radial_analysis import save_orientation_map
 
     for plane in multi_result.planes:
         # Use alphabetic suffix: a, b, c, etc.

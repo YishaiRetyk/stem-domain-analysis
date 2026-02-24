@@ -616,7 +616,7 @@ def run_interactive_threshold_loop(
     Returns:
         Final analysis results dict
     """
-    from src.radial_analysis import run_radial_analysis
+    from src.legacy.radial_analysis import run_radial_analysis
 
     current_threshold = params['intensity_threshold']
     iteration = 0
@@ -1454,8 +1454,8 @@ Examples:
     
     # Import modules (delayed to show help faster)
     from src.io_dm4 import load_dm4
-    from src.preprocess import preprocess
-    from src.radial_analysis import run_radial_analysis
+    from src.legacy.preprocess import preprocess
+    from src.legacy.radial_analysis import run_radial_analysis
     
     # Load input file
     print("\n[1/5] Loading image...")

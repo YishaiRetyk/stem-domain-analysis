@@ -7,15 +7,114 @@ runs K-means/GMM/HDBSCAN clustering, and optionally regularizes spatially.
 
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+from scipy import ndimage
+from scipy.stats import mode
 from sklearn.preprocessing import StandardScaler
 
 from src.pipeline_config import ClusteringConfig
 from src.ring_analysis import RingFeatureVectors
 
 logger = logging.getLogger(__name__)
+
+
+# ======================================================================
+# Spatial helpers (previously in cluster_domains.py)
+# ======================================================================
+
+def compute_adjacency_metrics(tile_labels: np.ndarray) -> Dict[str, Any]:
+    """Compute adjacency-based metrics for spatial coherence."""
+    n_rows, n_cols = tile_labels.shape
+
+    h_diff = tile_labels[:, :-1] != tile_labels[:, 1:]
+    h_adjacencies = n_rows * (n_cols - 1)
+    h_flips = int(np.sum(h_diff))
+
+    v_diff = tile_labels[:-1, :] != tile_labels[1:, :]
+    v_adjacencies = (n_rows - 1) * n_cols
+    v_flips = int(np.sum(v_diff))
+
+    total_adjacencies = h_adjacencies + v_adjacencies
+    total_flips = h_flips + v_flips
+    flip_rate = total_flips / total_adjacencies if total_adjacencies > 0 else 0.0
+
+    unique_labels = np.unique(tile_labels)
+    micro_domain_count = 0
+    for label in unique_labels:
+        if label == -1:
+            continue
+        mask = tile_labels == label
+        labeled_regions, n_regions = ndimage.label(mask)
+        for region_id in range(1, n_regions + 1):
+            if np.sum(labeled_regions == region_id) < 5:
+                micro_domain_count += 1
+
+    return {
+        "flip_rate": float(flip_rate),
+        "n_adjacencies": int(total_adjacencies),
+        "n_flips": int(total_flips),
+        "micro_domain_count": int(micro_domain_count),
+    }
+
+
+def spatial_regularize(tile_labels: np.ndarray, params: dict) -> np.ndarray:
+    """Apply spatial regularization (mode filter + tiny-cluster removal)."""
+    iterations = params.get("regularize_iterations", 2)
+    min_domain_size = params.get("min_domain_size", 5)
+    labels_reg = tile_labels.copy()
+
+    for _ in range(iterations):
+        labels_new = labels_reg.copy()
+        n_rows, n_cols = labels_reg.shape
+        for i in range(n_rows):
+            for j in range(n_cols):
+                i_min, i_max = max(0, i - 1), min(n_rows, i + 2)
+                j_min, j_max = max(0, j - 1), min(n_cols, j + 2)
+                neighborhood = labels_reg[i_min:i_max, j_min:j_max].flatten()
+                valid = neighborhood[neighborhood >= 0]
+                if len(valid) > 0:
+                    mode_result = mode(valid, keepdims=False)
+                    labels_new[i, j] = mode_result.mode
+        labels_reg = labels_new
+
+    unique_labels = np.unique(labels_reg)
+    for label in unique_labels:
+        if label == -1:
+            continue
+        mask = labels_reg == label
+        labeled_regions, n_regions = ndimage.label(mask)
+        for region_id in range(1, n_regions + 1):
+            region_mask = labeled_regions == region_id
+            if np.sum(region_mask) < min_domain_size:
+                dilated = ndimage.binary_dilation(region_mask)
+                neighbor_mask = dilated & ~region_mask
+                if np.any(neighbor_mask):
+                    neighbor_labels = labels_reg[neighbor_mask]
+                    valid_neighbors = neighbor_labels[neighbor_labels >= 0]
+                    if len(valid_neighbors) > 0:
+                        mode_result = mode(valid_neighbors, keepdims=False)
+                        labels_reg[region_mask] = mode_result.mode
+                    else:
+                        labels_reg[region_mask] = -1
+    return labels_reg
+
+
+def upsample_labels(tile_labels_reg: np.ndarray, image_shape: Tuple[int, int],
+                    tile_size: int, stride: int) -> np.ndarray:
+    """Upsample tile labels to full image resolution (nearest-neighbor)."""
+    H, W = image_shape
+    n_rows, n_cols = tile_labels_reg.shape
+    label_image = np.full((H, W), -1, dtype=np.int32)
+    for i in range(n_rows):
+        for j in range(n_cols):
+            y_start = i * stride
+            x_start = j * stride
+            y_end = min(y_start + tile_size, H)
+            x_end = min(x_start + tile_size, W)
+            label_image[y_start:y_end, x_start:x_end] = tile_labels_reg[i, j]
+    return label_image
 
 
 # ======================================================================
@@ -112,7 +211,6 @@ def run_domain_clustering(
 
     # 5. Spatial regularization
     if config.regularize and n_clusters > 1:
-        from src.cluster_domains import spatial_regularize, compute_adjacency_metrics
         adj_pre = compute_adjacency_metrics(tile_labels)
         tile_labels_reg = spatial_regularize(tile_labels, {
             "regularize_iterations": config.spatial_regularize_iterations,

@@ -1164,7 +1164,7 @@ def _save_cluster_overlay(clustering_result, raw_image, config, out_dir, dpi):
     path = out_dir / "cluster_overlay.png"
     _ensure_dir(path)
 
-    from src.cluster_domains import upsample_labels
+    from src.domain_clustering import upsample_labels
     labels = clustering_result.tile_labels_regularized
     label_image = upsample_labels(labels, raw_image.shape[:2],
                                   config.tile_size, config.stride)

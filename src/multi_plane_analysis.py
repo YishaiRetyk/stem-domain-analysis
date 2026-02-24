@@ -5,7 +5,7 @@ from typing import List, Optional, Dict, Tuple
 from dataclasses import dataclass
 from pathlib import Path
 
-from src.radial_analysis import (
+from src.legacy.radial_analysis import (
     process_tiles_for_peaks,
     compute_global_radial_profile,
     RadialProfile
