@@ -585,6 +585,7 @@ class GPAConfig:
     amplitude_erosion_iterations: int = 2
     phase_noise_min_pixels: int = 10
     min_tier_a_fraction_for_gpa: float = 0.1
+    min_gvector_angle_deg: float = 15.0
 
 
 @dataclass
@@ -674,6 +675,8 @@ class TileFFTConfig:
     annulus_outer_factor: float = 1.1       # outer annulus bound = factor * peak_q
     background_disk_r_sq: int = 9           # squared radius for peak exclusion disk (r=3)
     lightweight_snr_method: str = "ratio"  # "ratio" (legacy) | "zscore"
+    window_type: str = "hann"              # "hann" | "tukey"
+    tukey_alpha: float = 0.2
 
 
 @dataclass

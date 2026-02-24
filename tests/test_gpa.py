@@ -149,6 +149,65 @@ class TestDisplacementStrain:
             f"Expected exx ≈ {strain_xx}, got {mean_exx:.4f}"
 
 
+class TestCollinearityAngleCheck:
+    """Angle-based collinearity rejection for g-vectors."""
+
+    def test_collinear_rejection_by_angle(self):
+        """G-vectors 5° apart should be rejected as collinear."""
+        N = 64
+        grid = FFTGrid(N, N, 0.1)
+        # Two g-vectors 5° apart
+        g1 = GVector(gx=2.0, gy=0.0, magnitude=2.0, angle_deg=0,
+                      d_spacing=0.5, snr=10, fwhm=0.05, ring_index=0)
+        g2 = GVector(gx=2.0 * np.cos(np.radians(5)),
+                      gy=2.0 * np.sin(np.radians(5)),
+                      magnitude=2.0, angle_deg=5.0,
+                      d_spacing=0.5, snr=10, fwhm=0.05, ring_index=0)
+
+        image, _ = _make_perfect_lattice(N, 0.1, 0.5, 0)
+        phase1 = compute_gpa_phase(image, g1, 0.1, grid)
+        phase2 = compute_gpa_phase(image, g2, 0.1, grid)
+
+        disp = compute_displacement_field(phase1, phase2, min_gvector_angle_deg=15.0)
+        assert disp is None
+
+    def test_antiparallel_rejection(self):
+        """G-vectors 175° apart (near-antiparallel) should be rejected."""
+        N = 64
+        grid = FFTGrid(N, N, 0.1)
+        g1 = GVector(gx=2.0, gy=0.0, magnitude=2.0, angle_deg=0,
+                      d_spacing=0.5, snr=10, fwhm=0.05, ring_index=0)
+        g2 = GVector(gx=-2.0 * np.cos(np.radians(5)),
+                      gy=-2.0 * np.sin(np.radians(5)),
+                      magnitude=2.0, angle_deg=175.0,
+                      d_spacing=0.5, snr=10, fwhm=0.05, ring_index=0)
+
+        image, _ = _make_perfect_lattice(N, 0.1, 0.5, 0)
+        phase1 = compute_gpa_phase(image, g1, 0.1, grid)
+        phase2 = compute_gpa_phase(image, g2, 0.1, grid)
+
+        disp = compute_displacement_field(phase1, phase2, min_gvector_angle_deg=15.0)
+        assert disp is None
+
+    def test_non_collinear_acceptance(self):
+        """G-vectors 45° apart should succeed."""
+        N = 64
+        grid = FFTGrid(N, N, 0.1)
+        g1 = GVector(gx=2.0, gy=0.0, magnitude=2.0, angle_deg=0,
+                      d_spacing=0.5, snr=10, fwhm=0.05, ring_index=0)
+        g2 = GVector(gx=2.0 * np.cos(np.radians(45)),
+                      gy=2.0 * np.sin(np.radians(45)),
+                      magnitude=2.0, angle_deg=45.0,
+                      d_spacing=0.5, snr=10, fwhm=0.05, ring_index=0)
+
+        image, _ = _make_perfect_lattice(N, 0.1, 0.5, 0)
+        phase1 = compute_gpa_phase(image, g1, 0.1, grid)
+        phase2 = compute_gpa_phase(image, g2, 0.1, grid)
+
+        disp = compute_displacement_field(phase1, phase2, min_gvector_angle_deg=15.0)
+        assert disp is not None
+
+
 class TestGPASchemaConsistency:
     """C12: Both GPA modes should produce identical GPAResult schema."""
 

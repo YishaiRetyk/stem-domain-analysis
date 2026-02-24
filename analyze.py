@@ -812,6 +812,10 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
         config.peak_snr.signal_method = args.snr_signal_method
     if args.bg_method is not None:
         config.global_fft.background_method = args.bg_method
+    if args.window_type is not None:
+        config.tile_fft.window_type = args.window_type
+    if args.tukey_alpha is not None:
+        config.tile_fft.tukey_alpha = args.tukey_alpha
 
     # Extract config sub-objects for threading
     gt = config.gate_thresholds
@@ -1005,6 +1009,7 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
         q_ranges=q_ranges if q_ranges else None,
         ctx=ctx,
         effective_q_min=tile_effective_q_min,
+        tile_fft_config=config.tile_fft,
         dynamic_dc_q=_dynamic_dc_q,
         dc_mask_config=config.dc_mask,
     )
@@ -1400,6 +1405,11 @@ Examples:
     parser.add_argument('--bg-method', type=str, default=None,
                         choices=['polynomial_robust', 'asls'], dest='bg_method',
                         help='Background fitting method (default: polynomial_robust)')
+    parser.add_argument('--window-type', type=str, default=None,
+                        choices=['hann', 'tukey'], dest='window_type',
+                        help='Tile FFT window function (default: hann)')
+    parser.add_argument('--tukey-alpha', type=float, default=None, dest='tukey_alpha',
+                        help='Tukey window alpha parameter (default: 0.2)')
 
     args = parser.parse_args()
     

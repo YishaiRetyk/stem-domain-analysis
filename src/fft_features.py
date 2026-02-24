@@ -77,6 +77,25 @@ def create_2d_hann_window(size: int) -> np.ndarray:
     return np.outer(hann_1d, hann_1d)
 
 
+def create_2d_tukey_window(size: int, alpha: float = 0.2) -> np.ndarray:
+    """Create a 2D Tukey window for FFT.
+
+    The Tukey window leaves the centre (1-alpha) fraction unattenuated,
+    tapering only at the edges.  alpha=0 gives a rectangular window,
+    alpha=1 gives a Hann window.
+    """
+    tukey_1d = windows.tukey(size, alpha=alpha)
+    return np.outer(tukey_1d, tukey_1d)
+
+
+def create_window(size: int, window_type: str = "hann",
+                  tukey_alpha: float = 0.2) -> np.ndarray:
+    """Dispatch to Hann or Tukey 2D window."""
+    if window_type == "tukey":
+        return create_2d_tukey_window(size, alpha=tukey_alpha)
+    return create_2d_hann_window(size)
+
+
 def tile_fft_peaks(tile: np.ndarray, px_nm: float, params: dict = None) -> PeakSet:
     """
     Compute FFT and extract peaks from a tile.

@@ -254,6 +254,7 @@ def compute_tile_averaged_fft(
     pixel_size_nm: float,
     skipped_mask: np.ndarray,
     effective_q_min: float = 0.0,
+    tile_fft_config=None,
 ) -> dict:
     """Streaming mean of all valid tile power spectra.
 
@@ -266,12 +267,16 @@ def compute_tile_averaged_fft(
     radial_profile, q_values, n_tiles, effective_q_min.
     """
     from src.fft_coords import FFTGrid
-    from src.fft_features import get_tiling_info, create_2d_hann_window
+    from src.fft_features import get_tiling_info, create_window
 
     H, W = image_fft.shape
     info = get_tiling_info(image_fft.shape, tile_size, stride)
     n_rows, n_cols = info["grid_shape"]
-    window = create_2d_hann_window(tile_size)
+    window = create_window(
+        tile_size,
+        tile_fft_config.window_type if tile_fft_config else "hann",
+        tile_fft_config.tukey_alpha if tile_fft_config else 0.2,
+    )
 
     # Pre-compute low-q mask
     grid = FFTGrid(tile_size, tile_size, pixel_size_nm)
@@ -337,6 +342,7 @@ def compute_cluster_averaged_ffts(
     pixel_size_nm: float,
     skipped_mask: np.ndarray,
     effective_q_min: float = 0.0,
+    tile_fft_config=None,
 ) -> Dict[int, dict]:
     """Streaming per-cluster mean power spectra.
 
@@ -355,12 +361,16 @@ def compute_cluster_averaged_ffts(
     Dict[cluster_id, {"mean_power", "radial_profile", "q_values", "n_tiles"}]
     """
     from src.fft_coords import FFTGrid
-    from src.fft_features import get_tiling_info, create_2d_hann_window
+    from src.fft_features import get_tiling_info, create_window
 
     H, W = image_fft.shape
     info = get_tiling_info(image_fft.shape, tile_size, stride)
     n_rows, n_cols = info["grid_shape"]
-    window = create_2d_hann_window(tile_size)
+    window = create_window(
+        tile_size,
+        tile_fft_config.window_type if tile_fft_config else "hann",
+        tile_fft_config.tukey_alpha if tile_fft_config else 0.2,
+    )
 
     # Pre-compute low-q mask
     grid = FFTGrid(tile_size, tile_size, pixel_size_nm)

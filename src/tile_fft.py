@@ -18,7 +18,7 @@ from typing import List, Optional, Tuple, TYPE_CHECKING
 
 from src.fft_coords import FFTGrid
 from src.pipeline_config import TilePeak, TilePeakSet, TileFFTConfig, DCMaskConfig
-from src.fft_features import tile_generator, get_tiling_info, create_2d_hann_window
+from src.fft_features import tile_generator, get_tiling_info, create_2d_hann_window, create_window
 from src.gates import evaluate_gate
 
 if TYPE_CHECKING:
@@ -384,7 +384,11 @@ def process_all_tiles(image_fft: np.ndarray,
     info = get_tiling_info(image_fft.shape, tile_size, stride)
     n_rows, n_cols = info["grid_shape"]
     n_total = n_rows * n_cols
-    window = create_2d_hann_window(tile_size)
+    window = create_window(
+        tile_size,
+        tile_fft_config.window_type if tile_fft_config else "hann",
+        tile_fft_config.tukey_alpha if tile_fft_config else 0.2,
+    )
 
     tile_grid = FFTGrid(tile_size, tile_size, fft_grid.pixel_size_nm)
 

@@ -394,7 +394,9 @@ def check_phase_noise(phase_result: GPAPhaseResult,
 # ======================================================================
 
 def compute_displacement_field(phase_g1: GPAPhaseResult,
-                               phase_g2: GPAPhaseResult) -> Optional[DisplacementField]:
+                               phase_g2: GPAPhaseResult,
+                               min_gvector_angle_deg: float = 15.0,
+                               ) -> Optional[DisplacementField]:
     """Compute displacement from two unwrapped phase fields.
 
     Convention (F1): g in cycles/nm, phase in radians.
@@ -402,9 +404,20 @@ def compute_displacement_field(phase_g1: GPAPhaseResult,
     Result u is in nm.
     """
     g1, g2 = phase_g1.g_vector, phase_g2.g_vector
+
+    # Angle-based collinearity check (scale-independent, 180° symmetry)
+    angle_diff = abs(g1.angle_deg - g2.angle_deg) % 180.0
+    if angle_diff > 90.0:
+        angle_diff = 180.0 - angle_diff
+    if angle_diff < min_gvector_angle_deg:
+        logger.warning("G-vectors are too collinear (%.1f°) for stable strain",
+                        angle_diff)
+        return None
+
+    # Secondary numerical guard
     det = g1.gx * g2.gy - g1.gy * g2.gx
     if abs(det) < 1e-10:
-        logger.warning("G-vectors are collinear, cannot compute displacement")
+        logger.warning("G-vectors are numerically collinear, cannot compute displacement")
         return None
 
     inv_det = 1.0 / det
@@ -567,7 +580,10 @@ def run_gpa_full(image_fft: np.ndarray,
     displacement = None
     strain = None
     if len(phases) == 2:
-        displacement = compute_displacement_field(phases["g0"], phases["g1"])
+        displacement = compute_displacement_field(
+            phases["g0"], phases["g1"],
+            min_gvector_angle_deg=config.min_gvector_angle_deg,
+        )
         if displacement is not None:
             displacement = smooth_displacement(displacement, sigma=config.displacement_smooth_sigma, ctx=ctx)
             strain = compute_strain_field(displacement, fft_grid.pixel_size_nm, ctx=ctx)
@@ -762,7 +778,10 @@ def run_gpa_region(image_fft: np.ndarray,
 
     # Displacement / strain
     if len(all_phases) == 2:
-        combined_displacement = compute_displacement_field(all_phases["g0"], all_phases["g1"])
+        combined_displacement = compute_displacement_field(
+            all_phases["g0"], all_phases["g1"],
+            min_gvector_angle_deg=config.min_gvector_angle_deg,
+        )
         if combined_displacement is not None:
             combined_displacement = smooth_displacement(combined_displacement, sigma=config.displacement_smooth_sigma, ctx=ctx)
             combined_strain = compute_strain_field(combined_displacement, fft_grid.pixel_size_nm, ctx=ctx)
