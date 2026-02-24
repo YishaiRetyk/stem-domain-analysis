@@ -884,6 +884,19 @@ class RingAnalysisConfig:
 
 
 @dataclass
+class ParallelConfig:
+    """CPU tile-processing parallelisation (opt-in).
+
+    Tile FFT and peak extraction are embarrassingly parallel: each tile
+    produces an independent power spectrum.  ``ThreadPoolExecutor`` is
+    used (numpy FFT releases the GIL) for near-linear scaling without
+    pickling overhead.
+    """
+    enabled: bool = False       # opt-in
+    cpu_workers: int = 0        # 0 = os.cpu_count()
+
+
+@dataclass
 class PipelineConfig:
     """Top-level pipeline configuration.
 
@@ -919,6 +932,7 @@ class PipelineConfig:
     peak_snr: PeakSNRConfig = field(default_factory=PeakSNRConfig)
     reference_selection: ReferenceSelectionConfig = field(default_factory=ReferenceSelectionConfig)
     ring_analysis: RingAnalysisConfig = field(default_factory=RingAnalysisConfig)
+    parallel: ParallelConfig = field(default_factory=ParallelConfig)
 
     def to_dict(self) -> dict:
         """Serialise to a JSON-safe dict."""
@@ -955,6 +969,7 @@ class PipelineConfig:
             "peak_snr": (PeakSNRConfig, "peak_snr"),
             "reference_selection": (ReferenceSelectionConfig, "reference_selection"),
             "ring_analysis": (RingAnalysisConfig, "ring_analysis"),
+            "parallel": (ParallelConfig, "parallel"),
         }
         # Nested sub-config mapping: field name -> dataclass type
         _nested = {

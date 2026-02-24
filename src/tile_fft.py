@@ -10,14 +10,17 @@ Gate G5: tile_size_px / (d_dom_nm / pixel_size_nm) >= 20 periods.
 
 import logging
 import gc
+import os
+import threading
 import numpy as np
 import psutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from scipy.signal import windows
 from scipy import ndimage
 from typing import List, Optional, Tuple, TYPE_CHECKING
 
 from src.fft_coords import FFTGrid
-from src.pipeline_config import TilePeak, TilePeakSet, TileFFTConfig, DCMaskConfig
+from src.pipeline_config import TilePeak, TilePeakSet, TileFFTConfig, DCMaskConfig, ParallelConfig
 from src.fft_features import tile_generator, get_tiling_info, create_2d_hann_window, create_window
 from src.gates import evaluate_gate
 
@@ -355,6 +358,7 @@ def process_all_tiles(image_fft: np.ndarray,
                       tile_fft_config: Optional[TileFFTConfig] = None,
                       dynamic_dc_q: float = 0.0,
                       dc_mask_config: Optional[DCMaskConfig] = None,
+                      parallel_config: Optional[ParallelConfig] = None,
                       ) -> Tuple[List[TilePeakSet], np.ndarray]:
     """Process all tiles, extracting peaks from each.
 
@@ -399,8 +403,21 @@ def process_all_tiles(image_fft: np.ndarray,
     logger.info(f"MEMORY: Starting tile processing. Initial RSS: {initial_mem:.2f} GB")
     print(f"MEMORY: Starting tile processing ({n_total} tiles). Initial RSS: {initial_mem:.2f} GB")
 
-    # Dispatch to GPU-batched or sequential CPU path
-    if ctx is not None and ctx.using_gpu:
+    # Dispatch: parallel CPU → GPU-batched → sequential CPU
+    _use_parallel = (parallel_config is not None and parallel_config.enabled
+                     and (ctx is None or not ctx.using_gpu))
+    if _use_parallel:
+        peak_sets, skipped = _process_tiles_cpu_parallel(
+            image_fft, roi_mask_grid, tile_grid, window,
+            tile_size, stride, n_rows, n_cols, n_total, q_ranges,
+            process, log_interval, initial_mem,
+            effective_q_min=effective_q_min,
+            tile_fft_config=tile_fft_config,
+            dynamic_dc_q=dynamic_dc_q,
+            dc_mask_config=dc_mask_config,
+            parallel_config=parallel_config,
+        )
+    elif ctx is not None and ctx.using_gpu:
         peak_sets, skipped = _process_tiles_gpu(
             image_fft, roi_mask_grid, tile_grid, window,
             tile_size, stride, n_rows, n_cols, q_ranges, ctx,
@@ -468,6 +485,89 @@ def _process_tiles_cpu(image_fft, roi_mask_grid, tile_grid, window,
             pct = 100 * tile_count / n_total
             logger.info(f"MEMORY: Tile {tile_count}/{n_total} ({pct:.0f}%) - RSS: {mem_gb:.2f} GB")
             print(f"MEMORY: Tile {tile_count}/{n_total} ({pct:.0f}%) - RSS: {mem_gb:.2f} GB", flush=True)
+
+    return peak_sets, skipped
+
+
+def _process_single_tile(tile_data, window, tile_grid, q_ranges,
+                         effective_q_min, tile_fft_config, dynamic_dc_q,
+                         dc_mask_config):
+    """Process a single tile (thread-safe, no shared mutable state)."""
+    power = compute_tile_fft(tile_data, window)
+    peaks = extract_tile_peaks(power, tile_grid, q_ranges=q_ranges,
+                               effective_q_min=effective_q_min,
+                               tile_fft_config=tile_fft_config,
+                               dynamic_dc_q=dynamic_dc_q,
+                               dc_mask_config=dc_mask_config)
+    return peaks, power
+
+
+def _process_tiles_cpu_parallel(image_fft, roi_mask_grid, tile_grid, window,
+                                tile_size, stride, n_rows, n_cols, n_total,
+                                q_ranges, process, log_interval, initial_mem,
+                                effective_q_min=0.0, tile_fft_config=None,
+                                dynamic_dc_q=0.0, dc_mask_config=None,
+                                parallel_config=None):
+    """Threaded CPU tile processing using ThreadPoolExecutor."""
+    import time as _time
+
+    skipped = np.zeros((n_rows, n_cols), dtype=bool)
+    result_map = {}
+
+    # Collect tile work items
+    work_items = []
+    for tile, row, col, y, x in tile_generator(image_fft, tile_size, stride):
+        if roi_mask_grid is not None and row < roi_mask_grid.shape[0] and col < roi_mask_grid.shape[1]:
+            if not roi_mask_grid[row, col]:
+                skipped[row, col] = True
+                result_map[(row, col)] = TilePeakSet(peaks=[], tile_row=row, tile_col=col)
+                continue
+        # tile is a view into the original array — copy for thread safety
+        work_items.append((tile.copy(), row, col))
+
+    max_workers = parallel_config.cpu_workers if parallel_config.cpu_workers > 0 else (os.cpu_count() or 4)
+    max_workers = max(1, min(max_workers, len(work_items)))
+    logger.info("Parallel tile processing: %d workers, %d tiles", max_workers, len(work_items))
+
+    counter_lock = threading.Lock()
+    tiles_done = [0]
+    t_start = _time.monotonic()
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_rc = {}
+        for tile_data, row, col in work_items:
+            fut = executor.submit(
+                _process_single_tile, tile_data, window, tile_grid, q_ranges,
+                effective_q_min, tile_fft_config, dynamic_dc_q, dc_mask_config,
+            )
+            future_to_rc[fut] = (row, col)
+
+        for future in as_completed(future_to_rc):
+            row, col = future_to_rc[future]
+            peaks, power = future.result()
+            result_map[(row, col)] = TilePeakSet(
+                peaks=peaks, tile_row=row, tile_col=col,
+                power_spectrum=power,
+            )
+
+            with counter_lock:
+                tiles_done[0] += 1
+                td = tiles_done[0]
+
+            if td % log_interval == 0:
+                elapsed = _time.monotonic() - t_start
+                tiles_per_s = td / elapsed if elapsed > 0 else 0
+                mem_gb = process.memory_info().rss / 1024**3
+                pct = 100 * td / n_total
+                msg = (f"MEMORY: Parallel tile {td}/{n_total} ({pct:.0f}%) "
+                       f"- {tiles_per_s:.1f} tiles/s - RSS: {mem_gb:.2f} GB")
+                logger.info(msg)
+                print(msg, flush=True)
+
+    # Assemble in tile_generator order
+    peak_sets: List[TilePeakSet] = []
+    for _tile, row, col, y, x in tile_generator(image_fft, tile_size, stride):
+        peak_sets.append(result_map[(row, col)])
 
     return peak_sets, skipped
 

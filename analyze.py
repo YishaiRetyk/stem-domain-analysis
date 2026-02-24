@@ -818,6 +818,10 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
         config.tile_fft.tukey_alpha = args.tukey_alpha
     if args.phase_unwrap_method is not None:
         config.gpa.phase_unwrap.method = args.phase_unwrap_method
+    if args.parallel_tiles:
+        config.parallel.enabled = True
+    if args.tile_workers > 0:
+        config.parallel.cpu_workers = args.tile_workers
 
     # Extract config sub-objects for threading
     gt = config.gate_thresholds
@@ -1014,6 +1018,7 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
         tile_fft_config=config.tile_fft,
         dynamic_dc_q=_dynamic_dc_q,
         dc_mask_config=config.dc_mask,
+        parallel_config=config.parallel,
     )
 
     tile_fft_grid = FFTGrid(config.tile_size, config.tile_size, pixel_size)
@@ -1416,6 +1421,10 @@ Examples:
                         choices=['default', 'quality_guided'],
                         dest='phase_unwrap_method',
                         help='Phase unwrapping method (default: default)')
+    parser.add_argument('--parallel-tiles', action='store_true', dest='parallel_tiles',
+                        help='Enable CPU-parallel tile processing')
+    parser.add_argument('--tile-workers', type=int, default=0, dest='tile_workers',
+                        help='Number of CPU workers for parallel tiles (0=auto)')
 
     args = parser.parse_args()
     
