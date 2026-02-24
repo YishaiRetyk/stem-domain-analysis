@@ -19,12 +19,166 @@ from src.fft_coords import FFTGrid
 from src.pipeline_config import (
     GVector, GPAConfig, GPAPhaseResult, GPAResult, GPAModeDecision,
     DisplacementField, StrainField, ReferenceRegion, GatedTileGrid,
-    GlobalFFTResult,
+    GlobalFFTResult, PhaseUnwrapConfig,
 )
 from src.reference_selection import select_reference_region, check_ref_region_exists
 from src.gates import evaluate_gate
 
 logger = logging.getLogger(__name__)
+
+# Optional GPU phase unwrapping via cucim
+try:
+    from cucim.skimage.restoration import unwrap_phase as cucim_unwrap_phase
+    CUCIM_UNWRAP_AVAILABLE = True
+except ImportError:
+    cucim_unwrap_phase = None
+    CUCIM_UNWRAP_AVAILABLE = False
+
+
+def _unwrap_phase_quality_guided(phase_raw: np.ndarray,
+                                  amplitude: np.ndarray,
+                                  config: "PhaseUnwrapConfig") -> np.ndarray:
+    """Quality-guided phase unwrapping via weighted Laplacian (Ghiglia & Romero 1994).
+
+    Solves:  W nabla^2 phi = W nabla^2(wrapped_phase)
+    where W = amplitude^power, using conjugate-gradient iteration.
+    """
+    from scipy.sparse import diags, kron, eye, csc_matrix
+    from scipy.sparse.linalg import cg
+
+    H, W_dim = phase_raw.shape
+
+    # Compute weights from amplitude
+    amp_norm = amplitude / (np.max(amplitude) + 1e-10)
+    weights = amp_norm ** config.laplacian_weight_power
+
+    # Wrapping-aware Laplacian of phase:
+    # dx[i,j] = angle(exp(j*(phase[i,j+1] - phase[i,j])))
+    dx = np.zeros_like(phase_raw)
+    dy = np.zeros_like(phase_raw)
+    dx[:, :-1] = np.angle(np.exp(1j * np.diff(phase_raw, axis=1)))
+    dy[:-1, :] = np.angle(np.exp(1j * np.diff(phase_raw, axis=0)))
+
+    # Weighted wrapped Laplacian (RHS)
+    rho = np.zeros_like(phase_raw)
+    # d^2/dx^2 contribution
+    rho[:, 1:] += weights[:, 1:] * dx[:, :-1]
+    rho[:, :-1] -= weights[:, 1:] * dx[:, :-1]  # this is off - do it properly
+
+    # Actually, let's do it cleanly:
+    # rho = div(W * grad_wrapped(phase))
+    # weighted dx: wx[i,j] = w_x[i,j] * dx[i,j], where w_x = min(W[i,j], W[i,j+1])
+    wx = np.zeros_like(phase_raw)
+    wy = np.zeros_like(phase_raw)
+    wx[:, :-1] = np.minimum(weights[:, :-1], weights[:, 1:]) * dx[:, :-1]
+    wy[:-1, :] = np.minimum(weights[:-1, :], weights[1:, :]) * dy[:-1, :]
+
+    # Divergence: rho[i,j] = wx[i,j] - wx[i,j-1] + wy[i,j] - wy[i-1,j]
+    rho = np.zeros_like(phase_raw)
+    rho[:, :-1] += wx[:, :-1]
+    rho[:, 1:] -= wx[:, :-1]
+    rho[:-1, :] += wy[:-1, :]
+    rho[1:, :] -= wy[:-1, :]
+
+    rhs = rho.ravel()
+
+    # Build the weighted Laplacian matrix (sparse, fully vectorised)
+    N = H * W_dim
+
+    # Horizontal weights: min(w[i,j], w[i,j+1]) for j in [0, W_dim-2]
+    wx_2d = np.minimum(weights[:, :-1], weights[:, 1:])  # (H, W_dim-1)
+    wx_flat = np.zeros(N)
+    idx_h = (np.arange(H)[:, None] * W_dim + np.arange(W_dim - 1)[None, :]).ravel()
+    wx_flat[idx_h] = wx_2d.ravel()
+
+    # Vertical weights: min(w[i,j], w[i+1,j]) for i in [0, H-2]
+    wy_2d = np.minimum(weights[:-1, :], weights[1:, :])  # (H-1, W_dim)
+    wy_flat = np.zeros(N)
+    idx_v = (np.arange(H - 1)[:, None] * W_dim + np.arange(W_dim)[None, :]).ravel()
+    wy_flat[idx_v] = wy_2d.ravel()
+
+    # Build sparse matrix using vectorised index arithmetic
+    # Diagonal: sum of all connected weights
+    diag_vals = np.zeros(N)
+    # Right neighbor
+    idx_r = np.arange(N)
+    col_idx = idx_r % W_dim
+    mask_r = col_idx < W_dim - 1
+    diag_vals[idx_r[mask_r]] += wx_flat[idx_r[mask_r]]
+    # Left neighbor
+    mask_l = col_idx > 0
+    diag_vals[idx_r[mask_l]] += wx_flat[idx_r[mask_l] - 1]
+    # Bottom neighbor
+    row_idx = idx_r // W_dim
+    mask_b = row_idx < H - 1
+    diag_vals[idx_r[mask_b]] += wy_flat[idx_r[mask_b]]
+    # Top neighbor
+    mask_t = row_idx > 0
+    diag_vals[idx_r[mask_t]] += wy_flat[idx_r[mask_t] - W_dim]
+
+    # Off-diagonal entries
+    # Right: connection (i, i+1) with weight wx_flat[i] for valid cols
+    off_r_idx = idx_r[mask_r]
+    off_r_val = -wx_flat[off_r_idx]
+
+    # Bottom: connection (i, i+W_dim) with weight wy_flat[i] for valid rows
+    off_b_idx = idx_r[mask_b]
+    off_b_val = -wy_flat[off_b_idx]
+
+    from scipy.sparse import coo_matrix
+
+    # Build COO entries
+    rows_list = []
+    cols_list = []
+    vals_list = []
+
+    # Diagonal
+    rows_list.append(np.arange(N))
+    cols_list.append(np.arange(N))
+    vals_list.append(diag_vals)
+
+    # Right neighbor (i, i+1)
+    rows_list.append(off_r_idx)
+    cols_list.append(off_r_idx + 1)
+    vals_list.append(off_r_val)
+
+    # Left neighbor (i+1, i) — symmetric
+    rows_list.append(off_r_idx + 1)
+    cols_list.append(off_r_idx)
+    vals_list.append(off_r_val)
+
+    # Bottom neighbor (i, i+W_dim)
+    rows_list.append(off_b_idx)
+    cols_list.append(off_b_idx + W_dim)
+    vals_list.append(off_b_val)
+
+    # Top neighbor (i+W_dim, i) — symmetric
+    rows_list.append(off_b_idx + W_dim)
+    cols_list.append(off_b_idx)
+    vals_list.append(off_b_val)
+
+    all_rows = np.concatenate(rows_list)
+    all_cols = np.concatenate(cols_list)
+    all_vals = np.concatenate(vals_list)
+
+    L = coo_matrix((all_vals, (all_rows, all_cols)), shape=(N, N)).tocsc()
+
+    # Regularize: add small epsilon to diagonal for positive definiteness
+    L += csc_matrix(diags([1e-10], [0], shape=(N, N)))
+
+    # Solve with CG
+    x0 = phase_raw.ravel().copy()
+    solution, info = cg(L, rhs, x0=x0, rtol=config.cg_tol, maxiter=config.cg_maxiter)
+    if info != 0:
+        logger.warning("Quality-guided CG solver did not converge (info=%d), "
+                        "falling back to default unwrapping", info)
+        try:
+            from skimage.restoration import unwrap_phase
+            return unwrap_phase(phase_raw)
+        except ImportError:
+            return phase_raw.copy()
+
+    return solution.reshape(H, W_dim)
 
 
 # ======================================================================
@@ -148,7 +302,9 @@ def compute_gpa_phase(image_fft: np.ndarray,
                       amplitude_threshold: float = 0.1,
                       ctx=None,
                       _cached_ft_shifted=None,
-                      amplitude_erosion_iterations: int = 2) -> GPAPhaseResult:
+                      amplitude_erosion_iterations: int = 2,
+                      phase_unwrap_config: "PhaseUnwrapConfig" = None,
+                      ) -> GPAPhaseResult:
     """GPA phase extraction following Hytch et al. (1998).
 
     Uses subpixel-correct real-space phase ramp (F2).
@@ -173,6 +329,7 @@ def compute_gpa_phase(image_fft: np.ndarray,
                 image_fft, g_vector, mask_sigma_q, fft_grid,
                 amplitude_threshold, ctx, _cached_ft_shifted,
                 amplitude_erosion_iterations,
+                phase_unwrap_config=phase_unwrap_config,
             )
         except Exception as e:
             # OOM fallback: clear GPU memory and retry on CPU
@@ -232,12 +389,21 @@ def compute_gpa_phase(image_fft: np.ndarray,
     phase_raw[~amplitude_mask] = 0.0
 
     # Phase unwrapping -- full array, NO zero-forcing (F3)
-    try:
-        from skimage.restoration import unwrap_phase
-        phase_unwrapped = unwrap_phase(phase_raw)
-    except ImportError:
-        logger.warning("skimage.restoration.unwrap_phase not available, using raw phase")
-        phase_unwrapped = phase_raw.copy()
+    _pu_method = (phase_unwrap_config.method if phase_unwrap_config is not None
+                  else "default")
+
+    if _pu_method == "quality_guided":
+        phase_unwrapped = _unwrap_phase_quality_guided(
+            phase_raw, amplitude,
+            phase_unwrap_config,
+        )
+    else:
+        try:
+            from skimage.restoration import unwrap_phase
+            phase_unwrapped = unwrap_phase(phase_raw)
+        except ImportError:
+            logger.warning("skimage.restoration.unwrap_phase not available, using raw phase")
+            phase_unwrapped = phase_raw.copy()
 
     # NaN low-amplitude regions after unwrapping
     phase_unwrapped[~amplitude_mask] = np.nan
@@ -264,7 +430,8 @@ def compute_gpa_phase(image_fft: np.ndarray,
 
 def _compute_gpa_phase_gpu(image_fft, g_vector, mask_sigma_q, fft_grid,
                             amplitude_threshold, ctx, _cached_ft_shifted,
-                            amplitude_erosion_iterations=2):
+                            amplitude_erosion_iterations=2,
+                            phase_unwrap_config=None):
     """GPU-accelerated GPA phase extraction (steps 1-8 on GPU, 9+ on CPU)."""
     xp = ctx.xp
     H, W = image_fft.shape
@@ -326,13 +493,35 @@ def _compute_gpa_phase_gpu(image_fft, g_vector, mask_sigma_q, fft_grid,
     # Zero out low-amplitude regions before unwrapping
     phase_raw[~amplitude_mask] = 0.0
 
-    # Step 9: Phase unwrapping (CPU only — no CuPy equivalent)
-    try:
-        from skimage.restoration import unwrap_phase
-        phase_unwrapped = unwrap_phase(phase_raw)
-    except ImportError:
-        logger.warning("skimage.restoration.unwrap_phase not available, using raw phase")
-        phase_unwrapped = phase_raw.copy()
+    # Step 9: Phase unwrapping
+    _pu_method = (phase_unwrap_config.method if phase_unwrap_config is not None
+                  else "default")
+
+    if _pu_method == "quality_guided":
+        phase_unwrapped = _unwrap_phase_quality_guided(
+            phase_raw, amplitude,
+            phase_unwrap_config,
+        )
+    elif CUCIM_UNWRAP_AVAILABLE:
+        try:
+            import cupy as cp
+            phase_raw_d = cp.asarray(phase_raw)
+            phase_unwrapped = cp.asnumpy(cucim_unwrap_phase(phase_raw_d))
+            del phase_raw_d
+        except Exception as e:
+            logger.warning("cucim unwrap_phase failed (%s), falling back to skimage", e)
+            try:
+                from skimage.restoration import unwrap_phase
+                phase_unwrapped = unwrap_phase(phase_raw)
+            except ImportError:
+                phase_unwrapped = phase_raw.copy()
+    else:
+        try:
+            from skimage.restoration import unwrap_phase
+            phase_unwrapped = unwrap_phase(phase_raw)
+        except ImportError:
+            logger.warning("skimage.restoration.unwrap_phase not available, using raw phase")
+            phase_unwrapped = phase_raw.copy()
 
     # NaN low-amplitude regions after unwrapping
     phase_unwrapped[~amplitude_mask] = np.nan
@@ -536,6 +725,7 @@ def run_gpa_full(image_fft: np.ndarray,
             amplitude_threshold=config.amplitude_threshold,
             ctx=ctx,
             amplitude_erosion_iterations=config.amplitude_erosion_iterations,
+            phase_unwrap_config=config.phase_unwrap,
         )
         # Phase noise in reference region
         sigma_phi = check_phase_noise(phase_result, ref_region.tiles,
@@ -744,6 +934,7 @@ def run_gpa_region(image_fft: np.ndarray,
                 ctx=ctx,
                 _cached_ft_shifted=cached_ft_shifted,
                 amplitude_erosion_iterations=config.amplitude_erosion_iterations,
+                phase_unwrap_config=config.phase_unwrap,
             )
 
             # Extract domain region and insert into combined
@@ -761,7 +952,8 @@ def run_gpa_region(image_fft: np.ndarray,
                                   amplitude_threshold=config.amplitude_threshold,
                                   ctx=ctx,
                                   _cached_ft_shifted=cached_ft_shifted,
-                                  amplitude_erosion_iterations=config.amplitude_erosion_iterations)
+                                  amplitude_erosion_iterations=config.amplitude_erosion_iterations,
+                                  phase_unwrap_config=config.phase_unwrap)
         phase.phase_unwrapped = combined_phase_unwrapped[key].astype(np.float32)
         phase.amplitude_mask = combined_amplitude_mask[key]
 

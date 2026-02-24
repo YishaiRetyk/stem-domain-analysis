@@ -816,6 +816,8 @@ def run_hybrid_pipeline(image: np.ndarray, args, output_path: Path,
         config.tile_fft.window_type = args.window_type
     if args.tukey_alpha is not None:
         config.tile_fft.tukey_alpha = args.tukey_alpha
+    if args.phase_unwrap_method is not None:
+        config.gpa.phase_unwrap.method = args.phase_unwrap_method
 
     # Extract config sub-objects for threading
     gt = config.gate_thresholds
@@ -1410,6 +1412,10 @@ Examples:
                         help='Tile FFT window function (default: hann)')
     parser.add_argument('--tukey-alpha', type=float, default=None, dest='tukey_alpha',
                         help='Tukey window alpha parameter (default: 0.2)')
+    parser.add_argument('--phase-unwrap-method', type=str, default=None,
+                        choices=['default', 'quality_guided'],
+                        dest='phase_unwrap_method',
+                        help='Phase unwrapping method (default: default)')
 
     args = parser.parse_args()
     

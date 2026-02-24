@@ -542,6 +542,21 @@ class GlobalFFTConfig:
 
 
 @dataclass
+class PhaseUnwrapConfig:
+    """Phase unwrapping method configuration.
+
+    ``default`` preserves existing skimage behaviour. ``quality_guided``
+    uses a weighted-Laplacian solver (Ghiglia & Romero 1994) that
+    down-weights low-amplitude / noisy regions.
+    """
+    method: str = "default"              # "default" | "quality_guided"
+    quality_threshold: float = 0.1
+    laplacian_weight_power: float = 2.0
+    cg_tol: float = 1e-5
+    cg_maxiter: int = 500
+
+
+@dataclass
 class GPAConfig:
     """Geometric Phase Analysis (GPA) controls.
 
@@ -586,6 +601,7 @@ class GPAConfig:
     phase_noise_min_pixels: int = 10
     min_tier_a_fraction_for_gpa: float = 0.1
     min_gvector_angle_deg: float = 15.0
+    phase_unwrap: PhaseUnwrapConfig = field(default_factory=PhaseUnwrapConfig)
 
 
 @dataclass
@@ -940,11 +956,22 @@ class PipelineConfig:
             "reference_selection": (ReferenceSelectionConfig, "reference_selection"),
             "ring_analysis": (RingAnalysisConfig, "ring_analysis"),
         }
+        # Nested sub-config mapping: field name -> dataclass type
+        _nested = {
+            "phase_unwrap": PhaseUnwrapConfig,
+        }
+
         for attr, (klass, key) in _mapping.items():
             if key in d and isinstance(d[key], dict):
                 sub = klass()
                 for k, v in d[key].items():
-                    if hasattr(sub, k):
+                    if k in _nested and isinstance(v, dict):
+                        nested_sub = _nested[k]()
+                        for nk, nv in v.items():
+                            if hasattr(nested_sub, nk):
+                                setattr(nested_sub, nk, nv)
+                        setattr(sub, k, nested_sub)
+                    elif hasattr(sub, k):
                         setattr(sub, k, v)
                 setattr(cfg, attr, sub)
 
